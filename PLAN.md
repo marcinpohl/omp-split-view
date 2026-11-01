@@ -81,9 +81,9 @@ that order's terms. After every item run `bun test`, `bun run test:coverage`,
 | T1 `/split-trim-response` | done | B4 |
 | T2 theme invalidation | done | — |
 | T3 empty thinking blocks | done (with W2) | B5 |
-| T4 `/split` + `/split-save` round-trip | partial | — |
+| T4 `/split` + `/split-save` round-trip | done | — |
 | T5 resume/reconstruct | done | — |
-| T6 command argument handling | partial | — |
+| T6 command argument handling | done | — |
 | T7 tool panel extras | done | B6 |
 | W8 large-terminal geometry | done | — |
 
@@ -246,19 +246,26 @@ assertions use the harness `setTheme` hook. `test/setup.ts` redirects
   `bandMemo` staleness fixed in `renderBand`.
 - [x] **T3 — Empty thinking blocks.** Done with W2: direct block count via
   `retainedThinkingBlocks()` (the "too indirect" fallback was not needed).
-- [ ] **T4 — `/split` toggle pair + `/split-save` round-trip (partial).** Done:
-  config load tolerates garbage, `/split-save` persists the live layout and
-  reports a write failure, and the toggle pair was verified live. Missing: a
-  fresh `session_start` in a new harness reading the saved layout back.
+- [x] **T4 — `/split` toggle pair + `/split-save` round-trip.** Done: config
+  load tolerates garbage, `/split-save` persists the live layout and reports a
+  write failure, the toggle pair was verified live, and "session_start applies
+  the layout saved on disk" reads it back — every field in the written config
+  differs from the live layout (tools off, diff off, `toolMode: "full"`,
+  `trimResponse: true`, 24 rows, 45% tools, 60-col dock), then asserts the
+  applied band height, dock width, panel set, transcript switches and full-mode
+  output. A shared harness suffices because `session_start` re-reads the file;
+  the missing piece was a config the live state could not already satisfy.
 - [x] **T5 — Resume/reconstruct.** Done: "session_start, session_tree and
   session_switch replay the branch once" asserts the thinking text, the `read`
   tool row and the `replay.ts` files entry, with no duplicate rows after either
   branch event.
-- [ ] **T6 — Command argument handling (partial).** Done: `/split-height`
-  clamping and its usage message (via the geometry property), plus
-  `/split-tools-width` and `/split-tools-view` in the layout/save tests.
-  Missing: empty/non-numeric `/split-tools-width` errors and both explicit
-  `/split-tools-view` states.
+- [x] **T6 — Command argument handling.** Done: `/split-height` clamping and
+  its usage message (geometry property), `/split-tools-width` empty and
+  non-numeric rejections (the split must not move), its 20–60 clamp asserted
+  through the composed columns (`[0,66,86]` at 20% and `[0,34,86]` at 60%),
+  `/split-height` rejecting a non-numeric argument, `/files` warning on a
+  terminal too narrow to dock it, and both `/split-tools-view` states (the
+  full-mode assertions in `complex renderers` and the saved-mode read-back).
 - [x] **T7 — Tool panel extras.** Done in the `complex renderers` suite: an
   image result renders the one-line fallback and not the base64 payload, a
   finished call shows its elapsed time while a call that just started shows

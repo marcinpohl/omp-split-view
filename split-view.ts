@@ -46,7 +46,7 @@
  *   /files                      toggle the files panel within the band
  *   /split-tools-view           compact <-> full tool detail
  *   /split-tools-width <pct>    tools share of the band width (20-60)
- *   /split-height <n>           band height in rows (6-40)
+ *   /split-height <n>           band height in rows (6-80, clamped to fit)
  *   /split-diff                 toggle the files edit-diff subpanel
  *   /split-trim-response        full transcript <-> response-only
  *   /split-save                 persist the current layout as startup defaults

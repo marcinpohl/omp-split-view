@@ -155,6 +155,18 @@ function assertExactWidth(lines: readonly string[], width: number): void {
 	});
 }
 
+/** Cell offsets of each panel's top-left corner in a composed row, so a test
+ * can pin the width allocation rather than just the total row width. */
+function columnStarts(line: string): number[] {
+	const starts: number[] = [];
+	let width = 0;
+	for (const ch of line) {
+		if (ch === "╭") starts.push(width);
+		width += visibleWidth(ch);
+	}
+	return starts;
+}
+
 function effective(id: string): unknown {
 	const handle = lookup(id);
 	expect(handle).toBeDefined();
@@ -908,16 +920,6 @@ describe("complex renderers", () => {
 });
 
 describe("large terminals (4K / ultrawide)", () => {
-	/** Cell offsets of each panel's top-left corner in a composed row. */
-	const columnStarts = (line: string): number[] => {
-		const starts: number[] = [];
-		let width = 0;
-		for (const ch of line) {
-			if (ch === "╭") starts.push(width);
-			width += visibleWidth(ch);
-		}
-		return starts;
-	};
 	const writeConfig = (cfg: unknown) => writeFileSync(CONFIG_FILE, JSON.stringify(cfg));
 	/** Toggle-style commands announce the new state; drive to a known one. */
 	const setToggle = async (command: string, message: RegExp) => {
@@ -984,6 +986,135 @@ describe("large terminals (4K / ultrawide)", () => {
 		expect(joined).toContain("· +8 more");
 		expect(joined).not.toContain("· L4");
 		await setToggle("split-tools-view", /compact/);
+	});
+});
+
+/**
+ * Command argument handling and the disk -> live direction of the config: bad
+ * or out-of-range arguments must not move the layout, and a saved layout must
+ * be applied in full on the next `session_start` (one field per assertion, all
+ * deliberately different from the live layout so nothing passes by default).
+ */
+describe("command arguments and saved layout", () => {
+	const setToggle = async (command: string, message: RegExp) => {
+		await h.command(command);
+		if (!message.test(h.notifications.at(-1)?.message ?? "")) await h.command(command);
+	};
+	const layout = async () => {
+		h.setSize(120, 45);
+		await h.command("split-height", "20");
+		await h.command("split-tools-width", "35");
+		await setToggle("split-thinking", /Thinking on/);
+		await setToggle("split-tools", /Tools on/);
+		await setToggle("files", /Files panel on/);
+		await setToggle("split-tools-view", /compact/);
+		await setToggle("split-diff", /\bon$/);
+	};
+
+	beforeAll(layout);
+	afterAll(async () => {
+		// `filesWidth` has no command of its own, so only a config-free
+		// session_start resets it to auto; leaving 60 behind would squeeze the
+		// tools column for every later suite.
+		rmSync(CONFIG_FILE, { recursive: true, force: true });
+		await h.emit("session_start");
+		await layout();
+		await h.command("split-trim-response", "off");
+	});
+
+	test("/split-tools-width ignores an empty or non-numeric argument", async () => {
+		const before = columnStarts(h.widget()!.render(120)[0]);
+		for (const [arg, message] of [
+			["", "usage: /split-tools-width 20-60"],
+			["abc", "Invalid percentage"],
+		] as const) {
+			h.notifications.length = 0;
+			await h.command("split-tools-width", arg);
+			expect(h.notifications.at(-1)?.message).toContain(message);
+			// The band is untouched: neither call may move the split.
+			expect(columnStarts(h.widget()!.render(120)[0])).toEqual(before);
+		}
+		expect(h.notifications.at(-1)?.level).toBe("error");
+	});
+
+	test("/split-tools-width clamps to 20-60 and re-splits the band", async () => {
+		// 120 cols: files dock 34, leaving 86 for thinking | tools.
+		await h.command("split-tools-width", "5");
+		expect(h.notifications.at(-1)?.message).toContain("20%");
+		expect(columnStarts(h.widget()!.render(120)[0])).toEqual([0, 66, 86]);
+		await h.command("split-tools-width", "99");
+		expect(h.notifications.at(-1)?.message).toContain("60%");
+		expect(columnStarts(h.widget()!.render(120)[0])).toEqual([0, 34, 86]);
+		await h.command("split-tools-width", "35");
+	});
+
+	test("/split-height ignores a non-numeric argument", async () => {
+		const before = h.widget()!.render(120).length;
+		h.notifications.length = 0;
+		await h.command("split-height", "tall");
+		expect(h.notifications.at(-1)?.message).toContain("usage: /split-height");
+		expect(h.widget()!.render(120).length).toBe(before);
+	});
+
+	test("/files warns when the panel cannot dock below 90 columns", async () => {
+		h.setSize(80, 45);
+		h.notifications.length = 0;
+		await h.command("files"); // off
+		await h.command("files"); // on at 80 cols
+		expect(h.notifications.at(-1)).toMatchObject({
+			level: "warning",
+			message: expect.stringContaining("hidden below 90 cols"),
+		});
+		h.setSize(120, 45);
+		await h.command("files"); // leave it off for the reload test's expectations
+		await h.command("files");
+	});
+
+	test("session_start applies the layout saved on disk", async () => {
+		// A layout that differs from the live one on every field, so nothing can
+		// pass by accident: tools off, diff off, full detail, response-only,
+		// 24 rows, 45% tools, 60-col dock.
+		writeFileSync(
+			CONFIG_FILE,
+			JSON.stringify({
+				split: true,
+				thinking: true,
+				tools: false,
+				files: true,
+				diff: false,
+				toolMode: "full",
+				trimResponse: true,
+				bandHeight: 24,
+				toolsWidthPct: 45,
+				filesWidth: 60,
+			}),
+		);
+		h.setSize(120, 45);
+		await h.emit("session_start");
+		const lines = h.widget()!.render(120);
+		expect(lines.length).toBe(24);
+		assertExactWidth(lines, 120);
+		const text = lines.join("\n");
+		expect(text).toContain("Thinking");
+		expect(text).toContain("📂 Files");
+		expect(text).not.toContain("Tool Usage");
+		expect(text).not.toContain("Last Edit");
+		// Explicit 60-col dock (auto would be 34 at this width).
+		expect(columnStarts(lines[0])).toEqual([0, 60]);
+		expect(effective("display.hideToolActivity")).toBe(true);
+
+		// toolMode "full" and toolsWidthPct 45 land once the panel is shown:
+		// 120 - 60 dock = 60 for thinking | tools, 45% of it to tools.
+		await h.command("split-tools");
+		await h.emit("tool_execution_start", { toolCallId: "saved", toolName: "bash", args: { command: "true" } });
+		await h.emit("tool_execution_end", {
+			toolCallId: "saved",
+			result: { content: [{ type: "text", text: "restored output line" }] },
+			isError: false,
+		});
+		const withTools = h.widget()!.render(120);
+		expect(columnStarts(withTools[0])).toEqual([0, 33, 60]);
+		expect(withTools.join("\n")).toContain("restored output line");
 	});
 });
 

@@ -9,7 +9,7 @@ landed item updates the snapshot and ticks its row.
 
 | Command | Measures | Gate |
 | --- | --- | --- |
-| `bun test` | behaviour + property tests | 88 tests, 0 failures |
+| `bun test` | behaviour + property tests | 93 tests, 0 failures |
 | `bun run test:coverage` | line/function coverage from Bun's lcov | lines ≥ 99%, functions ≥ 90% (`scripts/check-coverage.ts`) |
 | `bun run lint` | ESLint 10 + typescript-eslint + sonarjs; also the cyclomatic/cognitive/size metrics | 0 errors (warnings are the metric report) |
 | `bun run typecheck` | `tsc --noEmit`, strict | clean |
@@ -25,12 +25,12 @@ targets control characters.
 
 | File | Lines | Funcs | Test file | Tests |
 | --- | --- | --- | --- | --- |
-| `split-view.ts` | 99.90% | 97.85% | `test/split-view.test.ts` | 52 |
+| `split-view.ts` | 99.90% | 97.85% | `test/split-view.test.ts` | 57 |
 | `helpers.ts` | 100.00% | 94.12% | `test/helpers.test.ts` | 19 |
 | `ui-panels-config.ts` | 100.00% | 80.00% | `test/properties.test.ts` | 17 |
-| **overall** | **99.91%** | **96.52%** | | **88** |
+| **overall** | **99.91%** | **96.52%** | | **93** |
 
-32,364 assertions, ~3.9 s wall time. Uncovered:
+32,410 assertions, ~3.9 s wall time. Uncovered:
 
 - `split-view.ts:121` — `themeGetter` default that throws if something renders
   before `session_start` binds a theme. Deliberate, unreachable.
@@ -46,6 +46,12 @@ Property coverage is behavioural, not line-based: helpers (truncation, caps,
 config normalization, visibility), band geometry for arbitrary terminal sizes,
 cache idempotence, theme invalidation, escape stripping, arbitrary event
 streams. Fixed fast-check seeds (`20261101`) keep failures reproducible.
+
+`command arguments and saved layout` covers the reject/clamp paths that the
+layout tests never exercised (empty and non-numeric arguments must not move the
+split; `/split-tools-width` clamps 20–60, asserted through the composed column
+offsets) and the disk → live direction of the config: one `session_start` with
+a saved layout that differs on every field.
 
 The `complex renderers` suite targets the five highest-`cc` functions branch by
 branch: tool output preview cap and `+N more`, image fallback vs base64, a
@@ -90,7 +96,7 @@ row as `notice?`; the Q1 split must not add a fifth, or extract an options
 object (Q7's pattern) as part of the extraction.
 
 File sizes: `split-view.ts` 1389 L, `helpers.ts` 244 L,
-`ui-panels-config.ts` 146 L, `scripts/check-coverage.ts` 90 L, tests 1779 L.
+`ui-panels-config.ts` 146 L, `scripts/check-coverage.ts` 90 L, tests 1910 L.
 
 ## Work queue
 
