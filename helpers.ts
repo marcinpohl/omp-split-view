@@ -130,13 +130,54 @@ export const AUTO_DOCK_PCT = 0.25;
 export const AUTO_DOCK_MIN_COLS = 34;
 export const AUTO_DOCK_MAX_COLS = 120;
 
-/** Files panel width: auto = 25% clamped to 34–120 cols, so the column keeps
- * growing on wide terminals; a manual width is clamped to
- * [MIN_DOCK_COLS, cols - DOCK_LEFT_RESERVE]. */
-export function dockColsFor(cols: number, manual: number | null = null): number {
+/** Layout presets: `4k` is the taller, narrower curve; `wide` trades band rows
+ * for columns, which is what a 21:9-or-wider pane actually has. */
+export type GeometryMode = "4k" | "wide";
+
+export interface GeometryProfile {
+	/** Band height as a share of the terminal rows. */
+	bandPct: number;
+	/** Floor for the auto band height, in rows. */
+	minBandRows: number;
+	/** Files dock share of the terminal columns (auto width only). */
+	dockPct: number;
+	minDockCols: number;
+	maxDockCols: number;
+}
+
+export const GEOMETRY_PROFILES: Readonly<Record<GeometryMode, GeometryProfile>> = {
+	"4k": {
+		bandPct: 0.45,
+		minBandRows: 20,
+		dockPct: AUTO_DOCK_PCT,
+		minDockCols: AUTO_DOCK_MIN_COLS,
+		maxDockCols: AUTO_DOCK_MAX_COLS,
+	},
+	wide: { bandPct: 0.35, minBandRows: 14, dockPct: 0.32, minDockCols: 40, maxDockCols: 200 },
+};
+
+/** Columns per row at which a pane counts as wide-screen. 21:9 (3440×1440 at a
+ * normal font ≈ 430×40 cells) is ~10.8, 32:9 is ~12.5, 16:9 1440p is ~6 and a
+ * 4K cell grid is ~4, so 8 separates ultrawide from both. */
+export const AUTO_WIDE_ASPECT = 8;
+
+/** Preset implied by the terminal shape; unknown/short geometry falls back to
+ * `4k`, which is also the pre-switch behavior. */
+export function autoGeometryMode(columns: number, rows: number): GeometryMode {
+	return rows > 0 && columns / rows >= AUTO_WIDE_ASPECT ? "wide" : "4k";
+}
+
+/** Files panel width: auto = the profile's share of the terminal clamped to its
+ * floor/ceiling, so the column keeps growing on wide terminals; a manual width
+ * is clamped to [MIN_DOCK_COLS, cols - DOCK_LEFT_RESERVE]. */
+export function dockColsFor(
+	cols: number,
+	manual: number | null = null,
+	profile: GeometryProfile = GEOMETRY_PROFILES["4k"],
+): number {
 	if (manual === null) {
-		const auto = Math.floor(cols * AUTO_DOCK_PCT);
-		return Math.max(AUTO_DOCK_MIN_COLS, Math.min(AUTO_DOCK_MAX_COLS, auto));
+		const auto = Math.floor(cols * profile.dockPct);
+		return Math.max(profile.minDockCols, Math.min(profile.maxDockCols, auto));
 	}
 	const max = Math.max(MIN_DOCK_COLS, cols - DOCK_LEFT_RESERVE);
 	return Math.max(MIN_DOCK_COLS, Math.min(max, Math.trunc(manual)));
@@ -149,12 +190,16 @@ export const MAX_BAND_HEIGHT = 80;
 /** Rows the transcript + editor keep; a band that would eat into them hides. */
 export const MIN_ROWS_BELOW_BAND = 18;
 
-/** Startup band height for a terminal of `rows`: 45% of the height, never
- * below the classic 20 rows and never above MAX_BAND_HEIGHT. Evaluated only
- * when the saved config has no explicit height, so a chosen height is never
- * overridden: 45 rows -> 20 (the old default), 100 -> 45, 200 -> 80. */
-export function defaultBandHeight(rows: number): number {
-	return Math.max(20, Math.min(MAX_BAND_HEIGHT, Math.floor(rows * 0.45)));
+/** Startup band height for a terminal of `rows`: the profile's share of the
+ * height, never below its row floor and never above MAX_BAND_HEIGHT. Evaluated
+ * only when the saved config has no explicit height, so a chosen height is
+ * never overridden: `4k` gives 45 rows -> 20 (the old default), 100 -> 45,
+ * 200 -> 80; `wide` gives 40 -> 14, 100 -> 35, 600 -> 80. */
+export function defaultBandHeight(
+	rows: number,
+	profile: GeometryProfile = GEOMETRY_PROFILES["4k"],
+): number {
+	return Math.max(profile.minBandRows, Math.min(MAX_BAND_HEIGHT, Math.floor(rows * profile.bandPct)));
 }
 
 /** Tallest band that still leaves MIN_ROWS_BELOW_BAND for the transcript and

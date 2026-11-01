@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import {
+	GEOMETRY_PROFILES,
 	MAX_BAND_HEIGHT,
 	MAX_DIFF_CHARS,
 	MAX_DIFF_LINES,
 	MIN_BAND_HEIGHT,
 	appendStreamTail,
+	autoGeometryMode,
 	bandToolsColsFor,
 	capDiffText,
 	capDisplayLine,
@@ -135,6 +137,34 @@ describe("band height scaling", () => {
 	});
 });
 
+describe("geometry presets", () => {
+	test("wide trades band rows for dock columns", () => {
+		expect(defaultBandHeight(40, GEOMETRY_PROFILES.wide)).toBe(14);
+		expect(defaultBandHeight(100, GEOMETRY_PROFILES.wide)).toBe(35);
+		expect(defaultBandHeight(600, GEOMETRY_PROFILES.wide)).toBe(MAX_BAND_HEIGHT);
+		expect(dockColsFor(500, null, GEOMETRY_PROFILES.wide)).toBe(160);
+		expect(dockColsFor(100, null, GEOMETRY_PROFILES.wide)).toBe(40); // floor
+		expect(dockColsFor(1000, null, GEOMETRY_PROFILES.wide)).toBe(200); // ceiling
+		// A manual width still ignores the preset's ceiling.
+		expect(dockColsFor(500, 250, GEOMETRY_PROFILES.wide)).toBe(250);
+	});
+
+	test("4k is the default profile, unchanged", () => {
+		expect(defaultBandHeight(100)).toBe(45);
+		expect(dockColsFor(400)).toBe(100);
+	});
+
+	test("the preset follows the terminal aspect ratio", () => {
+		expect(autoGeometryMode(500, 40)).toBe("wide"); // 32:9
+		expect(autoGeometryMode(430, 40)).toBe("wide"); // 21:9
+		expect(autoGeometryMode(320, 40)).toBe("wide"); // exactly 8 cols/row
+		expect(autoGeometryMode(319, 40)).toBe("4k"); // one column below
+		expect(autoGeometryMode(400, 100)).toBe("4k"); // 4K cell grid
+		expect(autoGeometryMode(240, 40)).toBe("4k"); // 16:9
+		expect(autoGeometryMode(120, 0)).toBe("4k"); // no rows reported
+	});
+});
+
 describe("formatDuration", () => {
 	test("compact units", () => {
 		expect(formatDuration(420)).toBe("0.4s");
@@ -191,6 +221,15 @@ describe("normalizeConfig", () => {
 		expect(normalizeConfig({ bandHeight: 200 }).bandHeight).toBe(MAX_BAND_HEIGHT);
 		// Inside the bounds the saved height is kept verbatim.
 		expect(normalizeConfig({ bandHeight: 42 }).bandHeight).toBe(42);
+	});
+	test("geometry is a strict literal with auto as the default", () => {
+		expect(normalizeConfig({}).geometry).toBe("auto");
+		expect(normalizeConfig({ geometry: "4k" }).geometry).toBe("4k");
+		expect(normalizeConfig({ geometry: "wide" }).geometry).toBe("wide");
+		expect(normalizeConfig({ geometry: "auto" }).geometry).toBe("auto");
+		// Garbage never becomes a preset: the aspect ratio decides instead.
+		expect(normalizeConfig({ geometry: "WIDE" as never }).geometry).toBe("auto");
+		expect(normalizeConfig({ geometry: 4 as never }).geometry).toBe("auto");
 	});
 	test("panel defaults", () => {
 		const cfg = normalizeConfig({ split: true });

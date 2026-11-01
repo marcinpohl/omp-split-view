@@ -71,7 +71,8 @@ default. Start bare regardless of saved defaults with `--no-split`.
 | `/files` | Toggle the files panel within the band |
 | `/split-tools-view` | Compact ↔ full tool detail (full shows output previews) |
 | `/split-tools-width <pct>` | Tools panel width as % of the band (20–60, default 35) |
-| `/split-height <n>` | Band height in rows (6–80; clamped to leave 18 rows for the transcript, default 45% of the terminal height) |
+| `/split-height <n>` | Band height in rows (6–80; clamped to leave 18 rows for the transcript, default the geometry preset's share of the terminal height) |
+| `/split-geometry [auto\|4k\|wide]` | Geometry preset: `4k` = taller band, narrower dock; `wide` = shorter band, wider dock; no argument flips to the other preset; `auto` (default) derives it from the terminal aspect ratio |
 | `/split-diff` | Toggle the files panel's edit-diff subpanel |
 | `/split-trim-response [on\|off]` | Full transcript ↔ response-only |
 | `/split-save` | Persist the current layout as startup defaults for new windows |
@@ -112,17 +113,32 @@ interrupted write cannot leave truncated JSON that would load as defaults.
 - **Untrusted text** — escape sequences and other C0/C1 control characters in
   model or tool text are stripped at ingestion and on branch replay, so a tool
   result, thinking delta or resumed session cannot drive the terminal.
-- **Geometry** — scales with the window instead of clamping at laptop sizes.
-  The files dock is 25% of the width (34–120 cols), the band is 45% of the
-  height by default (20–80 rows) when no height is saved, and each tool's
-  output preview grows from 2 to 6 lines as the band gets taller. On a
-  400×100 (4K) terminal that is a 45-row band split 195 | 105 | 100; on an
-  ultrawide 500×60 it is 247 | 133 | 120. `/split-height` clamps to leave 18
-  rows for the transcript and editor, the band hides itself entirely on
-  terminals too short for it, the files column drops out below 90 columns (a
-  files-only layout keeps its frame and says so rather than rendering blank),
-  and every rendered row is exactly the terminal width from 40 columns up
-  (tested).
+- **Geometry** — scales with the window instead of clamping at laptop sizes,
+  and picks a preset from the terminal shape: `4k` (the taller, narrower
+  curve) unless the pane is at least 8 columns per row, i.e. 21:9 or wider,
+  where `wide` trades band rows for dock columns. `/split-geometry` pins
+  either preset and `auto` gives the choice back to the aspect ratio. Each
+  tool's output preview grows from 2 to 6 lines as the band gets taller.
+
+  | terminal | preset | band rows | thinking │ tools │ files |
+  | --- | --- | --- | --- |
+  | 120×45 | `4k` | 20 | 56 │ 30 │ 34 |
+  | 240×40 (16:9 1440p) | `4k` | 20 | 117 │ 63 │ 60 |
+  | 400×100 (4K) | `4k` | 45 | 195 │ 105 │ 100 |
+  | 400×100 (4K) | `wide` | 35 | 177 │ 95 │ 128 |
+  | 500×40 (32:9) | `4k` | 20 | 247 │ 133 │ 120 |
+  | 500×40 (32:9) | `wide` | 14 | 221 │ 119 │ 160 |
+
+  Both curves derive from the same shape: the band takes the preset's share
+  of the rows (45 % or 35 %, floors 20/14, ceiling 80) when no height is
+  saved, and the files dock takes its share of the columns (25 % clamped to
+  34–120, or 32 % clamped to 40–200). A `/split-height` or a saved `bandHeight`
+  always wins over the preset's own curve, and a saved `filesWidth` overrides
+  the dock share. `/split-height` clamps to leave 18 rows for the transcript
+  and editor, the band hides itself entirely on terminals too short for it,
+  the files column drops out below 90 columns (a files-only layout keeps its
+  frame and says so rather than rendering blank), and every rendered row is
+  exactly the terminal width from 40 columns up (tested).
 
 ## Differences from the pi original
 
@@ -162,8 +178,10 @@ equivalent.
 
 Property tests (`test/properties.test.ts`, fast-check) cover the helper
 invariants and, through the widget factory, band geometry for any terminal
-size, cache idempotence, theme invalidation, escape-stripping, and arbitrary
-event streams. Seeds are fixed, so failures reproduce.
+size, the geometry presets (both curves against literal shares, the aspect
+cutoff, pinned-height invariance, argument acceptance and the `/split-save`
+round-trip), cache idempotence, theme invalidation, escape-stripping, and
+arbitrary event streams. Seeds are fixed, so failures reproduce.
 
 `bun install` pulls the whole omp runtime through the host packages pinned in
 `devDependencies`: `node_modules` is ~1 GB, so the first install is slow and the
@@ -185,12 +203,13 @@ bun run check:package
 ```
 
 The repository has no remote yet, so the workflow stays inert until one is
-added; running the six commands above locally is the equivalent check.
+added; running the five commands above locally is the equivalent check.
 
 The Bun pin is deliberate: 1.4.4 changed lcov line attribution and reports
-executed multi-line statements as missed (`split-view.ts` 983 counted / 933 hit
-instead of 1034 / 1033 on the same tests), which fails the coverage gate. Every
-coverage number in this repo was measured on 1.4.3.
+executed multi-line statements as missed — on the pre-preset tree it gave
+`split-view.ts` 983 counted / 933 hit instead of 1034 / 1033 on the same tests
+— which fails the coverage gate. Every coverage number in this repo was
+measured on 1.4.3.
 
 ### Publishing
 
@@ -215,7 +234,7 @@ Bun instruments TypeScript directly (no istanbul/nyc/`--experimental` flags)
 and writes an lcov report; `scripts/check-coverage.ts` parses it and fails the
 command below `lines = 99%` / `functions = 90%` (override with
 `COVERAGE_LINES` / `COVERAGE_FUNCTIONS`). Test fixtures are excluded from the
-totals. Current: 99.92% lines / 97.08% functions — the only uncovered line is
+totals. Current: 99.92% lines / 97.20% functions — the only uncovered line is
 the `themeGetter` default that throws before `session_start` binds a theme; the
 uncovered functions are no-op extension exports.
 

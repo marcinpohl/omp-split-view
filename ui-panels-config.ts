@@ -25,6 +25,10 @@ const CONFIG_PATH = path.join(
 
 export type ToolMode = "compact" | "full";
 
+/** Persisted geometry preset: `4k` (taller band, narrow dock), `wide` (short
+ * band, wide dock), or `auto` — the terminal aspect ratio decides. */
+export type GeometrySetting = "auto" | "4k" | "wide";
+
 export interface UiPanelsConfig {
 	/** Master: is the band (thinking | tools above the editor) active. */
 	split?: boolean;
@@ -47,6 +51,8 @@ export interface UiPanelsConfig {
 	toolsWidthPct?: number;
 	/** Files panel width in columns. Absent = auto (25% of the terminal, 34–120 cols). */
 	filesWidth?: number;
+	/** Layout preset; "auto" picks 4k vs wide from the terminal aspect ratio. */
+	geometry?: GeometrySetting;
 }
 
 /** Strict boolean read — only real booleans count; absent or wrongly-typed
@@ -68,6 +74,7 @@ export function normalizeConfig(raw: UiPanelsConfig): Required<{
 	bandHeight: number;
 	toolsWidthPct: number;
 	filesWidth: number | null;
+	geometry: GeometrySetting;
 }> {
 	// Tolerate any shape — a null root, an array or a primitive reads as an
 	// empty config instead of throwing on property access.
@@ -75,6 +82,10 @@ export function normalizeConfig(raw: UiPanelsConfig): Required<{
 		typeof raw === "object" && raw !== null && !Array.isArray(raw) ? raw : {};
 	const split = boolOr(root.split, false);
 	const tm: ToolMode = root.toolMode === "full" ? "full" : "compact";
+	// geometry — strict literal match; absent or garbage (including a config
+	// written before the key existed) means "auto".
+	const geometry: GeometrySetting =
+		root.geometry === "4k" || root.geometry === "wide" ? root.geometry : "auto";
 	// Only a real finite number is usable; Number(null) === 0 would otherwise
 	// clamp to 6. Non-numeric/unusable values use the default.
 	const rawHeight: unknown = root.bandHeight;
@@ -106,6 +117,7 @@ export function normalizeConfig(raw: UiPanelsConfig): Required<{
 		bandHeight,
 		toolsWidthPct,
 		filesWidth,
+		geometry,
 	};
 }
 

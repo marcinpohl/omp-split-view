@@ -66,11 +66,13 @@ import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
 import type { SessionMessageEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import {
+	GEOMETRY_PROFILES,
 	MAX_BAND_HEIGHT,
 	MIN_BAND_HEIGHT,
 	MIN_DOCK_COLS,
 	MIN_ROWS_BELOW_BAND,
 	appendStreamTail,
+	autoGeometryMode,
 	bandToolsColsFor,
 	capDiffText,
 	capDisplayLine,
@@ -84,6 +86,7 @@ import {
 	sanitizeText,
 	transcriptVisibility,
 	truncateInline,
+	type GeometryMode,
 	type ImageBlock,
 	type TranscriptVisibility,
 } from "./helpers.ts";
@@ -92,6 +95,7 @@ import {
 	loadUiPanelsConfig,
 	normalizeConfig,
 	saveUiPanelsConfig,
+	type GeometrySetting,
 	type ToolMode,
 } from "./ui-panels-config.ts";
 import { existsSync, statSync } from "node:fs";
@@ -134,11 +138,16 @@ let showDiff = true;
 let toolMode: ToolMode = "compact";
 let trimResponse = false;
 let bandHeight = 20;
-/** No explicit band height in the saved config: size it to the terminal once,
- * at first mount, instead of pinning the 20-row default on a 4K display. */
+/** No explicit band height: re-derive it from the current preset at every
+ * mount and on every preset switch, instead of pinning the default on a 4K —
+ * or an ultrawide — display. `/split-height` pins it and clears this. */
 let bandHeightAuto = true;
 let toolsWidthPct = 35;
 let filesWidth: number | null = null;
+/** Persisted preset choice; `auto` derives it from the terminal aspect. */
+let geometrySetting: GeometrySetting = "auto";
+/** Preset in force for this session (resolved from `geometrySetting`). */
+let geometryMode: GeometryMode = "4k";
 
 // ─── thinking buffer ─────────────────────────────────────────────────────────
 
@@ -828,7 +837,10 @@ function panelLayout(width: number): { ids: PanelId[]; filesWidthCols: number } 
 	// A files column needs room for its frame plus something beside it.
 	const filesWidthCols =
 		filesOn && width >= MIN_TERM_WIDTH
-			? Math.max(MIN_DOCK_COLS, Math.min(dockColsFor(width, filesWidth), width - 40))
+			? Math.max(
+					MIN_DOCK_COLS,
+					Math.min(dockColsFor(width, filesWidth, GEOMETRY_PROFILES[geometryMode]), width - 40),
+				)
 			: 0;
 	if (filesWidthCols > 0) ids.push("files");
 	return { ids, filesWidthCols };
@@ -860,6 +872,10 @@ function renderBand(theme: Theme, width: number, bodyRows: number, rows: number)
 		filesOn ? 1 : 0,
 		showDiff ? 1 : 0,
 		filesWidth,
+		// The dock width depends on the preset. `/split-geometry` and a session
+		// load also clear the memo, but an unmount/remount at a new shape with a
+		// pinned height changes nothing else in this key.
+		geometryMode,
 		filesVersion,
 		editDiff.version,
 		toolMode,
@@ -1053,6 +1069,19 @@ function filesPanelLines(theme: Theme, width: number, height: number, notice?: s
 
 // ─── mount / unmount ─────────────────────────────────────────────────────────
 
+/** Preset in force for the live terminal: a pinned setting wins, `auto` reads
+ * the aspect ratio. Called wherever the setting or the terminal may have
+ * changed (mount, session load, `/split-geometry`), because the widget is
+ * mounted once per process and does not re-enter its factory on a session
+ * switch. With no terminal bound yet, `auto` resolves to `4k` until the mount
+ * reports the real size. */
+function resolveGeometryMode(): GeometryMode {
+	if (geometrySetting !== "auto") return geometrySetting;
+	const cols = tuiRef?.terminal.columns ?? 0;
+	const rows = tuiRef?.terminal.rows ?? 0;
+	return autoGeometryMode(cols, rows);
+}
+
 function mountWidget(ctx: ExtensionContext): void {
 	if (ctx.mode !== "tui" || widgetMounted) return;
 	widgetMounted = true;
@@ -1060,9 +1089,9 @@ function mountWidget(ctx: ExtensionContext): void {
 		WIDGET_KEY,
 		tui => {
 			tuiRef = tui;
+			geometryMode = resolveGeometryMode();
 			if (bandHeightAuto) {
-				bandHeight = defaultBandHeight(tui.terminal.rows);
-				bandHeightAuto = false;
+				bandHeight = defaultBandHeight(tui.terminal.rows, GEOMETRY_PROFILES[geometryMode]);
 				bandCacheKey = "";
 			}
 			return new BandHub(tui);
@@ -1271,6 +1300,11 @@ function registerEvents(pi: ExtensionAPI): void {
 		bandHeight = cfg.bandHeight;
 		const rawHeight: unknown = isRecord(raw) ? (raw as { bandHeight?: unknown }).bandHeight : undefined;
 		bandHeightAuto = typeof rawHeight !== "number";
+		geometrySetting = cfg.geometry;
+		// The widget is mounted once, so its factory does not run again on a
+		// session switch: resolve here as well, or an ultrawide pane would drop
+		// back to the 4k curve until the next mount.
+		geometryMode = resolveGeometryMode();
 		toolsWidthPct = cfg.toolsWidthPct;
 		filesWidth = cfg.filesWidth;
 		filesOn = cfg.files;
@@ -1361,9 +1395,11 @@ function registerEvents(pi: ExtensionAPI): void {
 	});
 }
 
-/** All ten slash commands: toggles first, then band settings and persistence. */
+/** All eleven slash commands: toggles first, then band settings and
+ * persistence. */
 function registerCommands(pi: ExtensionAPI): void {
 	registerPanelToggles(pi);
+	registerGeometryCommand(pi);
 	registerBandSettings(pi);
 }
 
@@ -1457,6 +1493,53 @@ function registerPanelToggles(pi: ExtensionAPI): void {
 	});
 }
 
+/** Accepted `/split-geometry` arguments; any other non-empty arg is rejected. */
+function isGeometrySetting(value: string): value is GeometrySetting {
+	return value === "auto" || value === "4k" || value === "wide";
+}
+
+/** Resolve the preset for the current terminal, re-derive an auto band height
+ * from it, and report the geometry that resulted. */
+function applyGeometry(ctx: ExtensionContext): void {
+	const cols = tuiRef?.terminal.columns ?? 0;
+	const rows = tuiRef?.terminal.rows ?? 0;
+	geometryMode = resolveGeometryMode();
+	if (bandHeightAuto && rows > 0)
+		bandHeight = defaultBandHeight(rows, GEOMETRY_PROFILES[geometryMode]);
+	bandCacheKey = "";
+	reconcile(ctx);
+	syncTranscriptVisibility();
+	const profile = GEOMETRY_PROFILES[geometryMode];
+	// Same clamp panelLayout applies, so the message names the dock you get.
+	const dock = Math.max(MIN_DOCK_COLS, Math.min(dockColsFor(cols, filesWidth, profile), cols - 40));
+	const label = geometrySetting === "auto" ? `auto (${geometryMode})` : geometryMode;
+	notify(
+		bandHeightAuto
+			? `Geometry: ${label} — band ${bandHeight} rows, dock ${dock} cols`
+			: `Geometry: ${label} — dock ${dock} cols, band height ${bandHeight} rows (pinned)`,
+	);
+}
+
+/** `/split-geometry`: pin a preset, or hand the choice back to the terminal. */
+function registerGeometryCommand(pi: ExtensionAPI): void {
+	pi.registerCommand("split-geometry", {
+		description: "Switch band/dock geometry preset: 4k ↔ wide (/split-geometry auto restores aspect-ratio detection)",
+		handler: async (args, ctx) => {
+			if (!requireTui(ctx)) return;
+			const arg = String(args ?? "").trim().toLowerCase();
+			if (arg !== "" && !isGeometrySetting(arg)) {
+				notify("Invalid geometry (usage: /split-geometry auto|4k|wide)", "error");
+				return;
+			}
+			// No argument pins the preset the layout is not using, so the
+			// switch visibly flips the band even when `auto` picked it.
+			const other: GeometrySetting = geometryMode === "4k" ? "wide" : "4k";
+			geometrySetting = isGeometrySetting(arg) ? arg : other;
+			applyGeometry(ctx);
+		},
+	});
+}
+
 /** Band geometry, tool-view depth, response-only and `/split-save`. */
 function registerBandSettings(pi: ExtensionAPI): void {
 	pi.registerCommand("split-tools-view", {
@@ -1545,6 +1628,7 @@ function registerBandSettings(pi: ExtensionAPI): void {
 				trimResponse,
 				bandHeight,
 				toolsWidthPct,
+				geometry: geometrySetting,
 				...(filesWidth === null ? {} : { filesWidth }),
 				diff: showDiff,
 			});

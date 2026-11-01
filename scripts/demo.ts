@@ -21,6 +21,7 @@ import { join } from "node:path";
 process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "omp-split-view-demo-"));
 
 const { default: splitView, retainedThinkingBlocks, retainedToolEntries } = await import("../split-view.ts");
+const { autoGeometryMode } = await import("../helpers.ts");
 const { visibleWidth } = await import("@oh-my-pi/pi-tui");
 
 /** Identity colorizer: rows print as plain text with real cell geometry. */
@@ -179,7 +180,7 @@ const measure = async (width: number, rows: number) => {
 	return { rows: lines.length, starts };
 };
 
-console.log("  terminal     band  thinking | tools | files (cols)");
+console.log("  terminal    preset   band  thinking | tools | files (cols)");
 for (const [width, rows] of [
 	[120, 45], // classic
 	[200, 60], // 1440p, larger font
@@ -191,11 +192,13 @@ for (const [width, rows] of [
 	const tools = (starts[2] ?? width) - (starts[1] ?? width);
 	const files = width - (starts[2] ?? width);
 	const size = `${width}x${rows}`;
+	const preset = autoGeometryMode(width, rows);
 	const columns = `${String(thinking).padStart(8)} | ${String(tools).padStart(5)} | ${String(files).padStart(5)}`;
-	console.log(`  ${size.padEnd(11)} ${String(band).padStart(4)}  ${columns}`);
+	console.log(`  ${size.padEnd(11)} ${preset.padEnd(6)} ${String(band).padStart(4)}  ${columns}`);
 }
-console.log("  band = 45% of rows when no height is saved (20 floor, 80 ceiling);");
-console.log("  dock = 25% of columns (34 floor, 120 ceiling); /split-height keeps 18 rows for the transcript.");
+console.log("  preset = auto: wide (≥8 cols/row) takes 35% of the rows and 32% of the cols,");
+console.log("  4k takes 45% and 25% (20-row floor, 80-row ceiling; 34/120-col dock bounds).");
+console.log("  /split-geometry pins 4k or wide; /split-height keeps 18 rows for the transcript.");
 
 heading("6. State bounds — seams the suite asserts on");
 await resetBuffers();

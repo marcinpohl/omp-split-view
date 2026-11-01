@@ -9,13 +9,17 @@ import {
 	AUTO_DOCK_MAX_COLS,
 	AUTO_DOCK_MIN_COLS,
 	AUTO_DOCK_PCT,
+	DOCK_LEFT_RESERVE,
+	GEOMETRY_PROFILES,
 	MAX_BAND_HEIGHT,
 	MIN_BAND_HEIGHT,
 	MIN_DOCK_COLS,
 	appendStreamTail,
+	autoGeometryMode,
 	bandToolsColsFor,
 	capDisplayLine,
 	capToolText,
+	defaultBandHeight,
 	dockColsFor,
 	formatDuration,
 	isHighSurrogate,
@@ -152,6 +156,197 @@ describe("dockColsFor", () => {
 				},
 			),
 			{ numRuns: 500, seed: SEED },
+		);
+	});
+});
+
+/** 4k/wide are ordered: `wide` trades band rows for dock columns. */
+describe("geometry profiles", () => {
+	const PRESETS = ["4k", "wide"] as const;
+	const rows = fc.integer({ min: 0, max: 2000 });
+	const cols = fc.integer({ min: 0, max: 2000 });
+	const rank = (mode: string) => (mode === "wide" ? 1 : 0);
+
+	test("the band stays inside its profile's floor and the shared ceiling", () => {
+		fc.assert(
+			fc.property(rows, fc.constantFrom(...PRESETS), (n, preset) => {
+				const profile = GEOMETRY_PROFILES[preset];
+				const height = defaultBandHeight(n, profile);
+				expect(Number.isInteger(height)).toBe(true);
+				expect(height).toBeGreaterThanOrEqual(profile.minBandRows);
+				expect(height).toBeLessThanOrEqual(MAX_BAND_HEIGHT);
+				// Inside the bounds the share applies verbatim; outside, the bound wins.
+				const share = Math.floor(n * profile.bandPct);
+				if (share < profile.minBandRows) expect(height).toBe(profile.minBandRows);
+				else if (share > MAX_BAND_HEIGHT) expect(height).toBe(MAX_BAND_HEIGHT);
+				else expect(height).toBe(share);
+			}),
+			{ numRuns: 500, seed: SEED },
+		);
+	});
+
+	test("the band never shrinks as the terminal grows", () => {
+		fc.assert(
+			fc.property(rows, rows, fc.constantFrom(...PRESETS), (a, b, preset) => {
+				const [lo, hi] = a <= b ? [a, b] : [b, a];
+				const profile = GEOMETRY_PROFILES[preset];
+				expect(defaultBandHeight(lo, profile)).toBeLessThanOrEqual(defaultBandHeight(hi, profile));
+			}),
+			{ numRuns: 300, seed: SEED },
+		);
+	});
+
+	test("the auto dock stays inside the profile's bounds, grows, and applies the share mid-range", () => {
+		fc.assert(
+			fc.property(cols, fc.constantFrom(...PRESETS), (width, preset) => {
+				const profile = GEOMETRY_PROFILES[preset];
+				const dock = dockColsFor(width, null, profile);
+				expect(Number.isInteger(dock)).toBe(true);
+				expect(dock).toBeGreaterThanOrEqual(profile.minDockCols);
+				expect(dock).toBeLessThanOrEqual(profile.maxDockCols);
+				const share = Math.floor(width * profile.dockPct);
+				if (share < profile.minDockCols) expect(dock).toBe(profile.minDockCols);
+				else if (share > profile.maxDockCols) expect(dock).toBe(profile.maxDockCols);
+				// Within the bounds the share applies, so the dock keeps growing
+				// instead of flat-capping mid-range.
+				else expect(dock).toBe(share);
+			}),
+			{ numRuns: 500, seed: SEED },
+		);
+	});
+
+	test("the auto dock never shrinks as the terminal widens", () => {
+		fc.assert(
+			fc.property(cols, cols, fc.constantFrom(...PRESETS), (a, b, preset) => {
+				const [narrow, wide] = a <= b ? [a, b] : [b, a];
+				const profile = GEOMETRY_PROFILES[preset];
+				expect(dockColsFor(narrow, null, profile)).toBeLessThanOrEqual(
+					dockColsFor(wide, null, profile),
+				);
+			}),
+			{ numRuns: 300, seed: SEED },
+		);
+	});
+
+	test("a manual dock width ignores the preset and is idempotent", () => {
+		fc.assert(
+			fc.property(
+				fc.integer({ min: 40, max: 2000 }),
+				fc.option(fc.integer({ min: -100, max: 2000 }), { nil: null }),
+				(width, manual) => {
+					if (manual === null) return;
+					const preset = dockColsFor(width, manual, GEOMETRY_PROFILES.wide);
+					expect(preset).toBe(dockColsFor(width, manual, GEOMETRY_PROFILES["4k"]));
+					expect(preset).toBe(dockColsFor(width, manual));
+					expect(preset).toBeGreaterThanOrEqual(MIN_DOCK_COLS);
+					expect(preset).toBeLessThanOrEqual(Math.max(MIN_DOCK_COLS, width - DOCK_LEFT_RESERVE));
+					// Re-clamping an already clamped width cannot move it.
+					expect(dockColsFor(width, preset, GEOMETRY_PROFILES.wide)).toBe(preset);
+				},
+			),
+			{ numRuns: 500, seed: SEED },
+		);
+	});
+
+	test("4k reproduces the pre-switch curve exactly", () => {
+		// The default profile is the old behavior: any drift here would move
+		// every existing 4K/1440p layout without a preset switch.
+		fc.assert(
+			fc.property(rows, cols, (n, width) => {
+				expect(defaultBandHeight(n)).toBe(
+					Math.max(20, Math.min(MAX_BAND_HEIGHT, Math.floor(n * 0.45))),
+				);
+				expect(dockColsFor(width)).toBe(
+					Math.max(
+						AUTO_DOCK_MIN_COLS,
+						Math.min(AUTO_DOCK_MAX_COLS, Math.floor(width * AUTO_DOCK_PCT)),
+					),
+				);
+			}),
+			{ numRuns: 500, seed: SEED },
+		);
+	});
+
+	test("wide always spends fewer rows and buys more columns", () => {
+		fc.assert(
+			fc.property(rows, cols, (n, width) => {
+				const fourK = GEOMETRY_PROFILES["4k"];
+				const wide = GEOMETRY_PROFILES.wide;
+				const fourKBand = defaultBandHeight(n, fourK);
+				const wideBand = defaultBandHeight(n, wide);
+				expect(wideBand).toBeLessThanOrEqual(fourKBand);
+				// Strict while the 4k band has not hit the ceiling (below ~178 rows).
+				if (fourKBand < MAX_BAND_HEIGHT) expect(wideBand).toBeLessThan(fourKBand);
+				expect(dockColsFor(width, null, wide)).toBeGreaterThan(dockColsFor(width, null, fourK));
+			}),
+			{ numRuns: 500, seed: SEED },
+		);
+	});
+
+	test("each preset matches its documented curve at every size", () => {
+		// Literal shares, not the module's own constants: a drifted `bandPct`
+		// or `dockPct` must fail here, which is why the other geometry
+		// properties (they derive expectations from the profiles) cannot.
+		const DOCUMENTED = {
+			"4k": { bandPct: 0.45, minBand: 20, dockPct: 0.25, minDock: 34, maxDock: 120 },
+			wide: { bandPct: 0.35, minBand: 14, dockPct: 0.32, minDock: 40, maxDock: 200 },
+		} as const;
+		fc.assert(
+			fc.property(rows, cols, fc.constantFrom(...PRESETS), (n, width, preset) => {
+				const spec = DOCUMENTED[preset];
+				expect(defaultBandHeight(n, GEOMETRY_PROFILES[preset])).toBe(
+					Math.max(spec.minBand, Math.min(MAX_BAND_HEIGHT, Math.floor(n * spec.bandPct))),
+				);
+				expect(dockColsFor(width, null, GEOMETRY_PROFILES[preset])).toBe(
+					Math.max(spec.minDock, Math.min(spec.maxDock, Math.floor(width * spec.dockPct))),
+				);
+			}),
+			{ numRuns: 500, seed: SEED },
+		);
+	});
+
+	test("autoGeometryMode matches the exact aspect threshold", () => {
+		// Literal 8: the documented ultrawide cutoff, not `AUTO_WIDE_ASPECT`.
+		fc.assert(
+			fc.property(
+				fc.integer({ min: 1, max: 500 }),
+				fc.integer({ min: 0, max: 10_000 }),
+				(rows, cols) => {
+					expect(autoGeometryMode(cols, rows)).toBe(cols >= 8 * rows ? "wide" : "4k");
+					// Both sides of the boundary, exactly.
+					expect(autoGeometryMode(8 * rows, rows)).toBe("wide");
+					expect(autoGeometryMode(8 * rows - 1, rows)).toBe("4k");
+				},
+			),
+			{ numRuns: 400, seed: SEED },
+		);
+	});
+
+	test("autoGeometryMode only ever narrows as the pane gets taller", () => {
+		// From one reported row up: at zero rows there is no shape to read, and
+		// the fallback (`4k`) is deliberately not part of the ordering.
+		fc.assert(
+			fc.property(
+				fc.integer({ min: 1, max: 500 }),
+				fc.integer({ min: 1, max: 500 }),
+				fc.integer({ min: 0, max: 5000 }),
+				(a, b, cols) => {
+					const [shorter, taller] = a <= b ? [a, b] : [b, a];
+					expect(rank(autoGeometryMode(cols, shorter))).toBeGreaterThanOrEqual(
+						rank(autoGeometryMode(cols, taller)),
+					);
+				},
+			),
+			{ numRuns: 300, seed: SEED },
+		);
+	});
+
+	test("a pane with no reported rows never counts as wide", () => {
+		fc.assert(
+			fc.property(fc.integer({ min: 0, max: 5000 }), fc.integer({ min: -50, max: 0 }), (cols, rows) => {
+				expect(autoGeometryMode(cols, rows)).toBe("4k");
+			}),
+			{ numRuns: 100, seed: SEED },
 		);
 	});
 });
@@ -306,6 +501,24 @@ describe("normalizeConfig", () => {
 				expect(normalizeConfig(cfg as never)).toEqual(cfg);
 			}),
 			{ numRuns: 500, seed: SEED },
+		);
+	});
+
+	test("geometry keeps only the three literals and defaults to auto", () => {
+		const SETTINGS = ["auto", "4k", "wide"] as const;
+		fc.assert(
+			fc.property(
+				fc.oneof(fc.string(), fc.constantFrom(...SETTINGS), fc.anything()),
+				raw => {
+					const cfg = normalizeConfig({ geometry: raw as never });
+					expect(SETTINGS).toContain(cfg.geometry);
+					const expected = raw === "4k" || raw === "wide" ? raw : "auto";
+					expect(cfg.geometry).toBe(expected);
+					// A normalized value must survive another round trip unchanged.
+					expect(normalizeConfig({ geometry: cfg.geometry }).geometry).toBe(cfg.geometry);
+				},
+			),
+			{ numRuns: 400, seed: SEED },
 		);
 	});
 

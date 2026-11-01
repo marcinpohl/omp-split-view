@@ -6,8 +6,8 @@ checker, and throwaway probe scripts; none are inferred.
 
 `CODE_QUALITY.md` owns the measured snapshot (tests/coverage/lint) and the
 ranked queue; this file owns the behaviour descriptions and acceptance text.
-Status below is reconciled against `CODE_QUALITY.md` as of the Q1–Q7/B7
-structural batch (the commit that added `.github/workflows/ci.yml`).
+Status below is reconciled against `CODE_QUALITY.md` as of the G1 geometry
+preset switch (the batch before it: Q1–Q7 structural, B7 CI).
 
 ## Verified baseline (re-check after any change)
 
@@ -16,17 +16,19 @@ its numbers in sync with these commands.
 
 | Command | Expected |
 | --- | --- |
-| `bun test` | 102 pass, 0 fail, 32439 expect() calls |
-| `bun run test:coverage` | gate passes: lines ≥ 99%, functions ≥ 90% (currently 99.92% / 97.08%) |
+| `bun test` | 133 pass, 0 fail, 49019 expect() calls |
+| `bun run test:coverage` | gate passes: lines ≥ 99%, functions ≥ 90% (currently 99.92% / 97.20%) |
 | `bun run lint` | 0 errors, 2 warnings (the parked Q8 pair) |
 | `bun run typecheck` | clean (`tsc --noEmit`, strict) |
 | `bun run check:package` | `check-package: ok — 3 shipped modules (@marcinpohl/omp-split-view@0.1.0)` |
 | geometry sweep (probe below) | 0 failures (40–300 cols × 6–40 rows), rows == height, every row exactly `width` cells, no control chars |
+| geometry preset properties | 0 failures (90–420 cols × 24–140 rows × saved/auto preset; both curves at 0–2000 rows/cols against literal shares) |
+| `bun run demo` | prints frames; section 5 shows 120×45 `4k` 20 │ 56│30│34, 400×100 `4k` 45 │ 195│105│100, 500×60 `wide` 21 │ 221│119│160 |
 
-Files: `split-view.ts` 1559 L, `helpers.ts` 278 L, `ui-panels-config.ts` 155 L,
-`test/split-view.test.ts` 1444 L, `test/properties.test.ts` 320 L,
-`test/helpers.test.ts` 255 L, `test/setup.ts` 7 L, `scripts/check-coverage.ts`
-90 L, `scripts/check-package.ts` 167 L, `.github/workflows/ci.yml` 18 L,
+Files: `split-view.ts` 1643 L, `helpers.ts` 323 L, `ui-panels-config.ts` 165 L,
+`test/split-view.test.ts` 1779 L, `test/properties.test.ts` 533 L,
+`test/helpers.test.ts` 294 L, `test/setup.ts` 7 L, `scripts/check-coverage.ts`
+90 L, `scripts/check-package.ts` 169 L, `.github/workflows/ci.yml` 18 L,
 `.github/workflows/publish.yml` 39 L, `CODE_QUALITY.md`, `eslint.config.js`.
 Git repository with CI (W7/B7 done); no remote, so the workflow is inert until
 one is added.
@@ -57,6 +59,19 @@ Fixed during the 2026-11-01 passes (not planned, found by testing):
   renders. Properties: "model and tool text can never reach a row as terminal
   escapes", plus the sanitizeText unit properties and the two row-level tests
   for replayed thinking and a hostile `details.diff`.
+- **A saved geometry preset was never armed (G1).** The mount factory resolved
+  `geometryMode` only for `auto`, while `session_start` reset it to `4k`, so a
+  saved `wide`/`4k` was overwritten before it could size the band. The factory
+  now resolves the mode unconditionally through `resolveGeometryMode()`.
+  Regressions: "a saved preset overrides the aspect ratio in both directions",
+  "the preset is saved and drives the next session's layout".
+- **A session switch dropped an ultrawide pane to `4k` (G1).** Resolution
+  lived only in the widget factory, which the host calls on first mount;
+  switching sessions in one process left `geometryMode` at the reset value
+  until the next mount. `resolveGeometryMode()` now also runs on session load.
+  Regression: "a session switch keeps the auto preset without a remount"
+  (asserted through the no-arg `/split-geometry` message, because rendering
+  would re-enter the factory and mask it).
 
 Fixed during the 2026-11-01 improvement pass (S1–S6 in `CODE_QUALITY.md`;
 same-day probe numbers before → after):
@@ -125,6 +140,7 @@ that order's terms. After every item run `bun test`, `bun run test:coverage`,
 | T6 command argument handling | done | — |
 | T7 tool panel extras | done | B6 |
 | W8 large-terminal geometry | done | — |
+| W9 geometry preset switch (`4k`/`wide`) | done | G1 |
 
 ### W1 — Theme cache misses `text` (low, one line)
 
@@ -219,8 +235,9 @@ tool preview at 2 output lines. Now the dock is 25% of the width (34–120), the
 band defaults to 45% of the terminal height when no height is saved (20–80,
 so a 45-row screen keeps the classic 20) and may be set up to
 `maxBandHeight(rows)`, which always leaves 18 rows for the transcript and
-editor, and the tool preview depth follows the band (2–6 lines). Helpers
-(`defaultBandHeight`, `maxBandHeight`, `dockColsFor`) are unit- and
+editor, and the tool preview depth follows the band (2–6 lines). Those are now
+the `4k` preset's numbers — W9 adds `wide` and the aspect-based choice on top.
+Helpers (`defaultBandHeight`, `maxBandHeight`, `dockColsFor`) are unit- and
 property-tested, the composed band is asserted at 400×100 (45 rows, columns
 at 0/195/300), `/split-height` clamping is a property, and an explicitly saved
 height is proven to survive the terminal-derived default. `bun run demo`
@@ -231,6 +248,34 @@ section 5 prints the resulting table for 120×45, 200×60, 400×100 and 500×60.
   `previewLinesFor`), `ui-panels-config.ts` (height clamp 6–80).
 - Acceptance: no fixed geometric cap below the terminal size; a chosen height
   is never overridden; a request that would hide the band is clamped instead.
+
+### W9 — One geometry curve for every terminal shape (med) — **done**
+
+**Done** — W8's single auto curve is right for a 4K cell grid (~400×100) but
+spends scarce rows and leaves columns unused on a 21:9/32:9 pane. Two presets
+now exist: `4k` (45 % of rows, 25 % of columns — W8's curve, and still the
+default the helpers return) and `wide` (35 % of rows, 32 % of columns, floors
+20/14 rows, dock 40–200). `auto` picks by aspect ratio (≥ 8 columns per row =
+ultrawide, which separates 21:9 ≈ 10.8 and 32:9 ≈ 12.5 from 16:9 ≈ 6 and 4K
+≈ 4). `/split-geometry [auto|4k|wide]` pins it (no argument flips to the other
+preset), `/split-save` persists it, and a manual `/split-height` or a saved
+`filesWidth` still wins over the preset's curve.
+
+- Acceptance, all asserted: `auto` → `wide` on 500×40 (14 rows,
+  `[0, 221, 340]`) and `4k` on 400×100 (45 rows, unchanged); a saved preset
+  overrides the ratio both ways (500×40 pinned `4k` → 20 rows,
+  `[0, 247, 380]`); an unknown argument errors and moves nothing; a pinned
+  height survives a preset switch (`30 rows (pinned)`, dock follows the
+  preset); `/split-save` writes `geometry` and the next session applies it
+  (400×100 + `wide`, no saved height → 35 rows, `[0, 177, 272]`).
+- Property coverage (fast-check, seed `20261101`): documented curve vs literal
+  shares at any size, bounds/monotonicity of both curves, the exact aspect
+  boundary and its monotonicity, profile-invariant manual widths, the composed
+  band (rows + column offsets) for arbitrary terminal sizes and saved/auto
+  presets, pinned-height invariance with the message checked against the
+  rendered offsets, `auto|4k|wide` as the only accepted arguments (anything
+  else renders identically), `auto|4k|wide` round-tripping through
+  `/split-save`, and a remount at a new shape dropping the band memo.
 
 ### W6 — `reconstruct` replays every bash token through `fs` (low-med) — **open (Q3 landed without folding it)**
 

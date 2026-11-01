@@ -9,8 +9,22 @@ import "@oh-my-pi/pi-coding-agent/session/settings";
 import "@oh-my-pi/pi-coding-agent/modes/settings";
 import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
 import splitView, { retainedEditDiff, retainedThinkingBlocks, retainedToolEntries } from "../split-view.ts";
-import { MAX_DIFF_CHARS, MAX_DIFF_LINES } from "../helpers.ts";
-import { CONFIG_FILE, loadUiPanelsConfig, saveUiPanelsConfig } from "../ui-panels-config.ts";
+import {
+	GEOMETRY_PROFILES,
+	MAX_BAND_HEIGHT,
+	MAX_DIFF_CHARS,
+	MAX_DIFF_LINES,
+	MIN_BAND_HEIGHT,
+	MIN_DOCK_COLS,
+	MIN_ROWS_BELOW_BAND,
+	autoGeometryMode,
+	bandToolsColsFor,
+	defaultBandHeight,
+	dockColsFor,
+	maxBandHeight,
+	type GeometryProfile,
+} from "../helpers.ts";
+import { CONFIG_FILE, loadUiPanelsConfig, normalizeConfig, saveUiPanelsConfig } from "../ui-panels-config.ts";
 
 /** Identity colorizer: keeps row geometry measurable without a live theme. */
 const flatTheme = {
@@ -1040,6 +1054,327 @@ describe("large terminals (4K / ultrawide)", () => {
 		expect(joined).toContain("· +8 more");
 		expect(joined).not.toContain("· L4");
 		await setToggle("split-tools-view", /compact/);
+	});
+});
+
+/**
+ * The geometry preset switch: `auto` derives 4k vs wide from the terminal
+ * aspect ratio, `/split-geometry` pins either preset, and a pinned band height
+ * keeps winning over the preset's own curve.
+ */
+describe("geometry presets", () => {
+	const writeConfig = (cfg: unknown) => writeFileSync(CONFIG_FILE, JSON.stringify(cfg));
+	const fullLayout = { split: true, thinking: true, tools: true, files: true, diff: true };
+
+	afterAll(async () => {
+		rmSync(CONFIG_FILE, { recursive: true, force: true });
+		h.setSize(120, 45);
+		await h.emit("session_start"); // no config -> bare layout, auto geometry
+		await h.command("split");
+		await h.command("split-height", "20");
+	});
+
+	test("auto picks wide on a 32:9 pane: a 14-row band and a 160-col dock", async () => {
+		writeConfig(fullLayout);
+		h.setSize(500, 40);
+		await h.emit("session_start");
+		const lines = h.widget()!.render(500);
+		expect(lines.length).toBe(14); // 35% of 40 rows
+		assertExactWidth(lines, 500);
+		// 500 cols: dock = 32% (160), thinking | tools split the other 340.
+		expect(columnStarts(lines[0])).toEqual([0, 221, 340]);
+	});
+
+	test("a saved preset overrides the aspect ratio in both directions", async () => {
+		writeConfig({ ...fullLayout, geometry: "wide" });
+		h.setSize(500, 40);
+		await h.emit("session_start");
+		const wide = h.widget()!.render(500);
+		expect(wide.length).toBe(14);
+		expect(columnStarts(wide[0])).toEqual([0, 221, 340]);
+
+		writeConfig({ ...fullLayout, geometry: "4k" });
+		await h.emit("session_start");
+		const fourK = h.widget()!.render(500);
+		expect(fourK.length).toBe(20); // the 4k curve on the same pane
+		expect(columnStarts(fourK[0])).toEqual([0, 247, 380]);
+	});
+
+	test("an unknown argument is rejected and leaves the layout alone", async () => {
+		writeConfig(fullLayout);
+		h.setSize(500, 40);
+		await h.emit("session_start"); // auto -> wide
+		await h.command("split-geometry", "3d");
+		expect(h.notifications.at(-1)?.level).toBe("error");
+		expect(h.notifications.at(-1)?.message).toContain(
+			"Invalid geometry (usage: /split-geometry auto|4k|wide)",
+		);
+		expect(h.widget()!.render(500).length).toBe(14);
+	});
+
+	test("/split-geometry pins a preset and reports the resulting geometry", async () => {
+		await h.command("split-geometry", "4k");
+		expect(h.notifications.at(-1)?.message).toBe("Geometry: 4k — band 20 rows, dock 120 cols");
+		const lines = h.widget()!.render(500);
+		expect(lines.length).toBe(20);
+		expect(columnStarts(lines[0])).toEqual([0, 247, 380]);
+	});
+
+	test("no argument flips the preset in force; `auto` hands it back to the aspect ratio", async () => {
+		await h.command("split-geometry");
+		expect(h.notifications.at(-1)?.message).toBe("Geometry: wide — band 14 rows, dock 160 cols");
+		await h.command("split-geometry", "auto");
+		expect(h.notifications.at(-1)?.message.startsWith("Geometry: auto (wide)")).toBe(true);
+	});
+
+	test("a pinned height survives a preset switch; only the dock follows the preset", async () => {
+		h.setSize(500, 60);
+		await h.emit("session_start"); // auto -> wide (500 / 60 ≈ 8.3)
+		await h.command("split-height", "30");
+		await h.command("split-geometry", "4k");
+		const message = h.notifications.at(-1)?.message ?? "";
+		expect(message).toContain("band height 30 rows (pinned)");
+		expect(message).toContain("dock 120 cols");
+		expect(h.widget()!.render(500).length).toBe(30);
+	});
+
+	test("the preset is saved and drives the next session's layout", async () => {
+		await h.command("split-geometry", "wide");
+		await h.command("split-save");
+		expect(JSON.parse(readFileSync(CONFIG_FILE, "utf8")).geometry).toBe("wide");
+
+		// With no saved height the band curve follows the preset: wide keeps 35
+		// of the 100 rows at 4K (and grows the dock from 100 to 128 cols).
+		writeConfig({ ...fullLayout, geometry: "wide" });
+		h.setSize(400, 100);
+		await h.emit("session_start");
+		const lines = h.widget()!.render(400);
+		expect(lines.length).toBe(35);
+		assertExactWidth(lines, 400);
+		expect(columnStarts(lines[0])).toEqual([0, 177, 272]);
+	});
+
+	test("a session switch keeps the auto preset without a remount", async () => {
+		writeConfig(fullLayout);
+		h.setSize(500, 40);
+		await h.emit("session_start");
+		await h.widget(); // the host mounts once and keeps this band
+		await h.emit("session_start"); // second session: no factory call
+		// The no-arg flip reads the preset the switch left in force, so it
+		// reveals whether the auto resolution survived a session load.
+		await h.command("split-geometry");
+		expect(h.notifications.at(-1)?.message).toBe("Geometry: 4k — band 20 rows, dock 120 cols");
+	});
+
+	test("a restart on a differently shaped pane re-lays a pinned band", async () => {
+		// Same width, taller pane: the resolved preset flips 4k and only the
+		// dock moves, so a stale band memo would keep the old dock.
+		writeConfig({ ...fullLayout, bandHeight: 30 });
+		h.setSize(500, 60); // 8.3 cols/row -> wide
+		await h.emit("session_start");
+		const wide = h.widget()!.render(500);
+		expect(500 - columnStarts(wide[0])[2]).toBe(160);
+		h.setSize(500, 90); // 5.6 cols/row -> 4k, same pinned height
+		await h.emit("session_start");
+		const fourK = h.widget()!.render(500);
+		expect(fourK.length).toBe(30); // the pinned height still wins
+		expect(500 - columnStarts(fourK[0])[2]).toBe(120);
+	});
+
+	test("a remount after a resize drops the band memo of the old preset", async () => {
+		// Unmount/remount (panels off then on) keeps the memo but no height
+		// change, so only the preset in the cache key can force a re-layout.
+		writeConfig({ ...fullLayout, bandHeight: 30 });
+		h.setSize(500, 60); // 8.3 cols/row -> wide
+		await h.emit("session_start");
+		const wide = h.widget()!.render(500);
+		expect(500 - columnStarts(wide[0])[2]).toBe(160);
+		await h.command("split"); // all panels off: the widget unmounts
+		h.setSize(500, 90); // 5.6 cols/row -> 4k, same 30-row band
+		await h.command("split"); // back on: a fresh mount at the new shape
+		const fourK = h.widget()!.render(500);
+		expect(fourK.length).toBe(30);
+		expect(500 - columnStarts(fourK[0])[2]).toBe(120);
+	});
+});
+
+/**
+ * Property-level geometry: the presets, the aspect resolution and the command
+ * surface must hold for arbitrary terminal sizes and arguments, not just the
+ * pinned examples in the `geometry presets` block above.
+ */
+describe("geometry preset properties", () => {
+	const writeConfig = (cfg: unknown) => writeFileSync(CONFIG_FILE, JSON.stringify(cfg));
+	const fullLayout = { split: true, thinking: true, tools: true, files: true, diff: true };
+	const columnsArb = fc.integer({ min: 90, max: 420 });
+	const rowsArb = fc.integer({ min: 24, max: 140 });
+	/** Rows the band must occupy, 0 when the terminal is too short for it. */
+	const expectedRows = (rows: number, profile: GeometryProfile): number => {
+		const band = defaultBandHeight(rows, profile);
+		return rows - band >= MIN_ROWS_BELOW_BAND ? band : 0;
+	};
+	/** The dock panelLayout settles on at this width, before composition. */
+	const expectedDock = (cols: number, profile: GeometryProfile): number =>
+		Math.max(MIN_DOCK_COLS, Math.min(dockColsFor(cols, null, profile), cols - 40));
+
+	afterAll(async () => {
+		rmSync(CONFIG_FILE, { recursive: true, force: true });
+		h.setSize(120, 45);
+		await h.emit("session_start");
+		await h.command("split");
+		await h.command("split-height", "20");
+	});
+
+	test("the resolved preset sizes the band and the dock for any terminal", async () => {
+		await fc.assert(
+			fc.asyncProperty(
+				columnsArb,
+				rowsArb,
+				fc.option(fc.constantFrom("4k", "wide"), { nil: undefined }),
+				async (cols, rows, saved) => {
+					// No saved preset = `auto`, which must read the aspect ratio.
+					writeConfig({
+						...fullLayout,
+						// toolsWidthPct pinned so the 65/35 band split is the spec's.
+						toolsWidthPct: 35,
+						...(saved === undefined ? {} : { geometry: saved }),
+					});
+					h.setSize(cols, rows);
+					await h.emit("session_start");
+					const preset = saved ?? autoGeometryMode(cols, rows);
+					const profile = GEOMETRY_PROFILES[preset];
+					const want = expectedRows(rows, profile);
+					const lines = h.widget()!.render(cols);
+					expect(lines.length).toBe(want);
+					if (want === 0) return;
+					assertExactWidth(lines, cols);
+					// files on and cols >= 90: the dock is always there, and the
+					// remaining columns split 65 / 35 between thinking and tools.
+					const dock = expectedDock(cols, profile);
+					const remaining = cols - dock;
+					const tools = bandToolsColsFor(remaining, 35);
+					expect(columnStarts(lines[0])).toEqual([0, remaining - tools, cols - dock]);
+				},
+			),
+			{ numRuns: 40, seed: 20261101 },
+		);
+	});
+
+	test("a pinned height survives any preset switch and the message names the real dock", async () => {
+		await fc.assert(
+			fc.asyncProperty(
+				fc.integer({ min: 24, max: 140 }),
+				fc.integer({ min: 1, max: 200 }),
+				fc.constantFrom("4k", "wide"),
+				async (rows, pin, preset) => {
+					writeConfig(fullLayout); // no saved height: nothing pinned yet
+					h.setSize(120, rows);
+					await h.emit("session_start");
+					await h.command("split-height", String(pin));
+					await h.command("split-geometry", preset);
+					// The command clamps to what leaves the transcript its rows.
+					const applied = Math.max(MIN_BAND_HEIGHT, Math.min(maxBandHeight(rows), pin));
+					const fits = rows - applied >= MIN_ROWS_BELOW_BAND;
+					const lines = h.widget()!.render(120);
+					expect(lines.length).toBe(fits ? applied : 0);
+					const message = h.notifications.at(-1)?.message ?? "";
+					expect(message).toContain(`band height ${applied} rows (pinned)`);
+					if (!fits) return;
+					assertExactWidth(lines, 120);
+					const dock = Number(/dock (\d+) cols/.exec(message)?.[1]);
+					expect(dock).toBe(120 - columnStarts(lines[0])[2]);
+				},
+			),
+			{ numRuns: 40, seed: 20261101 },
+		);
+	});
+
+	test("a preset switch re-lays the dock even when both presets share a band height", async () => {
+		// Above ~229 rows both curves sit on the 80-row ceiling, so the height
+		// is identical and only the dock moves: the band memo must still drop.
+		await fc.assert(
+			fc.asyncProperty(
+				fc.integer({ min: 625, max: 900 }),
+				fc.integer({ min: 229, max: 400 }),
+				async (cols, rows) => {
+					writeConfig(fullLayout);
+					h.setSize(cols, rows);
+					await h.emit("session_start");
+					await h.command("split-geometry", "4k");
+					const fourK = h.widget()!.render(cols);
+					await h.command("split-geometry", "wide");
+					const wide = h.widget()!.render(cols);
+					expect(fourK.length).toBe(MAX_BAND_HEIGHT);
+					expect(wide.length).toBe(MAX_BAND_HEIGHT);
+					// Both presets are at their dock ceilings here (120 vs 200).
+					expect(cols - columnStarts(fourK[0])[2]).toBe(120);
+					expect(cols - columnStarts(wide[0])[2]).toBe(200);
+				},
+			),
+			{ numRuns: 20, seed: 20261101 },
+		);
+	});
+
+	test("/split-geometry accepts exactly auto|4k|wide and is a no-op otherwise", async () => {
+		await fc.assert(
+			fc.asyncProperty(fc.string(), fc.constantFrom("auto", "4k", "wide"), async (arg, initial) => {
+				writeConfig({ ...fullLayout, geometry: initial });
+				h.setSize(500, 40); // ultrawide, so the presets differ visibly
+				await h.emit("session_start");
+				const before = h.widget()!.render(500);
+				const seen = h.notifications.length;
+				await h.command("split-geometry", arg);
+				expect(h.notifications.length).toBe(seen + 1);
+				const last = h.notifications.at(-1)!;
+				const normalized = arg.trim().toLowerCase();
+				const accepted =
+					normalized === "" ||
+					normalized === "auto" ||
+					normalized === "4k" ||
+					normalized === "wide";
+				if (!accepted) {
+					expect({ level: last.level, message: last.message }).toEqual({
+						level: "error",
+						message: "Invalid geometry (usage: /split-geometry auto|4k|wide)",
+					});
+					// A rejected argument must not move a single cell.
+					expect(h.widget()!.render(500)).toEqual(before);
+					return;
+				}
+				expect(last.level).toBe("info");
+				expect(last.message.startsWith("Geometry: ")).toBe(true);
+				const lines = h.widget()!.render(500);
+				assertExactWidth(lines, 500);
+			}),
+			{ numRuns: 80, seed: 20261101 },
+		);
+	});
+
+	test("every literal round-trips through /split-save and drives the next session", async () => {
+		await fc.assert(
+			fc.asyncProperty(
+				fc.constantFrom("auto", "4k", "wide"),
+				columnsArb,
+				fc.integer({ min: 40, max: 140 }), // tall enough that the band renders
+				async (setting, cols, rows) => {
+					writeConfig(fullLayout);
+					h.setSize(cols, rows);
+					await h.emit("session_start");
+					await h.command("split-geometry", setting);
+					await h.command("split-save");
+					expect(loadUiPanelsConfig().geometry).toBe(setting);
+					// Persisted and re-read, the value must not degrade to a default.
+					expect(normalizeConfig(loadUiPanelsConfig()).geometry).toBe(setting);
+					// Next session: the saved preset still decides the dock width.
+					await h.emit("session_start");
+					const lines = h.widget()!.render(cols);
+					const preset = setting === "auto" ? autoGeometryMode(cols, rows) : setting;
+					assertExactWidth(lines, cols);
+					expect(cols - columnStarts(lines[0])[2]).toBe(expectedDock(cols, GEOMETRY_PROFILES[preset]));
+				},
+			),
+			{ numRuns: 24, seed: 20261101 },
+		);
 	});
 });
 
