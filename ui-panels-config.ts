@@ -12,7 +12,7 @@
  * omp windows from clobbering each other's panels.
  */
 
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
@@ -122,13 +122,22 @@ export function loadUiPanelsConfig(): UiPanelsConfig {
 }
 
 /** Persist the config. Returns whether the write actually succeeded instead of
- * swallowing the error, so callers can report the real outcome. */
+ * swallowing the error, so callers can report the real outcome. The write goes
+ * to a pid-scoped temp file and is renamed into place: a crash mid-write cannot
+ * leave truncated JSON, and a fresh agent directory is created on demand. */
 export function saveUiPanelsConfig(cfg: UiPanelsConfig): boolean {
+	const tmp = `${CONFIG_PATH}.${process.pid}.tmp`;
 	try {
-		writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+		mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
+		writeFileSync(tmp, JSON.stringify(cfg, null, 2));
+		renameSync(tmp, CONFIG_PATH);
 		return true;
 	} catch {
-		/* never break the extension on a config write failure */
+		try {
+			rmSync(tmp, { force: true });
+		} catch {
+			/* best effort: never break the extension on a config write failure */
+		}
 		return false;
 	}
 }

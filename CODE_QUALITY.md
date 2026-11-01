@@ -1,7 +1,8 @@
 # Code quality — measurements and work queue
 
-Snapshot: 2026-11-01, after the Q1–Q7 structural batch plus B7 CI (base commit
-`b80a002`; the batch itself is uncommitted). This file is the dispatcher:
+Snapshot: 2026-11-01, after the Q1–Q7 structural batch, B7 CI and the
+split-view improvement pass (base commit `b80a002`; these batches are
+uncommitted). This file is the dispatcher:
 metrics live here, the ordered queue below is what to work on next, and every
 landed item updates the snapshot and ticks its row.
 
@@ -9,7 +10,7 @@ landed item updates the snapshot and ticks its row.
 
 | Command | Measures | Gate |
 | --- | --- | --- |
-| `bun test` | behaviour + property tests | 93 tests, 0 failures |
+| `bun test` | behaviour + property tests | 102 tests, 0 failures |
 | `bun run test:coverage` | line/function coverage from Bun's lcov | lines ≥ 99%, functions ≥ 90% (`scripts/check-coverage.ts`) |
 | `bun run lint` | ESLint 10 + typescript-eslint + sonarjs; also the cyclomatic/cognitive/size metrics | 0 errors (warnings are the metric report) |
 | `bun run typecheck` | `tsc --noEmit`, strict | clean |
@@ -25,24 +26,24 @@ targets control characters.
 
 | File | Lines | Funcs | Test file | Tests |
 | --- | --- | --- | --- | --- |
-| `split-view.ts` | 99.90% | 98.21% | `test/split-view.test.ts` | 57 |
-| `helpers.ts` | 100.00% | 94.12% | `test/helpers.test.ts` | 19 |
+| `split-view.ts` | 99.90% | 98.25% | `test/split-view.test.ts` | 61 |
+| `helpers.ts` | 100.00% | 94.44% | `test/helpers.test.ts` | 24 |
 | `ui-panels-config.ts` | 100.00% | 80.00% | `test/properties.test.ts` | 17 |
-| **overall** | **99.92%** | **97.01%** | | **93** |
+| **overall** | **99.92%** | **97.08%** | | **102** |
 
-32,410 assertions, ~3.9 s wall time. Uncovered:
+32,439 assertions, ~3.8 s wall time. Uncovered:
 
-- `split-view.ts:122` — `themeGetter` default that throws if something renders
+- `split-view.ts:123` — `themeGetter` default that throws if something renders
   before `session_start` binds a theme. Deliberate, unreachable.
-- Functions: 130/134 counted (`FNF`/`FNH` in `coverage/lcov.info`, `test/**`
+- Functions: 134/138 counted (`FNF`/`FNH` in `coverage/lcov.info`, `test/**`
   excluded as the gate does). The four misses are the throwing `themeGetter`
   default, `BandHub.dispose` (no-op host hook), and the two no-op default
   exports that exist so omp's extension auto-discovery does not report a load
-  error (`helpers.ts:210`, `ui-panels-config.ts:142`). Bun 1.4's lcov omits the
+  error (`helpers.ts:272`, `ui-panels-config.ts:153`). Bun 1.4's lcov omits the
   per-function `FN`/`FNDA` records, so those identities come from reading the
   four sites; only the totals come from the report. Every helper extracted by
-  Q1–Q7 is reached by the existing suite, so the denominator grew by 19 while
-  the miss list stayed at four.
+  Q1–Q7 plus the split-view batch (`capDiffText`, `imageLabel`,
+  `retainedEditDiff`) is reached by the existing suite.
 
 Property coverage is behavioural, not line-based: helpers (truncation, caps,
 config normalization, visibility), band geometry for arbitrary terminal sizes,
@@ -193,6 +194,47 @@ covered), lines unchanged at 99.91%, lint unchanged at 15 warnings / 0 errors.
   60 — asserted through the new `retainedToolEntries()` seam, because the band
   renders only the newest rows. Mutations: dropping the eviction block leaves
   65 entries; evicting `pop()` instead of `shift()` drops the newest call.
+
+### Landed — split-view improvement pass (S1–S6)
+
+Delta: 93 → 102 tests, overall functions 97.01% → 97.08% (three new functions,
+all reached), lines unchanged at 99.92%, lint unchanged at 2 warnings / 0
+errors. Rendering is byte-identical: `bun run demo` output matches the
+pre-batch capture after normalising tool-duration cells.
+
+- **S1 → replay sanitization.** `replayAssistant` now runs branch thinking
+  through `sanitizeText`, like live ingestion; a resumed session used to render
+  raw OSC/CSI from stored text. Test: a hostile `\u001b]0;PWNED\u0007\u001b[31m`
+  thinking block after `session_tree` reaches no row and no control char
+  survives.
+- **S2 → `toolLines` row budget.** The panel builds newest-first and stops once
+  `maxRows` items exist instead of rendering every tool (and every diff) each
+  frame. 60 tools × 150-line diff at a 12-row band: 14.5 ms → 1.1 ms per
+  invalidated render; cost no longer tracks history depth.
+- **S3 → `capDiffText`.** `setEditDiff` stores at most `MAX_DIFF_LINES` (400)
+  lines / `MAX_DIFF_CHARS` (64 KiB) with a marker, asserted through the new
+  `retainedEditDiff()` seam. A 20 000-line `details.diff` cost 24 ms in
+  `renderDiff` alone; it now retains 401 lines and renders under 1 ms. The cap
+  is applied without a `sanitizeText` pre-pass: `renderDiff` sanitizes the
+  text it renders, and pre-sanitizing collapsed tab indentation (a tab renders
+  as three cells) to a single space. A test pins both halves: escapes never
+  reach a row, and the stored text stays tab-faithful.
+- **S4 → atomic config save.** `saveUiPanelsConfig` writes a pid-scoped temp
+  file and renames it, creating the agent directory first; a fresh agent dir
+  used to make every `/split-save` fail, and a crash mid-write left truncated
+  JSON that loaded as defaults. Tests cover the fresh-directory save (no temp
+  file left behind) and the failure path (dir at the config path → `false`, no
+  `.tmp` residue).
+- **S5 → image label instead of payload.** `ToolEntry.imageLabel` stores the
+  already-rendered `imageFallback` line; an 8 MB base64 result used to keep
+  7.7 MB of retained heap for the whole session while only that line was ever
+  shown. Retained delta is now 0.06 MB; the `1x1` dimension assertion proves
+  the label is computed at ingest.
+- **S6 → stale text and a stale bound.** `/split-height` help says 6–80 (the
+  README already did); the `/split-trim-response` notify says `Transcript:`
+  instead of the pre-port `Panel C:`; the `normalizeConfig` property asserts
+  `<= MAX_BAND_HEIGHT` instead of a hard-coded 40, with explicit clamp
+  assertions at both bounds.
 
 ## Next up
 

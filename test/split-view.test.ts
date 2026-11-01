@@ -1,13 +1,15 @@
 import { afterAll, beforeAll, describe, expect, test, vi } from "bun:test";
 import * as fc from "fast-check";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
+import { basename, dirname } from "node:path";
 import { visibleWidth } from "@oh-my-pi/pi-tui";
 import { Settings, settings, type ExtensionAPI, type ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import "@oh-my-pi/pi-coding-agent/session/settings";
 import "@oh-my-pi/pi-coding-agent/modes/settings";
 import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
-import splitView, { retainedThinkingBlocks, retainedToolEntries } from "../split-view.ts";
+import splitView, { retainedEditDiff, retainedThinkingBlocks, retainedToolEntries } from "../split-view.ts";
+import { MAX_DIFF_CHARS, MAX_DIFF_LINES } from "../helpers.ts";
 import { CONFIG_FILE, loadUiPanelsConfig, saveUiPanelsConfig } from "../ui-panels-config.ts";
 
 /** Identity colorizer: keeps row geometry measurable without a live theme. */
@@ -676,8 +678,11 @@ describe("complex renderers", () => {
 			result: { content: [{ type: "image", data: png, mimeType: "image/png" }] },
 			isError: false,
 		});
-		const text = joined();
-		expect(text).toContain("[Image: [image/png]");
+		// Wide enough that the label does not wrap in the tools column.
+		const text = h.widget()!.render(200).join("\n");
+		// Dimensions are computed at ingest, so a missing `1x1` means the
+		// stored label lost them.
+		expect(text).toContain("[Image: [image/png] 1x1]");
 		expect(text).not.toContain("iVBORw0KGgo");
 	});
 
@@ -872,6 +877,55 @@ describe("complex renderers", () => {
 		// Four path fields resolve to one file: no phantom count badge.
 		expect(text).toContain("r omp-sv-key.txt");
 		expect(text).not.toContain("×");
+	});
+
+	test("replayed thinking is sanitized before it reaches a row", async () => {
+		await resetBuffers([
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "thinking", thinking: "safe\u001b]0;PWNED\u0007\u001b[31mred" }],
+				},
+			},
+		]);
+		const text = joined();
+		expect(text).toContain("safe");
+		expect(text).not.toContain("PWNED");
+		expect(text).not.toMatch(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/);
+	});
+
+	test("a stored edit diff is capped by lines and by chars", async () => {
+		await resetBuffers();
+		const big = Array.from({ length: 5000 }, (_, i) => `-old ${i}\n+new ${i}`).join("\n");
+		await h.emit("tool_result", {
+			toolName: "edit",
+			input: { path: "/tmp/capped.ts" },
+			details: { diff: big },
+		});
+		expect(retainedEditDiff().lines).toBe(MAX_DIFF_LINES + 1);
+
+		await h.emit("tool_result", {
+			toolName: "edit",
+			input: { path: "/tmp/capped.ts" },
+			details: { diff: "x".repeat(MAX_DIFF_CHARS * 2) },
+		});
+		expect(retainedEditDiff().chars).toBeLessThanOrEqual(MAX_DIFF_CHARS + 64);
+	});
+
+	test("a stored edit diff renders no terminal escapes", async () => {
+		await resetBuffers();
+		await h.emit("tool_result", {
+			toolName: "edit",
+			input: { path: "/tmp/hostile.ts" },
+			details: { diff: "-keep\u001b]0;PWNED\u0007\u001b[31mred" },
+		});
+		// The stored diff is only bounded here; renderDiff is what strips
+		// escapes, so this guards that no path renders `editDiff.diff` raw.
+		const text = joined();
+		expect(text).toContain("red");
+		expect(text).not.toContain("PWNED");
+		expect(text).not.toMatch(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/);
 	});
 
 	test("replay applies the edit diff and keeps the last path for a pathless diff", async () => {
@@ -1137,14 +1191,26 @@ describe("persistence and lifecycle", () => {
 		resetConfig();
 	});
 
+	test("save creates the agent directory and leaves no temp file", () => {
+		resetConfig();
+		// A fresh agent directory: the first /split-save must not fail.
+		rmSync(dirname(CONFIG_FILE), { recursive: true, force: true });
+		expect(saveUiPanelsConfig({ split: true })).toBe(true);
+		expect(readdirSync(dirname(CONFIG_FILE))).toEqual([basename(CONFIG_FILE)]);
+		expect(JSON.parse(readFileSync(CONFIG_FILE, "utf8"))).toEqual({ split: true });
+		resetConfig();
+	});
+
 	test("save reports a write failure instead of throwing", () => {
 		resetConfig();
 		expect(saveUiPanelsConfig({ split: true })).toBe(true);
 		expect(JSON.parse(readFileSync(CONFIG_FILE, "utf8"))).toEqual({ split: true });
 		resetConfig();
-		// A directory at the config path makes writeFileSync fail.
+		// A directory at the config path makes the rename fail.
 		mkdirSync(CONFIG_FILE, { recursive: true });
 		expect(saveUiPanelsConfig({ split: true })).toBe(false);
+		// The temp file is cleaned up, so a retry cannot pick up a stale write.
+		expect(readdirSync(dirname(CONFIG_FILE)).some(entry => entry.endsWith(".tmp"))).toBe(false);
 		resetConfig();
 	});
 
@@ -1349,7 +1415,7 @@ describe("persistence and lifecycle", () => {
 		expect(effective("display.hideToolActivity")).toBe(true);
 		await h.command("split-trim-response", "banana"); // unknown arg toggles
 		expect(effective("display.hideToolActivity")).toBe(false);
-		expect(h.notifications.at(-1)?.message).toContain("Panel C:");
+		expect(h.notifications.at(-1)?.message).toContain("Transcript:");
 	});
 
 	test("unsupported settings warn and do not apply an override", async () => {

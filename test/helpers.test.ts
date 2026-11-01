@@ -1,14 +1,18 @@
 import { describe, expect, test } from "bun:test";
 import {
 	MAX_BAND_HEIGHT,
+	MAX_DIFF_CHARS,
+	MAX_DIFF_LINES,
 	MIN_BAND_HEIGHT,
 	appendStreamTail,
 	bandToolsColsFor,
+	capDiffText,
 	capDisplayLine,
 	capToolText,
 	defaultBandHeight,
 	dockColsFor,
 	formatDuration,
+	isHighSurrogate,
 	lastImageBlock,
 	maxBandHeight,
 	outputPreview,
@@ -39,6 +43,44 @@ describe("capToolText", () => {
 		const kept = capToolText("😀".repeat(200), 101).split("\n")[1];
 		expect(kept.length % 2).toBe(0);
 		expect(kept.startsWith("😀")).toBe(true);
+	});
+});
+
+describe("capDiffText", () => {
+	test("text within both caps is returned unchanged", () => {
+		const diff = "@@ -1 +1 @@\n-old\n+new";
+		expect(capDiffText(diff)).toBe(diff);
+		// Exactly at the line cap: no marker, no copy.
+		const atCap = Array.from({ length: MAX_DIFF_LINES }, (_, i) => `+line ${i}`).join("\n");
+		expect(capDiffText(atCap)).toBe(atCap);
+	});
+
+	test("keeps the head lines and counts the rest", () => {
+		const lines = Array.from({ length: 500 }, (_, i) => `+line ${i}`);
+		const out = capDiffText(lines.join("\n")).split("\n");
+		expect(out.length).toBe(MAX_DIFF_LINES + 1);
+		expect(out[0]).toBe("+line 0");
+		expect(out[MAX_DIFF_LINES - 1]).toBe(`+line ${MAX_DIFF_LINES - 1}`);
+		expect(out[MAX_DIFF_LINES]).toBe(`… +${500 - MAX_DIFF_LINES} more diff lines`);
+	});
+
+	test("keeps the head chars and marks the char cut", () => {
+		const out = capDiffText("x".repeat(MAX_DIFF_CHARS * 2));
+		expect(out.length).toBeLessThanOrEqual(MAX_DIFF_CHARS + 64);
+		const lines = out.split("\n");
+		expect(lines.length).toBe(2);
+		expect(lines[0].length).toBe(MAX_DIFF_CHARS);
+		expect(lines[1]).toContain("[truncated: first");
+		expect(lines[1]).toContain(`of ${MAX_DIFF_CHARS * 2} chars`);
+	});
+
+	test("never cuts through a surrogate pair", () => {
+		// Odd budget: the cap lands between the emoji's surrogates.
+		const out = capDiffText("😀".repeat(MAX_DIFF_CHARS), MAX_DIFF_LINES, 101);
+		const kept = out.split("\n")[0];
+		expect(kept.length % 2).toBe(0);
+		expect(kept.startsWith("😀")).toBe(true);
+		expect(isHighSurrogate(kept.charCodeAt(kept.length - 1))).toBe(false);
 	});
 });
 
@@ -143,6 +185,12 @@ describe("normalizeConfig", () => {
 		expect(normalizeConfig({ filesWidth: "60" as never }).filesWidth).toBeNull();
 		expect(normalizeConfig({ filesWidth: 999 }).filesWidth).toBe(200);
 		expect(normalizeConfig(null as never).bandHeight).toBe(20);
+	});
+	test("bandHeight clamps to the documented bounds", () => {
+		expect(normalizeConfig({ bandHeight: 5 }).bandHeight).toBe(MIN_BAND_HEIGHT);
+		expect(normalizeConfig({ bandHeight: 200 }).bandHeight).toBe(MAX_BAND_HEIGHT);
+		// Inside the bounds the saved height is kept verbatim.
+		expect(normalizeConfig({ bandHeight: 42 }).bandHeight).toBe(42);
 	});
 	test("panel defaults", () => {
 		const cfg = normalizeConfig({ split: true });

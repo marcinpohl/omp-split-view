@@ -63,6 +63,40 @@ export function capToolText(s: string, cap = MAX_TOOL_TEXT_CHARS): string {
 	return marker + newestUnits(s, cap - marker.length);
 }
 
+/** Display and storage cap for one edit diff: the first `maxLines` lines and at
+ * most `maxChars` UTF-16 units, with a trailing marker naming the cut. */
+export const MAX_DIFF_LINES = 400;
+export const MAX_DIFF_CHARS = 64 * 1024;
+
+/** Keep the HEAD of a diff within `maxLines`/`maxChars` (diffs are read from
+ * the top, unlike tool output); the cut is code-point aligned and marked.
+ * Text within both caps is returned unchanged. */
+export function capDiffText(
+	text: string,
+	maxLines = MAX_DIFF_LINES,
+	maxChars = MAX_DIFF_CHARS,
+): string {
+	let head = text;
+	let hiddenChars = 0;
+	if (head.length > maxChars) {
+		let end = Math.max(0, maxChars);
+		// Never end the head on a lone high surrogate; the marker reports the
+		// units actually kept, not the requested budget.
+		if (end > 0 && isHighSurrogate(head.charCodeAt(end - 1))) end--;
+		hiddenChars = text.length - end;
+		head = head.slice(0, end);
+	}
+	const lines = head.split("\n");
+	if (lines.length <= maxLines && hiddenChars === 0) return text;
+	const kept = lines.slice(0, maxLines);
+	// One marker line, never counted against `maxLines`: a char cut is the
+	// more informative of the two, so it wins when both caps bind.
+	const marker = hiddenChars
+		? `… [truncated: first ${head.length} of ${text.length} chars]`
+		: `… +${lines.length - kept.length} more diff lines`;
+	return `${kept.join("\n")}\n${marker}`;
+}
+
 /** Band split minimums (cols) below which the tools ratio clamps. */
 export const MIN_THINK_COLS = 24;
 export const MIN_TOOLS_COLS = 20;

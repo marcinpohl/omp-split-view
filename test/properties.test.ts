@@ -9,6 +9,8 @@ import {
 	AUTO_DOCK_MAX_COLS,
 	AUTO_DOCK_MIN_COLS,
 	AUTO_DOCK_PCT,
+	MAX_BAND_HEIGHT,
+	MIN_BAND_HEIGHT,
 	MIN_DOCK_COLS,
 	appendStreamTail,
 	bandToolsColsFor,
@@ -287,8 +289,8 @@ describe("normalizeConfig", () => {
 				expect(typeof cfg.trimResponse).toBe("boolean");
 				expect(["compact", "full"]).toContain(cfg.toolMode);
 				expect(Number.isInteger(cfg.bandHeight)).toBe(true);
-				expect(cfg.bandHeight).toBeGreaterThanOrEqual(6);
-				expect(cfg.bandHeight).toBeLessThanOrEqual(40);
+				expect(cfg.bandHeight).toBeGreaterThanOrEqual(MIN_BAND_HEIGHT);
+				expect(cfg.bandHeight).toBeLessThanOrEqual(MAX_BAND_HEIGHT);
 				expect(Number.isInteger(cfg.toolsWidthPct)).toBe(true);
 				expect(cfg.toolsWidthPct).toBeGreaterThanOrEqual(20);
 				expect(cfg.toolsWidthPct).toBeLessThanOrEqual(60);

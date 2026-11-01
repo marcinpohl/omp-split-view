@@ -16,15 +16,15 @@ its numbers in sync with these commands.
 
 | Command | Expected |
 | --- | --- |
-| `bun test` | 93 pass, 0 fail, 32410 expect() calls |
-| `bun run test:coverage` | gate passes: lines ≥ 99%, functions ≥ 90% (currently 99.92% / 97.01%) |
+| `bun test` | 102 pass, 0 fail, 32439 expect() calls |
+| `bun run test:coverage` | gate passes: lines ≥ 99%, functions ≥ 90% (currently 99.92% / 97.08%) |
 | `bun run lint` | 0 errors, 2 warnings (the parked Q8 pair) |
 | `bun run typecheck` | clean (`tsc --noEmit`, strict) |
 | geometry sweep (probe below) | 0 failures (40–300 cols × 6–40 rows), rows == height, every row exactly `width` cells, no control chars |
 
-Files: `split-view.ts` 1531 L, `helpers.ts` 244 L, `ui-panels-config.ts` 146 L,
-`test/split-view.test.ts` 1378 L, `test/properties.test.ts` 318 L,
-`test/helpers.test.ts` 207 L, `test/setup.ts` 7 L, `scripts/check-coverage.ts`
+Files: `split-view.ts` 1559 L, `helpers.ts` 274 L, `ui-panels-config.ts` 155 L,
+`test/split-view.test.ts` 1444 L, `test/properties.test.ts` 320 L,
+`test/helpers.test.ts` 255 L, `test/setup.ts` 7 L, `scripts/check-coverage.ts`
 90 L, `.github/workflows/ci.yml` 17 L, `CODE_QUALITY.md`, `eslint.config.js`.
 Git repository with CI (W7/B7 done); no remote, so the workflow is inert until
 one is added.
@@ -50,9 +50,44 @@ Fixed during the 2026-11-01 passes (not planned, found by testing):
 - Model/tool text reached rows raw: a thinking delta or tool result containing
   CSI/OSC sequences could drive the terminal. `sanitizeText` strips escape
   sequences and C0/C1 controls at every ingestion point (thinking, tool name,
-  args, output, diff, image MIME, displayed paths). Properties: "model and
-  tool text can never reach a row as terminal escapes", plus the sanitizeText
-  unit properties.
+  args, output, image MIME, displayed paths) and now on branch replay too;
+  tool diffs reach the pane only through `renderDiff`, which sanitizes what it
+  renders. Properties: "model and tool text can never reach a row as terminal
+  escapes", plus the sanitizeText unit properties and the two row-level tests
+  for replayed thinking and a hostile `details.diff`.
+
+Fixed during the 2026-11-01 improvement pass (S1–S6 in `CODE_QUALITY.md`;
+same-day probe numbers before → after):
+
+- **Replay sanitization (S1).** Branch thinking is sanitized in
+  `replayAssistant`, so a resumed session can no longer render OSC/CSI from
+  stored text. Acceptance: the hostile block
+  `safe\u001b]0;PWNED\u0007\u001b[31mred` reaches no row (no `PWNED`, no
+  control char); reverting the `sanitizeText` call fails that test.
+- **Bounded tool panel (S2).** `toolLines` builds newest-first and stops at the
+  row budget instead of styling and diffing every entry. 60 tools × a 150-line
+  diff at a 12-row band: 14.5 ms → 1.1 ms per invalidated render, unchanged
+  rows (the built array is an exact suffix of the old one).
+- **Bounded stored diff (S3).** `setEditDiff` keeps the first 400 lines /
+  64 KiB with a `… +N more diff lines` / `… [truncated: …]` marker, exposed
+  through `retainedEditDiff()`. A 20 000-line `details.diff` retains 401 lines
+  and renders under 1 ms (24 ms in `renderDiff` alone before). The cap is
+  applied without a `sanitizeText` pre-pass: `renderDiff` sanitizes, and
+  pre-sanitizing collapsed tab indentation (3 cells) to one space.
+- **Atomic config save (S4).** `saveUiPanelsConfig` creates the agent directory
+  and writes `<config>.<pid>.tmp` → rename, so a fresh agent dir saves instead
+  of failing and an interrupted write cannot leave truncated JSON (which used
+  to load silently as defaults). Acceptance: save into a missing directory
+  leaves only the config file; a directory at the config path returns `false`
+  with no `.tmp` residue.
+- **Image label instead of payload (S5).** `ToolEntry.imageLabel` stores the
+  rendered `imageFallback` line, not the base64: the `1x1` dimension assertion
+  proves the label is computed at ingest, and retained heap after an 8 MB
+  image result is 0.06 MB (was 7.7 MB).
+- **Text and bound fixes (S6).** `/split-height` help says 6–80 (matching the
+  README), the `/split-trim-response` notify says `Transcript:` instead of the
+  pre-port `Panel C:`, and the `normalizeConfig` property asserts
+  `MIN_BAND_HEIGHT`/`MAX_BAND_HEIGHT` with explicit clamp cases at both ends.
 
 ## Decision before W1 (resolved)
 
@@ -241,7 +276,7 @@ assertions use the harness `setTheme` hook. `test/setup.ts` redirects
   the real `settings` singleton and `Settings.init()` runs in `beforeAll`).
   `/split-trim-response argument forms toggle and report`: `off` → `false`,
   `ON` → both handles `true`, a second `ON` stays on (explicit args are
-  absolute, not toggles), `banana` toggles, and the `Panel C:` notify fires.
+  absolute, not toggles), `banana` toggles, and the `Transcript:` notify fires.
   The lowercase parse and the idempotent explicit arg are both load-bearing
   (dropping `.toLowerCase()` fails the test). `unsupported settings warn and
   do not apply an override` swaps in a `Proxy` whose every read throws, so the

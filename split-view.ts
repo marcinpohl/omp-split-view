@@ -72,6 +72,7 @@ import {
 	MIN_ROWS_BELOW_BAND,
 	appendStreamTail,
 	bandToolsColsFor,
+	capDiffText,
 	capDisplayLine,
 	capToolText,
 	defaultBandHeight,
@@ -288,7 +289,10 @@ interface ToolEntry {
 	output: string;
 	active: boolean;
 	isError: boolean;
-	image?: ImageBlock;
+	/** Render-ready one-line description, computed once at ingest so the
+	 * base64 payload is not retained (an 8 MB result used to live in the
+	 * entry for the whole session while only this label was ever shown). */
+	imageLabel?: string;
 	diff?: string;
 	startedAt?: number;
 	endedAt?: number;
@@ -394,6 +398,16 @@ function ingestToolCall(id: string, name: string, args: unknown, startedAt?: num
 	}
 }
 
+/** One-line render label for a tool result's last image, computed at ingest so
+ * the base64 payload itself is never retained. `getImageDimensions` returns
+ * null for empty or unrecognised payloads, so a bad image degrades to the
+ * MIME-only label instead of throwing. */
+function imageLabel(image: ImageBlock | undefined): string | undefined {
+	if (!image) return undefined;
+	const mimeType = sanitizeText(image.mimeType);
+	return imageFallback(mimeType, getImageDimensions(image.data, mimeType) ?? undefined);
+}
+
 function ingestToolResult(id: string, result: unknown, isError: boolean, endedAt?: number): void {
 	const entry = toolsBy.get(id);
 	if (!entry) return;
@@ -401,8 +415,8 @@ function ingestToolResult(id: string, result: unknown, isError: boolean, endedAt
 	const text = resultText(result);
 	if (text) setToolOutput(entry, text);
 	const fields = isRecord(result) ? result : {};
-	const image = lastImageBlock(fields.content);
-	if (image) entry.image = { data: image.data, mimeType: sanitizeText(image.mimeType) };
+	// Computed at ingest: the base64 payload is never retained.
+	entry.imageLabel = imageLabel(lastImageBlock(fields.content));
 	const details = isRecord(fields.details) ? fields.details : {};
 	const diff = details.diff;
 	if (typeof diff === "string" && diff) {
@@ -466,10 +480,7 @@ function toolDetailLines(theme: Theme, entry: ToolEntry, textWidth: number, prev
 		for (const line of shown) out.push(theme.fg("toolOutput", `  · ${truncateInline(line, textWidth - 4)}`));
 		if (hidden > 0) out.push(theme.fg("dim", `  · +${hidden} more`));
 	}
-	if (entry.image) {
-		const dims = getImageDimensions(entry.image.data, entry.image.mimeType) ?? undefined;
-		out.push(theme.fg("toolOutput", `  · ${imageFallback(entry.image.mimeType, dims)}`));
-	}
+	if (entry.imageLabel) out.push(theme.fg("toolOutput", `  · ${entry.imageLabel}`));
 	return out;
 }
 
@@ -481,23 +492,29 @@ function toolDiffLines(theme: Theme, diff: string | undefined): string[] {
 	return out;
 }
 
-/** Panel rows for the tools view, styled, oldest first. */
-function toolLines(theme: Theme, width: number, previewCap = 2): string[] {
+/** Panel rows for the tools view, styled, oldest first. Only the newest entries
+ * that can fill `maxRows` are built: `newestRows` stops once `maxRows` wrapped
+ * rows exist and every item renders at least one row. */
+function toolLines(theme: Theme, width: number, previewCap: number, maxRows: number): string[] {
 	const full = toolMode === "full";
 	const textWidth = Math.max(8, width - 3);
-	const out: string[] = [];
-	for (const id of toolOrder) {
-		const entry = toolsBy.get(id);
+	const blocks: string[][] = [];
+	let items = 0;
+	for (let i = toolOrder.length - 1; i >= 0 && items < maxRows; i--) {
+		const entry = toolsBy.get(toolOrder[i]);
 		if (!entry) continue;
-		out.push(toolPrefix(theme, entry, textWidth));
-		if (!full) {
-			if (out.length > 1) out.splice(out.length - 1, 0, "");
-			continue;
+		const rows = [toolPrefix(theme, entry, textWidth)];
+		if (full) {
+			rows.push(...toolDetailLines(theme, entry, textWidth, previewCap));
+			rows.push(...toolDiffLines(theme, entry.diff));
 		}
-		out.push(...toolDetailLines(theme, entry, textWidth, previewCap));
-		out.push(...toolDiffLines(theme, entry.diff));
+		// Compact mode puts one blank row before every entry except the oldest;
+		// this reproduces the current `out.length > 1` splice exactly.
+		const block = !full && i > 0 ? ["", ...rows] : rows;
+		blocks.push(block);
+		items += block.length;
 	}
-	return out;
+	return blocks.reverse().flat();
 }
 
 // ─── files buffer ────────────────────────────────────────────────────────────
@@ -615,8 +632,16 @@ const editDiff = { path: "", diff: "", version: 0 };
 
 function setEditDiff(filePath: string, diff: string): void {
 	editDiff.path = filePath;
-	editDiff.diff = diff;
+	// Bounded, not pre-sanitized: `renderDiff` sanitizes (escapes included) and
+	// expands tabs itself, so running sanitizeText here would turn tab
+	// indentation into a single space and change the rendered diff.
+	editDiff.diff = capDiffText(diff);
 	editDiff.version++;
+}
+
+/** Test seam: stored edit-diff size after the ingest cap. */
+export function retainedEditDiff(): { lines: number; chars: number } {
+	return { lines: editDiff.diff ? editDiff.diff.split("\n").length : 0, chars: editDiff.diff.length };
 }
 
 function clearEditDiff(): void {
@@ -651,7 +676,7 @@ function bandDef(theme: Theme, id: "thinking" | "tools"): BandDef {
 		color: "muted",
 		streaming: () => toolOrder.some(id => toolsBy.get(id)?.active),
 		style: line => line,
-		lines: (width: number, rows: number) => toolLines(theme, width, previewLinesFor(rows)),
+		lines: (width: number, rows: number) => toolLines(theme, width, previewLinesFor(rows), rows),
 		empty: "No tools called yet",
 	};
 }
@@ -1150,7 +1175,10 @@ type ToolResultBranchMessage = Extract<BranchMessage, { role: "toolResult" }>;
 /** Replay one assistant message: collect thinking text, rebuild its tool calls. */
 function replayAssistant(msg: AssistantBranchMessage, thoughts: string[]): void {
 	for (const block of msg.content) {
-		if (block.type === "thinking" && typeof block.thinking === "string") thoughts.push(block.thinking);
+		// Live ingestion sanitizes; replay must too, or a resumed session can
+		// render raw escape sequences from the stored branch.
+		if (block.type === "thinking" && typeof block.thinking === "string")
+			thoughts.push(sanitizeText(block.thinking));
 		if (block.type !== "toolCall") continue;
 		try {
 			// Rebuild through the same ingest path live events use.
@@ -1444,7 +1472,7 @@ function registerBandSettings(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("split-height", {
-		description: "Set the band height in rows (6-40)",
+		description: "Set the band height in rows (6-80, clamped to fit)",
 		handler: async (args, ctx) => {
 			if (!requireTui(ctx)) return;
 			const height = Number.parseInt(String(args ?? "").trim(), 10);
@@ -1500,7 +1528,7 @@ function registerBandSettings(pi: ExtensionAPI): void {
 				return;
 			}
 			requestRender();
-			notify(`Panel C: ${trimResponse ? "response only" : "full transcript"}`);
+			notify(`Transcript: ${trimResponse ? "response only" : "full transcript"}`);
 		},
 	});
 

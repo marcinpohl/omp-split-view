@@ -63,8 +63,10 @@ default. Start bare regardless of saved defaults with `--no-split`.
 | `/split-save` | Persist the current layout as startup defaults for new windows |
 
 Toggles are session-local; only `/split-save` writes
-`~/.omp/agent/ui-panels.json` (honoring `PI_CODING_AGENT_DIR`). `/split` then
-toggles between bare omp and that saved layout.
+`~/.omp/agent/ui-panels.json` (honoring `PI_CODING_AGENT_DIR`). The save
+creates the directory when it is missing and goes through a temp file, so an
+interrupted write cannot leave truncated JSON that would load as defaults.
+`/split` then toggles between bare omp and that saved layout.
 
 ## Features
 
@@ -86,14 +88,16 @@ toggles between bare omp and that saved layout.
   keeps the list). File tracking comes from tool calls: `read`, `write`,
   `edit`, `ast_edit`, plus paths mentioned on a `bash` command line. The diff
   subpanel follows any tool result that reports `details.diff` plus a path —
-  built-in `edit` as well as custom tools that emit the same payload.
+  built-in `edit` as well as custom tools that emit the same payload. The
+  stored diff is bounded to its first 400 lines (at most 64 KiB) with a
+  `… +N more diff lines` marker, so one huge diff cannot slow the band.
 - **Response-only mode** — sets omp's native `hideThinkingBlock` and
   `display.hideToolActivity` switches as runtime overrides, so the transcript
   shows user + assistant text only. Turning it off clears the overrides and
   restores whatever the user configured.
 - **Untrusted text** — escape sequences and other C0/C1 control characters in
-  model or tool text are stripped at ingestion, so a tool result or thinking
-  delta cannot drive the terminal.
+  model or tool text are stripped at ingestion and on branch replay, so a tool
+  result, thinking delta or resumed session cannot drive the terminal.
 - **Geometry** — scales with the window instead of clamping at laptop sizes.
   The files dock is 25% of the width (34–120 cols), the band is 45% of the
   height by default (20–80 rows) when no height is saved, and each tool's
@@ -179,7 +183,7 @@ Bun instruments TypeScript directly (no istanbul/nyc/`--experimental` flags)
 and writes an lcov report; `scripts/check-coverage.ts` parses it and fails the
 command below `lines = 99%` / `functions = 90%` (override with
 `COVERAGE_LINES` / `COVERAGE_FUNCTIONS`). Test fixtures are excluded from the
-totals. Current: 99.92% lines / 97.01% functions — the only uncovered line is
+totals. Current: 99.92% lines / 97.08% functions — the only uncovered line is
 the `themeGetter` default that throws before `session_start` binds a theme; the
 uncovered functions are no-op extension exports.
 
