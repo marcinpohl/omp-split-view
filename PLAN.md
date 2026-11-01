@@ -8,7 +8,8 @@ checker, and throwaway probe scripts; none are inferred.
 
 | Command | Expected |
 | --- | --- |
-| `bun test` | 54 pass, 0 fail, 29564 expect() calls |
+| `bun test` | 62 pass, 0 fail, 29607 expect() calls |
+| `bun run test:coverage` | gate passes: lines ≥ 99%, functions ≥ 90% (currently 99.91% / 96.36%) |
 | `bun run typecheck` | clean (`tsc --noEmit`, strict) |
 | geometry sweep (probe below) | 0 failures (40–300 cols × 6–40 rows), rows == height, every row exactly `width` cells, no control chars |
 
@@ -16,6 +17,9 @@ Files: `split-view.ts` 1332 L, `helpers.ts` 212 L, `ui-panels-config.ts` 144 L,
 `test/split-view.test.ts` 537 L, `test/properties.test.ts` 310 L,
 `test/helpers.test.ts` 172 L, `test/setup.ts` 7 L. No `.git`, no CI.
 `fast-check` 4.x is the dev dependency behind the property tests.
+`eslint`/`typescript-eslint`/`sonarjs` back `bun run lint`; coverage comes from
+Bun's built-in instrumentation plus the lcov gate in `scripts/check-coverage.ts`
+(Bun 1.4 does not enforce `coverageThreshold` from `bunfig.toml`).
 
 Fixed during the 2026-11-01 passes (not planned, found by testing):
 

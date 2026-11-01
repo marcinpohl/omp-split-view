@@ -29,6 +29,11 @@ export default tseslint.config(
 		},
 	},
 	{
+		// CLI tools report through stdout by design.
+		files: ["scripts/**/*.ts"],
+		rules: { "no-console": "off" },
+	},
+	{
 		// The sanitizer matches control characters on purpose.
 		files: ["helpers.ts"],
 		rules: { "no-control-regex": "off", "sonarjs/no-control-regex": "off" },

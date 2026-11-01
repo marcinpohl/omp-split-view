@@ -1,11 +1,13 @@
 import { beforeAll, describe, expect, test } from "bun:test";
 import * as fc from "fast-check";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { visibleWidth } from "@oh-my-pi/pi-tui";
 import { Settings, settings, type ExtensionAPI, type ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import "@oh-my-pi/pi-coding-agent/session/settings";
 import "@oh-my-pi/pi-coding-agent/modes/settings";
 import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
 import splitView from "../split-view.ts";
+import { CONFIG_FILE, loadUiPanelsConfig, saveUiPanelsConfig } from "../ui-panels-config.ts";
 
 /** Identity colorizer: keeps row geometry measurable without a live theme. */
 const flatTheme = {
@@ -20,6 +22,11 @@ const flatTheme = {
 
 type Handler = (event: unknown, ctx: ExtensionContext) => unknown;
 type WidgetFactory = (tui: unknown, theme: unknown) => { render(width: number): readonly string[] };
+/** What the host holds for the band: a Component with the optional invalidate. */
+interface BandComponent {
+	render(width: number): readonly string[];
+	invalidate(): void;
+}
 
 interface Harness {
 	emit: (event: string, payload?: unknown) => Promise<void>;
@@ -27,6 +34,11 @@ interface Harness {
 	widget: () => { render(width: number): readonly string[] } | undefined;
 	/** Swap the theme `ctx.ui.theme` returns (cache-invalidation tests). */
 	setTheme: (theme: unknown) => void;
+	/** Branch the session manager replays for resume/branch-switch tests. */
+	setBranch: (branch: unknown[]) => void;
+	/** The widget instance the host holds, for Component-contract calls. */
+	component: () => BandComponent | undefined;
+	notifications: { message: string; level: string }[];
 	widgets: Map<string, WidgetFactory | undefined>;
 	setSize: (columns: number, rows: number) => void;
 	/** session_start followed by /split (empty saved layout -> thinking + tools). */
@@ -43,6 +55,9 @@ function createHarness(columns = 120, rows = 45): Harness {
 	const commands = new Map<string, (args: string, ctx: ExtensionContext) => Promise<void>>();
 	const widgets = new Map<string, WidgetFactory | undefined>();
 
+	const notifications: { message: string; level: string }[] = [];
+	let branch: unknown[] = [];
+
 	const tui = {
 		terminal: { columns, rows },
 		requestRender: () => {},
@@ -53,12 +68,14 @@ function createHarness(columns = 120, rows = 45): Harness {
 	const ctx = {
 		mode: "tui",
 		cwd: "/tmp",
-		sessionManager: { getBranch: () => [] },
+		sessionManager: { getBranch: () => branch },
 		ui: {
 			get theme() {
 				return currentTheme;
 			},
-			notify: () => {},
+			notify: (message: string, level: string) => {
+				notifications.push({ message, level });
+			},
 			setWidget: (key: string, content: WidgetFactory | undefined) => {
 				widgets.set(key, content);
 				// omp invokes the factory synchronously while mounting.
@@ -104,6 +121,14 @@ function createHarness(columns = 120, rows = 45): Harness {
 		setTheme: theme => {
 			currentTheme = theme;
 		},
+		setBranch: next => {
+			branch = next;
+		},
+		component: () => {
+			const factory = widgets.get("split-view");
+			return factory ? (factory(tui, flatTheme) as BandComponent) : undefined;
+		},
+		notifications,
 		widgets,
 		setSize: (nextColumns, nextRows) => {
 			tui.terminal.columns = nextColumns;
@@ -533,5 +558,170 @@ describe("band properties", () => {
 			}),
 			{ numRuns: 20, seed: 20261101 },
 		);
+	});
+});
+
+describe("persistence and lifecycle", () => {
+	const resetConfig = () => rmSync(CONFIG_FILE, { recursive: true, force: true });
+	const ensure = async (label: string, command: string) => {
+		if (h.widget()?.render(120).join("\n").includes(label)) return;
+		await h.command(command);
+	};
+
+	test("config load tolerates missing, malformed and non-object files", () => {
+		resetConfig();
+		expect(loadUiPanelsConfig()).toEqual({});
+		for (const garbage of ["not json {", "null", "[]", "42"]) {
+			writeFileSync(CONFIG_FILE, garbage);
+			expect(loadUiPanelsConfig()).toEqual({});
+		}
+		writeFileSync(CONFIG_FILE, JSON.stringify({ split: true, bandHeight: 12 }));
+		expect(loadUiPanelsConfig()).toEqual({ split: true, bandHeight: 12 });
+		resetConfig();
+	});
+
+	test("save reports a write failure instead of throwing", () => {
+		resetConfig();
+		expect(saveUiPanelsConfig({ split: true })).toBe(true);
+		expect(JSON.parse(readFileSync(CONFIG_FILE, "utf8"))).toEqual({ split: true });
+		resetConfig();
+		// A directory at the config path makes writeFileSync fail.
+		mkdirSync(CONFIG_FILE, { recursive: true });
+		expect(saveUiPanelsConfig({ split: true })).toBe(false);
+		resetConfig();
+	});
+
+	test("/split-save persists the live layout, and reports a failed write", async () => {
+		resetConfig();
+		await ensure("Thinking", "split-thinking");
+		await ensure("Tool Usage", "split-tools");
+		await ensure("📂 Files", "files");
+		// Other suites leave diff/toolMode/trimResponse in either state; read the
+		// saved layout once, then normalize only those three toggles.
+		await h.command("split-save");
+		const before = JSON.parse(readFileSync(CONFIG_FILE, "utf8"));
+		if (before.diff !== true) await h.command("split-diff");
+		if (before.toolMode !== "compact") await h.command("split-tools-view");
+		if (before.trimResponse) await h.command("split-trim-response", "off");
+		await h.command("split-height", "12");
+		await h.command("split-tools-width", "45");
+		h.notifications.length = 0;
+		await h.command("split-save");
+		expect(h.notifications.at(-1)).toMatchObject({ level: "info" });
+		expect(JSON.parse(readFileSync(CONFIG_FILE, "utf8"))).toMatchObject({
+			split: true,
+			thinking: true,
+			tools: true,
+			files: true,
+			diff: true,
+			toolMode: "compact",
+			trimResponse: false,
+			bandHeight: 12,
+			toolsWidthPct: 45,
+		});
+
+		resetConfig();
+		mkdirSync(CONFIG_FILE, { recursive: true });
+		h.notifications.length = 0;
+		await h.command("split-save");
+		expect(h.notifications.at(-1)).toMatchObject({
+			level: "error",
+			message: expect.stringContaining("Could not save"),
+		});
+		resetConfig();
+		await h.command("split-height", "20");
+		await h.command("split-tools-width", "35");
+	});
+
+	test("tool_execution_update streams partial output into the tool panel", async () => {
+		await h.emit("tool_execution_start", {
+			toolCallId: "upd",
+			toolName: "bash",
+			args: { command: "sleep 5" },
+		});
+		await h.emit("tool_execution_update", {
+			toolCallId: "upd",
+			partialResult: { content: "partial output line" },
+		});
+		// A second update reuses the pending flush timer.
+		await h.emit("tool_execution_update", {
+			toolCallId: "upd",
+			partialResult: { content: "partial output line" },
+		});
+		await new Promise(resolve => setTimeout(resolve, 200));
+		// Tool detail mode is whatever earlier suites left; make output visible.
+		const outputVisible = () => h.widget()!.render(120).join("\n").includes("partial output line");
+		let toggles = 0;
+		while (!outputVisible() && toggles < 2) {
+			await h.command("split-tools-view");
+			toggles++;
+		}
+		expect(outputVisible()).toBe(true);
+		for (; toggles > 0; toggles--) await h.command("split-tools-view");
+		await h.emit("tool_execution_end", {
+			toolCallId: "upd",
+			result: { content: "partial output line" },
+			isError: false,
+		});
+	});
+
+	test("session_start, session_tree and session_switch replay the branch once", async () => {
+		h.setBranch([
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [
+						{ type: "thinking", thinking: "replayed reasoning" },
+						{ type: "toolCall", id: "b1", name: "read", arguments: { path: "/tmp/replay.ts" } },
+					],
+				},
+			},
+			{
+				type: "message",
+				message: { role: "toolResult", toolCallId: "b1", toolName: "read", content: "ok" },
+			},
+		]);
+		await h.emit("session_start");
+		await ensure("Thinking", "split-thinking");
+		await ensure("Tool Usage", "split-tools");
+		await ensure("📂 Files", "files");
+		for (const event of ["session_tree", "session_switch"]) {
+			await h.emit(event);
+			const joined = h.widget()!.render(120).join("\n");
+			expect(joined).toContain("replayed reasoning");
+			expect(joined).toContain("replay.ts");
+			expect((joined.match(/replayed reasoning/g) ?? []).length).toBe(1);
+		}
+	});
+
+	test("the live tool ticker refreshes while a call runs and stops after", async () => {
+		await h.emit("tool_execution_start", {
+			toolCallId: "tick",
+			toolName: "bash",
+			args: { command: "sleep 9" },
+		});
+		await new Promise(resolve => setTimeout(resolve, 1100)); // running tick
+		await h.emit("tool_execution_end", {
+			toolCallId: "tick",
+			result: { content: "" },
+			isError: false,
+		});
+		await new Promise(resolve => setTimeout(resolve, 1100)); // stop tick
+		expect(h.widget()!.render(120).length).toBe(20);
+	});
+
+	test("host invalidate() keeps the band rendering at the same geometry", () => {
+		const component = h.component()!;
+		const before = component.render(120);
+		component.invalidate();
+		expect(component.render(120)).toEqual(before);
+		assertExactWidth(before, 120);
+	});
+
+	test("session_shutdown unmounts the widget and clears timers", async () => {
+		expect(h.widgets.get("split-view")).toBeDefined();
+		await h.emit("session_shutdown");
+		expect(h.widgets.get("split-view")).toBeUndefined();
 	});
 });

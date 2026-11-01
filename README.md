@@ -130,6 +130,20 @@ event streams. Seeds are fixed, so failures reproduce.
 dependencies: `node_modules` is ~1 GB, so the first install is slow and the
 cache is expected.
 
+### Coverage
+
+```sh
+bun run test:coverage
+```
+
+Bun instruments TypeScript directly (no istanbul/nyc/`--experimental` flags)
+and writes an lcov report; `scripts/check-coverage.ts` parses it and fails the
+command below `lines = 99%` / `functions = 90%` (override with
+`COVERAGE_LINES` / `COVERAGE_FUNCTIONS`). Test fixtures are excluded from the
+totals. Current: 99.91% lines / 96.36% functions — the only uncovered line is
+the `themeGetter` default that throws before `session_start` binds a theme; the
+uncovered functions are no-op extension exports.
+
 ### Linting and complexity metrics
 
 Python's pylint/radon have no maintained TypeScript port; the equivalents here
