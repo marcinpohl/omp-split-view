@@ -9,7 +9,7 @@ landed item updates the snapshot and ticks its row.
 
 | Command | Measures | Gate |
 | --- | --- | --- |
-| `bun test` | behaviour + property tests | 81 tests, 0 failures |
+| `bun test` | behaviour + property tests | 88 tests, 0 failures |
 | `bun run test:coverage` | line/function coverage from Bun's lcov | lines ≥ 99%, functions ≥ 90% (`scripts/check-coverage.ts`) |
 | `bun run lint` | ESLint 10 + typescript-eslint + sonarjs; also the cyclomatic/cognitive/size metrics | 0 errors (warnings are the metric report) |
 | `bun run typecheck` | `tsc --noEmit`, strict | clean |
@@ -25,16 +25,16 @@ targets control characters.
 
 | File | Lines | Funcs | Test file | Tests |
 | --- | --- | --- | --- | --- |
-| `split-view.ts` | 99.90% | 97.83% | `test/split-view.test.ts` | 48 |
-| `helpers.ts` | 100.00% | 93.33% | `test/helpers.test.ts` | 16 |
+| `split-view.ts` | 99.90% | 97.85% | `test/split-view.test.ts` | 52 |
+| `helpers.ts` | 100.00% | 94.12% | `test/helpers.test.ts` | 19 |
 | `ui-panels-config.ts` | 100.00% | 80.00% | `test/properties.test.ts` | 17 |
-| **overall** | **99.91%** | **96.43%** | | **81** |
+| **overall** | **99.91%** | **96.52%** | | **88** |
 
-29,753 assertions, ~3.9 s wall time. Uncovered:
+32,364 assertions, ~3.9 s wall time. Uncovered:
 
-- `split-view.ts:118` — `themeGetter` default that throws if something renders
+- `split-view.ts:121` — `themeGetter` default that throws if something renders
   before `session_start` binds a theme. Deliberate, unreachable.
-- Functions: 108/112 counted (`FNF`/`FNH` in `coverage/lcov.info`, `test/**`
+- Functions: 111/115 counted (`FNF`/`FNH` in `coverage/lcov.info`, `test/**`
   excluded as the gate does). The four misses are the throwing `themeGetter`
   default, `BandHub.dispose` (no-op host hook), and the two no-op default
   exports that exist so omp's extension auto-discovery does not report a load
@@ -70,23 +70,27 @@ function length 100 lines.
 
 | Function | cc | cognitive | other | Location |
 | --- | --- | --- | --- | --- |
-| `filesPanelLines` | 31 | 50 | — | `split-view.ts:804` |
-| `toolLines` | 21 | 39 | — | `split-view.ts:425` |
-| `reconstruct` | 20 | 36 | — | `split-view.ts:1019` |
-| `renderBand` | 23 | 29 | — | `split-view.ts:691` |
-| `pathsFrom` | 18 | 24 | — | `split-view.ts:484` |
-| `syncTranscriptVisibility` | 15 | — | — | `split-view.ts:974` |
+| `filesPanelLines` | 31 | 50 | — | `split-view.ts:816` |
+| `toolLines` | 21 | 39 | — | `split-view.ts:437` |
+| `reconstruct` | 20 | 36 | — | `split-view.ts:1036` |
+| `renderBand` | 23 | 29 | — | `split-view.ts:703` |
+| `pathsFrom` | 18 | 24 | — | `split-view.ts:496` |
+| `syncTranscriptVisibility` | 15 | — | — | `split-view.ts:991` |
 | `normalizeConfig` | 14 | — | — | `ui-panels-config.ts:58` |
-| `splitView` | — | — | 273 lines | `split-view.ts:1067` |
-| `newestRows` | — | — | 6 params | `split-view.ts:608` |
-| `renderPanel` | — | — | 5 params | `split-view.ts:634` |
+| `splitView` | — | — | 279 lines | `split-view.ts:1084` |
+| `newestRows` | — | — | 6 params | `split-view.ts:620` |
+| `renderPanel` | — | — | 5 params | `split-view.ts:646` |
+
+Band/dock geometry now scales (`defaultBandHeight`, `maxBandHeight`,
+`AUTO_DOCK_*` in `helpers.ts`), so 4K and ultrawide terminals get a 45%-height
+band and a 25%-width dock instead of the 48-col/40-row ceilings.
 
 `filesPanelLines` sits exactly at the 4-parameter limit after taking the hint
 row as `notice?`; the Q1 split must not add a fifth, or extract an options
 object (Q7's pattern) as part of the extraction.
 
-File sizes: `split-view.ts` 1366 L, `helpers.ts` 212 L,
-`ui-panels-config.ts` 144 L, `scripts/check-coverage.ts` 90 L, tests 1652 L.
+File sizes: `split-view.ts` 1389 L, `helpers.ts` 244 L,
+`ui-panels-config.ts` 146 L, `scripts/check-coverage.ts` 90 L, tests 1779 L.
 
 ## Work queue
 

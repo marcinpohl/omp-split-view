@@ -16,6 +16,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import { MAX_BAND_HEIGHT, MIN_BAND_HEIGHT } from "./helpers.ts";
 
 const CONFIG_PATH = path.join(
 	process.env.PI_CODING_AGENT_DIR?.trim() || path.join(homedir(), ".omp", "agent"),
@@ -39,11 +40,12 @@ export interface UiPanelsConfig {
 	toolMode?: ToolMode;
 	/** Response-only transcript (hides thinking blocks and tool activity). */
 	trimResponse?: boolean;
-	/** Band height in rows (6–40, default 20). */
+	/** Band height in rows (6–80, default 20, scaled to the terminal height
+	 * when absent). */
 	bandHeight?: number;
 	/** Tools panel's share of the band width in percent (20–60, default 35). */
 	toolsWidthPct?: number;
-	/** Files panel width in columns. Absent = auto (25% of the terminal, 34–48 cols). */
+	/** Files panel width in columns. Absent = auto (25% of the terminal, 34–120 cols). */
 	filesWidth?: number;
 }
 
@@ -80,7 +82,7 @@ export function normalizeConfig(raw: UiPanelsConfig): Required<{
 		typeof rawHeight === "number" && Number.isFinite(rawHeight)
 			? Math.trunc(rawHeight)
 			: 20;
-	const bandHeight = Math.max(6, Math.min(40, usableHeight));
+	const bandHeight = Math.max(MIN_BAND_HEIGHT, Math.min(MAX_BAND_HEIGHT, usableHeight));
 	// toolsWidthPct — same strict typing as bandHeight (real finite number,
 	// default 35 on garbage), clamped to 20–60.
 	const rawPct: unknown = root.toolsWidthPct;

@@ -57,7 +57,7 @@ default. Start bare regardless of saved defaults with `--no-split`.
 | `/files` | Toggle the files panel within the band |
 | `/split-tools-view` | Compact ↔ full tool detail (full shows output previews) |
 | `/split-tools-width <pct>` | Tools panel width as % of the band (20–60, default 35) |
-| `/split-height <n>` | Band height in rows (6–40, default 20) |
+| `/split-height <n>` | Band height in rows (6–80; clamped to leave 18 rows for the transcript, default 45% of the terminal height) |
 | `/split-diff` | Toggle the files panel's edit-diff subpanel |
 | `/split-trim-response [on\|off]` | Full transcript ↔ response-only |
 | `/split-save` | Persist the current layout as startup defaults for new windows |
@@ -94,10 +94,17 @@ toggles between bare omp and that saved layout.
 - **Untrusted text** — escape sequences and other C0/C1 control characters in
   model or tool text are stripped at ingestion, so a tool result or thinking
   delta cannot drive the terminal.
-- **Geometry** — the band hides itself on terminals too short for
-  transcript + editor; the files column drops out below 90 columns (a
-  files-only layout keeps its frame and says so, instead of rendering blank);
-  every rendered row is exactly the terminal width from 40 columns up (tested).
+- **Geometry** — scales with the window instead of clamping at laptop sizes.
+  The files dock is 25% of the width (34–120 cols), the band is 45% of the
+  height by default (20–80 rows) when no height is saved, and each tool's
+  output preview grows from 2 to 6 lines as the band gets taller. On a
+  400×100 (4K) terminal that is a 45-row band split 195 | 105 | 100; on an
+  ultrawide 500×60 it is 247 | 133 | 120. `/split-height` clamps to leave 18
+  rows for the transcript and editor, the band hides itself entirely on
+  terminals too short for it, the files column drops out below 90 columns (a
+  files-only layout keeps its frame and says so rather than rendering blank),
+  and every rendered row is exactly the terminal width from 40 columns up
+  (tested).
 
 ## Differences from the pi original
 
@@ -122,8 +129,17 @@ root does not exist here, so:
 ```sh
 bun install
 bun test          # helpers + component/integration + fast-check property tests
+bun run demo      # print real band frames (no TUI required)
 bun run typecheck # tsc --noEmit against @oh-my-pi/pi-tui / pi-coding-agent
 ```
+
+`bun run demo` (`scripts/demo.ts`) drives the extension with a fake host and
+prints the exact rows omp would receive from `render(width)`: the three-column
+layout with a live edit diff, a custom tool's diff reaching the files pane, a
+files-only layout on a too-narrow terminal, directory grouping/badges/
+truncation, and the retained-state bounds. The band is editor chrome inside
+omp's own frame, so there is no screenshot path; this is the reviewable
+equivalent.
 
 Property tests (`test/properties.test.ts`, fast-check) cover the helper
 invariants and, through the widget factory, band geometry for any terminal
@@ -147,7 +163,7 @@ Bun instruments TypeScript directly (no istanbul/nyc/`--experimental` flags)
 and writes an lcov report; `scripts/check-coverage.ts` parses it and fails the
 command below `lines = 99%` / `functions = 90%` (override with
 `COVERAGE_LINES` / `COVERAGE_FUNCTIONS`). Test fixtures are excluded from the
-totals. Current: 99.91% lines / 96.36% functions — the only uncovered line is
+totals. Current: 99.91% lines / 96.43% functions — the only uncovered line is
 the `themeGetter` default that throws before `session_start` binds a theme; the
 uncovered functions are no-op extension exports.
 

@@ -65,14 +65,19 @@ import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
 import {
+	MAX_BAND_HEIGHT,
+	MIN_BAND_HEIGHT,
 	MIN_DOCK_COLS,
+	MIN_ROWS_BELOW_BAND,
 	appendStreamTail,
 	bandToolsColsFor,
 	capDisplayLine,
 	capToolText,
+	defaultBandHeight,
 	dockColsFor,
 	formatDuration,
 	lastImageBlock,
+	maxBandHeight,
 	outputPreview,
 	sanitizeText,
 	transcriptVisibility,
@@ -101,8 +106,6 @@ const MAX_TOOL_OUTPUT_LINES = 20;
 const MAX_TOOL_DIFF_LINES = 150;
 const MAX_BODY_ROWS = 400;
 const MAX_LINE_CHARS = MAX_TAIL_CHARS;
-/** Rows the transcript + editor need; shorter terminals hide the band. */
-const MIN_ROWS_BELOW_BAND = 18;
 const THINK_RAF_MS = 50;
 const TOOLS_FLUSH_MS = 100;
 
@@ -129,6 +132,9 @@ let showDiff = true;
 let toolMode: ToolMode = "compact";
 let trimResponse = false;
 let bandHeight = 20;
+/** No explicit band height in the saved config: size it to the terminal once,
+ * at first mount, instead of pinning the 20-row default on a 4K display. */
+let bandHeightAuto = true;
 let toolsWidthPct = 35;
 let filesWidth: number | null = null;
 
@@ -421,8 +427,14 @@ function toolState(entry: ToolEntry): { tone: "warning" | "error" | "success"; g
 	return { tone: "success", glyph: "✓" };
 }
 
+/** Output lines previewed per tool. A tall panel (4K-height terminal) has the
+ * rows to show more than the classic two, so the depth follows the band. */
+function previewLinesFor(rows: number): number {
+	return Math.max(2, Math.min(6, Math.floor(rows / 8)));
+}
+
 /** Panel rows for the tools view, styled, oldest first. */
-function toolLines(theme: Theme, width: number): string[] {
+function toolLines(theme: Theme, width: number, previewCap = 2): string[] {
 	const out: string[] = [];
 	const full = toolMode === "full";
 	const textWidth = Math.max(8, width - 3);
@@ -454,7 +466,7 @@ function toolLines(theme: Theme, width: number): string[] {
 		if (content.length === 0) {
 			if (entry.active) out.push(theme.fg("dim", "  · …"));
 		} else {
-			const { shown, hidden } = outputPreview(content, 2);
+			const { shown, hidden } = outputPreview(content, previewCap);
 			for (const line of shown) out.push(theme.fg("toolOutput", `  · ${truncateInline(line, textWidth - 4)}`));
 			if (hidden > 0) out.push(theme.fg("dim", `  · +${hidden} more`));
 		}
@@ -577,7 +589,7 @@ interface BandDef {
 	color: "accent" | "muted";
 	streaming: () => boolean;
 	style: (line: string) => string;
-	lines: (width: number) => string[];
+	lines: (width: number, rows: number) => string[];
 	empty: string;
 }
 
@@ -596,7 +608,7 @@ function bandDef(theme: Theme, id: "thinking" | "tools"): BandDef {
 		color: "muted",
 		streaming: () => toolOrder.some(id => toolsBy.get(id)?.active),
 		style: line => line,
-		lines: (width: number) => toolLines(theme, width),
+		lines: (width: number, rows: number) => toolLines(theme, width, previewLinesFor(rows)),
 		empty: "No tools called yet",
 	};
 }
@@ -650,7 +662,7 @@ function renderPanel(
 		theme.fg("border", "╮");
 	const bottom = theme.fg("border", `╰${"─".repeat(inner)}╯`);
 	const textWidth = Math.max(1, width - 3);
-	const visible = newestRows(def.lines(width), textWidth, bodyRows, def.style, memo, def.title);
+	const visible = newestRows(def.lines(width, bodyRows), textWidth, bodyRows, def.style, memo, def.title);
 	const bodyRow = (text: string) => {
 		// Clip, don't just pad: wrapped lines and empty-state hints can be
 		// wider than a narrow panel, and an over-wide row corrupts the frame.
@@ -915,6 +927,11 @@ function mountWidget(ctx: ExtensionContext): void {
 		WIDGET_KEY,
 		tui => {
 			tuiRef = tui;
+			if (bandHeightAuto) {
+				bandHeight = defaultBandHeight(tui.terminal.rows);
+				bandHeightAuto = false;
+				bandCacheKey = "";
+			}
 			return new BandHub(tui);
 		},
 		{ placement: "aboveEditor" },
@@ -1086,7 +1103,8 @@ export default function splitView(pi: ExtensionAPI): void {
 		notifyFn = (message, level) => ctx.ui.notify(message, level);
 		themeGetter = () => ctx.ui.theme;
 
-		let cfg = normalizeConfig(loadUiPanelsConfig());
+		const raw = loadUiPanelsConfig();
+		let cfg = normalizeConfig(raw);
 		if (pi.getFlag("no-split")) {
 			cfg = { ...cfg, split: false, thinking: false, tools: false, files: false, trimResponse: false };
 		}
@@ -1094,6 +1112,8 @@ export default function splitView(pi: ExtensionAPI): void {
 		toolsOn = cfg.tools;
 		toolMode = cfg.toolMode;
 		bandHeight = cfg.bandHeight;
+		const rawHeight: unknown = isRecord(raw) ? (raw as { bandHeight?: unknown }).bandHeight : undefined;
+		bandHeightAuto = typeof rawHeight !== "number";
 		toolsWidthPct = cfg.toolsWidthPct;
 		filesWidth = cfg.filesWidth;
 		filesOn = cfg.files;
@@ -1287,10 +1307,13 @@ export default function splitView(pi: ExtensionAPI): void {
 			if (!requireTui(ctx)) return;
 			const height = Number.parseInt(String(args ?? "").trim(), 10);
 			if (Number.isNaN(height)) {
-				notify(`Band height: ${bandHeight} rows (usage: /split-height 6-40)`);
+				const limit = tuiRef?.terminal.rows === undefined ? MAX_BAND_HEIGHT : maxBandHeight(tuiRef.terminal.rows);
+				notify(`Band height: ${bandHeight} rows (usage: /split-height ${MIN_BAND_HEIGHT}-${limit})`);
 				return;
 			}
-			bandHeight = Math.max(6, Math.min(40, height));
+			const limit = tuiRef?.terminal.rows === undefined ? MAX_BAND_HEIGHT : maxBandHeight(tuiRef.terminal.rows);
+			bandHeight = Math.max(MIN_BAND_HEIGHT, Math.min(limit, height));
+			bandHeightAuto = false;
 			bandCacheKey = "";
 			reconcile(ctx);
 			syncTranscriptVisibility();

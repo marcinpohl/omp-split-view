@@ -1,12 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import {
+	MAX_BAND_HEIGHT,
+	MIN_BAND_HEIGHT,
 	appendStreamTail,
 	bandToolsColsFor,
 	capDisplayLine,
 	capToolText,
+	defaultBandHeight,
 	dockColsFor,
 	formatDuration,
 	lastImageBlock,
+	maxBandHeight,
 	outputPreview,
 	transcriptVisibility,
 	truncateInline,
@@ -48,13 +52,44 @@ describe("bandToolsColsFor", () => {
 });
 
 describe("dockColsFor", () => {
-	test("auto 25% clamped 34–48, manual clamped to the terminal", () => {
+	test("auto tracks 25% of the terminal up to a 120-col guard", () => {
+		// Narrow: the 34-col floor keeps the frame and one word per row.
 		expect(dockColsFor(100)).toBe(34);
+		expect(dockColsFor(120)).toBe(34); // floor(30) < 34
 		expect(dockColsFor(160)).toBe(40);
-		expect(dockColsFor(400)).toBe(48);
+		// Wide: the dock keeps growing instead of stopping at the old 48.
+		expect(dockColsFor(240)).toBe(60);
+		expect(dockColsFor(400)).toBe(100); // 4K terminal, ~400 cols
+		expect(dockColsFor(480)).toBe(120);
+		expect(dockColsFor(600)).toBe(120); // guard, not a target
+	});
+
+	test("manual width is clamped to the terminal, not to the auto ceiling", () => {
 		expect(dockColsFor(160, 70)).toBe(70);
 		expect(dockColsFor(160, 10)).toBe(24);
 		expect(dockColsFor(160, 150)).toBe(110);
+		// Above the auto guard: an explicit choice wins up to cols - reserve.
+		expect(dockColsFor(400, 180)).toBe(180);
+		expect(dockColsFor(400, 999)).toBe(350);
+	});
+});
+
+describe("band height scaling", () => {
+	test("default follows the terminal, pinned at the classic 20 on a 45-row screen", () => {
+		expect(defaultBandHeight(45)).toBe(20); // unchanged for existing users
+		expect(defaultBandHeight(40)).toBe(20); // floor wins on short terminals
+		expect(defaultBandHeight(60)).toBe(27);
+		expect(defaultBandHeight(100)).toBe(45); // 4K: a third of the screen
+		expect(defaultBandHeight(200)).toBe(MAX_BAND_HEIGHT); // ceiling
+	});
+
+	test("max keeps the transcript and editor their rows", () => {
+		expect(maxBandHeight(20)).toBe(MIN_BAND_HEIGHT); // 20 - 18 = 2 → floor
+		expect(maxBandHeight(24)).toBe(6);
+		expect(maxBandHeight(45)).toBe(27);
+		expect(maxBandHeight(60)).toBe(42);
+		expect(maxBandHeight(100)).toBe(80);
+		expect(maxBandHeight(400)).toBe(80); // ceiling still applies
 	});
 });
 

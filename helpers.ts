@@ -89,13 +89,45 @@ export function bandToolsColsFor(total: number, pct: number): number {
 export const MIN_DOCK_COLS = 24;
 /** Columns the transcript side keeps when the files panel is resized. */
 export const DOCK_LEFT_RESERVE = 50;
+/** Auto dock width: 25% of the terminal. The ceiling is a guard against absurd
+ * widths, not a design target — it used to be 48, which left a 4K or ultrawide
+ * terminal with a 48-col slot and ~350 unused columns beside it. */
+export const AUTO_DOCK_PCT = 0.25;
+export const AUTO_DOCK_MIN_COLS = 34;
+export const AUTO_DOCK_MAX_COLS = 120;
 
-/** Files panel width: auto = 25% clamped to 34–48 cols; a manual width is
- * clamped to [MIN_DOCK_COLS, cols - DOCK_LEFT_RESERVE]. */
+/** Files panel width: auto = 25% clamped to 34–120 cols, so the column keeps
+ * growing on wide terminals; a manual width is clamped to
+ * [MIN_DOCK_COLS, cols - DOCK_LEFT_RESERVE]. */
 export function dockColsFor(cols: number, manual: number | null = null): number {
-	if (manual === null) return Math.max(34, Math.min(48, Math.floor(cols * 0.25)));
+	if (manual === null) {
+		const auto = Math.floor(cols * AUTO_DOCK_PCT);
+		return Math.max(AUTO_DOCK_MIN_COLS, Math.min(AUTO_DOCK_MAX_COLS, auto));
+	}
 	const max = Math.max(MIN_DOCK_COLS, cols - DOCK_LEFT_RESERVE);
 	return Math.max(MIN_DOCK_COLS, Math.min(max, Math.trunc(manual)));
+}
+
+export const MIN_BAND_HEIGHT = 6;
+/** Ceiling for the band: tall terminals (4K, portrait, large-font splits) may
+ * spend far more than the old 40-row cap on the panels. */
+export const MAX_BAND_HEIGHT = 80;
+/** Rows the transcript + editor keep; a band that would eat into them hides. */
+export const MIN_ROWS_BELOW_BAND = 18;
+
+/** Startup band height for a terminal of `rows`: 45% of the height, never
+ * below the classic 20 rows and never above MAX_BAND_HEIGHT. Evaluated only
+ * when the saved config has no explicit height, so a chosen height is never
+ * overridden: 45 rows -> 20 (the old default), 100 -> 45, 200 -> 80. */
+export function defaultBandHeight(rows: number): number {
+	return Math.max(20, Math.min(MAX_BAND_HEIGHT, Math.floor(rows * 0.45)));
+}
+
+/** Tallest band that still leaves MIN_ROWS_BELOW_BAND for the transcript and
+ * editor on a terminal of `rows`; used to clamp an explicit `/split-height` so
+ * a request cannot make the band silently invisible. */
+export function maxBandHeight(rows: number): number {
+	return Math.max(MIN_BAND_HEIGHT, Math.min(MAX_BAND_HEIGHT, rows - MIN_ROWS_BELOW_BAND));
 }
 
 /** Compact duration: 0.4s · 2.3s · 42s · 3m05s · 1h02m. `live` drops the

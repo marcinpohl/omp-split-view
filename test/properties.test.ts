@@ -6,6 +6,10 @@
 import { describe, expect, test } from "bun:test";
 import * as fc from "fast-check";
 import {
+	AUTO_DOCK_MAX_COLS,
+	AUTO_DOCK_MIN_COLS,
+	AUTO_DOCK_PCT,
+	MIN_DOCK_COLS,
 	appendStreamTail,
 	bandToolsColsFor,
 	capDisplayLine,
@@ -125,19 +129,23 @@ describe("bandToolsColsFor", () => {
 });
 
 describe("dockColsFor", () => {
-	test("auto stays in 34–48 and manual stays inside the terminal", () => {
+	test("auto tracks the terminal within 34–120, manual stays inside it", () => {
 		fc.assert(
 			fc.property(
-				fc.integer({ min: 40, max: 400 }),
-				fc.option(fc.integer({ min: -100, max: 400 }), { nil: null }),
+				fc.integer({ min: 40, max: 800 }),
+				fc.option(fc.integer({ min: -100, max: 800 }), { nil: null }),
 				(cols, manual) => {
 					const width = dockColsFor(cols, manual);
 					if (manual === null) {
-						expect(width).toBeGreaterThanOrEqual(34);
-						expect(width).toBeLessThanOrEqual(48);
+						expect(width).toBeGreaterThanOrEqual(AUTO_DOCK_MIN_COLS);
+						expect(width).toBeLessThanOrEqual(AUTO_DOCK_MAX_COLS);
+						// On a terminal wide enough for the ratio to apply, the dock
+						// must keep growing with it, never flat-cap mid-range.
+						if (cols >= 200 && width < AUTO_DOCK_MAX_COLS)
+							expect(width).toBe(Math.floor(cols * AUTO_DOCK_PCT));
 					} else {
-						expect(width).toBeGreaterThanOrEqual(24);
-						expect(width).toBeLessThanOrEqual(Math.max(24, cols - 50));
+						expect(width).toBeGreaterThanOrEqual(MIN_DOCK_COLS);
+						expect(width).toBeLessThanOrEqual(Math.max(MIN_DOCK_COLS, cols - 50));
 					}
 				},
 			),

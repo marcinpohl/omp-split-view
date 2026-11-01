@@ -6,6 +6,7 @@
 	"scripts": {
 		"typecheck": "bun x tsc --noEmit",
 		"test": "bun test",
+		"demo": "bun scripts/demo.ts",
 		"lint": "eslint .",
 		"lint:fix": "eslint . --fix",
 		"test:coverage": "bun test --coverage --coverage-reporter=text --coverage-reporter=lcov && bun scripts/check-coverage.ts"

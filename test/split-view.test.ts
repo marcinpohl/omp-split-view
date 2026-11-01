@@ -404,18 +404,22 @@ describe("band properties", () => {
 		await h.command("split-height", "20");
 	});
 
-	test("the band hides exactly when the transcript and editor need the rows", async () => {
+	test("/split-height fits the band to the terminal and never hides it silently", async () => {
 		await fc.assert(
 			fc.asyncProperty(
-				fc.integer({ min: 18, max: 60 }),
-				fc.integer({ min: 6, max: 40 }),
-				async (rows, height) => {
+				fc.integer({ min: 18, max: 120 }),
+				fc.integer({ min: 1, max: 200 }),
+				async (rows, requested) => {
 					h.setSize(120, rows);
-					await h.command("split-height", String(height));
-					const expected = rows - height >= 18;
+					await h.command("split-height", String(requested));
+					// The command clamps to what still leaves the transcript and
+					// editor their rows (and caps at MAX_BAND_HEIGHT).
+					const limit = Math.max(6, Math.min(80, rows - 18));
+					const applied = Math.max(6, Math.min(limit, requested));
+					const fits = rows - applied >= 18;
 					const lines = h.widget()!.render(120);
-					expect(lines.length).toBe(expected ? height : 0);
-					if (expected) assertExactWidth(lines, 120);
+					expect(lines.length).toBe(fits ? applied : 0);
+					if (fits) assertExactWidth(lines, 120);
 				},
 			),
 			{ numRuns: 60, seed: 20261101 },
@@ -900,6 +904,86 @@ describe("complex renderers", () => {
 		expect(text).toContain("✎ replay-edit.ts");
 		expect(text).toContain("+second");
 		expect(text).not.toContain("+first");
+	});
+});
+
+describe("large terminals (4K / ultrawide)", () => {
+	/** Cell offsets of each panel's top-left corner in a composed row. */
+	const columnStarts = (line: string): number[] => {
+		const starts: number[] = [];
+		let width = 0;
+		for (const ch of line) {
+			if (ch === "╭") starts.push(width);
+			width += visibleWidth(ch);
+		}
+		return starts;
+	};
+	const writeConfig = (cfg: unknown) => writeFileSync(CONFIG_FILE, JSON.stringify(cfg));
+	/** Toggle-style commands announce the new state; drive to a known one. */
+	const setToggle = async (command: string, message: RegExp) => {
+		await h.command(command);
+		if (!message.test(h.notifications.at(-1)?.message ?? "")) await h.command(command);
+	};
+
+	afterAll(async () => {
+		rmSync(CONFIG_FILE, { recursive: true, force: true });
+		h.setSize(120, 45);
+		await h.emit("session_start"); // no config -> bare, 20-row default
+		await h.command("split");
+		await setToggle("files", /Files panel on/);
+		await h.command("split-height", "20");
+	});
+
+	test("with no saved height the band is 45% of the rows and the dock 25% of the columns", async () => {
+		// No `bandHeight` key: the height must come from the terminal, not the
+		// 20-row default that suit a 45-row screen.
+		writeConfig({ split: true, thinking: true, tools: true, files: true, diff: true });
+		h.setSize(400, 100); // ~4K at a small font
+		await h.emit("session_start");
+		const lines = h.widget()!.render(400);
+		expect(lines.length).toBe(45);
+		assertExactWidth(lines, 400);
+		// 400 cols: files dock = 25% (100), thinking | tools split the other 300.
+		expect(columnStarts(lines[0])).toEqual([0, 195, 300]);
+	});
+
+	test("an explicitly saved height is never overridden by the terminal default", async () => {
+		writeConfig({ split: true, thinking: true, tools: true, files: true, bandHeight: 24 });
+		h.setSize(400, 100);
+		await h.emit("session_start");
+		expect(h.widget()!.render(400).length).toBe(24);
+	});
+
+	test("/split-height uses most of a tall screen, still leaving the transcript room", async () => {
+		writeConfig({ split: true, thinking: true, tools: true, files: true });
+		h.setSize(400, 100);
+		await h.emit("session_start");
+		await h.command("split-height", "200"); // clamped: 100 rows - 18 kept
+		expect(h.notifications.at(-1)?.message).toContain("80");
+		const lines = h.widget()!.render(400);
+		expect(lines.length).toBe(80);
+		assertExactWidth(lines, 400);
+	});
+
+	test("a taller band previews more of each tool's output", async () => {
+		writeConfig({ split: true, thinking: true, tools: true, files: true, bandHeight: 40 });
+		h.setSize(400, 100);
+		await h.emit("session_start");
+		await setToggle("split-tools-view", /full/);
+		const output = Array.from({ length: 12 }, (_, i) => `L${i}`).join("\n");
+		await h.emit("tool_execution_start", { toolCallId: "tall", toolName: "bash", args: { command: "seq 12" } });
+		await h.emit("tool_execution_end", {
+			toolCallId: "tall",
+			result: { content: [{ type: "text", text: output }] },
+			isError: false,
+		});
+		const joined = h.widget()!.render(400).join("\n");
+		// 40-row band -> 38 body rows -> 4 preview lines (not the classic 2).
+		expect(joined).toContain("· L0");
+		expect(joined).toContain("· L3");
+		expect(joined).toContain("· +8 more");
+		expect(joined).not.toContain("· L4");
+		await setToggle("split-tools-view", /compact/);
 	});
 });
 

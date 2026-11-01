@@ -85,6 +85,7 @@ that order's terms. After every item run `bun test`, `bun run test:coverage`,
 | T5 resume/reconstruct | done | — |
 | T6 command argument handling | partial | — |
 | T7 tool panel extras | done | B6 |
+| W8 large-terminal geometry | done | — |
 
 ### W1 — Theme cache misses `text` (low, one line)
 
@@ -170,6 +171,27 @@ The test covers all three branches with `toolName: "patch"` and is load-bearing
   resolvable path (`event.input.path` → `details.path`), keyed off the payload
   rather than the tool name.
 - Acceptance: T4-style event with `toolName: "patch"` updates the files pane.
+
+### W8 — Geometry clamped at laptop sizes (med) — **done**
+
+**Done** — three fixed caps made 4K/ultrawide terminals waste most of their
+space: the files dock topped out at 48 cols, the band at 40 rows, and each
+tool preview at 2 output lines. Now the dock is 25% of the width (34–120), the
+band defaults to 45% of the terminal height when no height is saved (20–80,
+so a 45-row screen keeps the classic 20) and may be set up to
+`maxBandHeight(rows)`, which always leaves 18 rows for the transcript and
+editor, and the tool preview depth follows the band (2–6 lines). Helpers
+(`defaultBandHeight`, `maxBandHeight`, `dockColsFor`) are unit- and
+property-tested, the composed band is asserted at 400×100 (45 rows, columns
+at 0/195/300), `/split-height` clamping is a property, and an explicitly saved
+height is proven to survive the terminal-derived default. `bun run demo`
+section 5 prints the resulting table for 120×45, 200×60, 400×100 and 500×60.
+
+- Where: `helpers.ts` (`dockColsFor`, `defaultBandHeight`, `maxBandHeight`),
+  `split-view.ts` (`bandHeightAuto` at first mount, `/split-height` clamp,
+  `previewLinesFor`), `ui-panels-config.ts` (height clamp 6–80).
+- Acceptance: no fixed geometric cap below the terminal size; a chosen height
+  is never overridden; a request that would hide the band is clamped instead.
 
 ### W6 — `reconstruct` replays every bash token through `fs` (low-med) — **open, do it with Q3**
 
