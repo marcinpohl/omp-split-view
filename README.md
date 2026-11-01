@@ -221,6 +221,29 @@ v<version>` once that secret exists; everything before the publish step can be
 checked locally, but the step itself cannot (`bun publish --dry-run` packs the
 tarball and then exits with `missing authentication`).
 
+Release prerequisites, in order: add the remote, push `main`, add the
+`NPM_TOKEN` secret to the repository, then push the tag. The registry has no
+`@marcinpohl/omp-split-view` version yet (checked 2026-11-01), so `v0.1.0` is
+the initial publish and the npm install line in [Install](#install) only starts
+working once that tag's workflow has completed.
+
+The packed file set is installable as published — verified for this tree:
+
+```sh
+bun pm pack                              # 6 files: package.json, LICENSE, README, 3 modules
+mkdir -p /tmp/omp-pkg && tar -xzf *.tgz -C /tmp/omp-pkg
+omp plugin install /tmp/omp-pkg/package  # a .tgz path is read as a directory (ENOTDIR)
+omp plugin list && omp plugin doctor     # lists @marcinpohl/omp-split-view, status ok
+```
+
+`omp plugin install` links a local directory and a published install copies
+files into `~/.omp/plugins/node_modules`, so the extracted tarball is the
+closest local stand-in for what npm serves. Discovery loads the packaged entry
+point from either: appending a throwaway `throw` to the installed
+`split-view.ts` surfaces as `Failed to load extension
+~/.omp/plugins/node_modules/@marcinpohl/omp-split-view/split-view.ts`, and the
+unmodified file loads silently.
+
 ### Coverage
 
 Metrics, thresholds and the ranked work queue live in
