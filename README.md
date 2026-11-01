@@ -44,7 +44,8 @@ omp plugin install /path/to/omp-split-view
 
 Requires oh-my-pi 18.x (`@oh-my-pi/pi-tui` / `@oh-my-pi/pi-coding-agent` 18+).
 
-Start bare regardless of saved defaults with `--no-split`.
+First run is bare; `/split` turns the band on and `/split-save` makes it the
+default. Start bare regardless of saved defaults with `--no-split`.
 
 ## Commands
 

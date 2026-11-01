@@ -4,6 +4,10 @@ Source of this list: analysis of 2026-11-01 against omp `@oh-my-pi/*` 18.14.2
 (lock-pinned). Every claim below was verified by running the suite, the type
 checker, and throwaway probe scripts; none are inferred.
 
+`CODE_QUALITY.md` owns the measured snapshot (tests/coverage/lint) and the
+ranked queue; this file owns the behaviour descriptions and acceptance text.
+Status below is reconciled against `CODE_QUALITY.md` as of commit `bc86769`.
+
 ## Verified baseline (re-check after any change)
 
 The metric snapshot and the ranked work queue live in `CODE_QUALITY.md`; keep
@@ -13,12 +17,15 @@ its numbers in sync with these commands.
 | --- | --- |
 | `bun test` | 62 pass, 0 fail, 29607 expect() calls |
 | `bun run test:coverage` | gate passes: lines ≥ 99%, functions ≥ 90% (currently 99.91% / 96.36%) |
+| `bun run lint` | 0 errors, 15 warnings (the cyclomatic/cognitive report) |
 | `bun run typecheck` | clean (`tsc --noEmit`, strict) |
 | geometry sweep (probe below) | 0 failures (40–300 cols × 6–40 rows), rows == height, every row exactly `width` cells, no control chars |
 
-Files: `split-view.ts` 1332 L, `helpers.ts` 212 L, `ui-panels-config.ts` 144 L,
-`test/split-view.test.ts` 537 L, `test/properties.test.ts` 310 L,
-`test/helpers.test.ts` 172 L, `test/setup.ts` 7 L. No `.git`, no CI.
+Files: `split-view.ts` 1337 L, `helpers.ts` 212 L, `ui-panels-config.ts` 144 L,
+`test/split-view.test.ts` 727 L, `test/properties.test.ts` 310 L,
+`test/helpers.test.ts` 172 L, `test/setup.ts` 7 L, `scripts/check-coverage.ts`
+90 L, `CODE_QUALITY.md`, `eslint.config.js`. Git repository; no CI yet
+(W7/B7).
 `fast-check` 4.x is the dev dependency behind the property tests.
 `eslint`/`typescript-eslint`/`sonarjs` back `bun run lint`; coverage comes from
 Bun's built-in instrumentation plus the lcov gate in `scripts/check-coverage.ts`
@@ -45,26 +52,39 @@ Fixed during the 2026-11-01 passes (not planned, found by testing):
   tool text can never reach a row as terminal escapes", plus the sanitizeText
   unit properties.
 
-## Decision required before W1
+## Decision before W1 (resolved)
 
-Fresh-install behaviour is currently **bare** (`normalizeConfig({})` →
-`split:false`, so thinking/tools are false; `ui-panels-config.ts:74`). The
-README's install steps never say to run `/split`, and `--no-split` is described
-as the way to get a bare start, which implies the opposite default.
+Fresh-install behaviour stays **bare** (`normalizeConfig({})` → `split:false`).
 
-- Option A (recommended): keep the machine default off, add one README line to
-  Install: "first run is bare; `/split` turns the band on, `/split-save` makes it
-  the default".
-- Option B: default `split:true` in `normalizeConfig` and keep the README.
-
-Do not do both: Option B plus the README line would make `--no-split` the only
-way to start bare, which contradicts the current docs. Pick one, record it here.
+**Option A taken**: the machine default stays off and the README Install
+section now says "First run is bare; `/split` turns the band on and
+`/split-save` makes it the default". Option B (default `split:true`) was
+rejected because it would make `--no-split` the only bare start and contradict
+the documented flag semantics.
 
 ## Work items
 
-Order is deliberate: cache/leak fixes first (tiny, no behaviour change), then
-behaviour, then tests, then packaging. After every item run `bun test` and
-`bun run typecheck`.
+Execution order comes from the `CODE_QUALITY.md` queue (Q1–Q8 structural,
+B1–B7 behaviour); the items below are the behaviour/architecture definitions in
+that order's terms. After every item run `bun test`, `bun run test:coverage`,
+`bun run lint` and `bun run typecheck`, then update both documents.
+
+| PLAN item | Status | CODE_QUALITY row |
+| --- | --- | --- |
+| W1 theme cache misses `text` | done | — |
+| W2 zero-line thinking blocks | open | B5 |
+| W3 `capToolText` tiny caps | done | — |
+| W4 files-only blank < 90 cols | open | B1 |
+| W5 diff follows tool name | open | B2 |
+| W6 `reconstruct` bash replay | open (fold into Q3) | Q3 |
+| W7 repository hygiene | partial (CI open) | B7 |
+| T1 `/split-trim-response` | open | B4 |
+| T2 theme invalidation | done | — |
+| T3 empty thinking blocks | open (with W2) | B5 |
+| T4 `/split` + `/split-save` round-trip | partial | — |
+| T5 resume/reconstruct | done | — |
+| T6 command argument handling | partial | — |
+| T7 tool panel extras | open | B6 |
 
 ### W1 — Theme cache misses `text` (low, one line)
 
@@ -81,7 +101,7 @@ cleared whenever the fingerprint changes (proved by the theme property test).
   reaching the rendered rows.
 - Note: `"text"` is a valid `ThemeColor` (`node_modules/@oh-my-pi/pi-tui/src/theme/schema.ts:129`).
 
-### W2 — Zero-line thinking blocks accumulate (low)
+### W2 — Zero-line thinking blocks accumulate (low) — **open (B5)**
 
 - Where: `thinking.end` (`split-view.ts:198`), `thinking.trim` (`split-view.ts:211`).
 - Problem: `end()` pushes `this.current` unconditionally; `trim()` counts only
@@ -108,7 +128,7 @@ capToolText length property (1–400 char caps).
   behaviour. Do not return the marker alone — it exceeds the cap by design.
 - Acceptance: unit test `capToolText("x".repeat(200), 8).length <= 8`.
 
-### W4 — Files-only layout is silently blank below 90 columns (low)
+### W4 — Files-only layout is silently blank below 90 columns (low) — **open (B1)**
 
 - Where: `renderBand`, `split-view.ts:656-683` (`filesWidthCols` gate).
 - Problem: with only the files panel on, widths 80 and 89 render 0 rows and no
@@ -121,7 +141,7 @@ capToolText length property (1–400 char caps).
 - Acceptance: geometry sweep includes files-only at 80/89 → `rows.length ===
   height`, every row exactly `width`, output contains the hint.
 
-### W5 — Diff subpanel only follows `toolName === "edit"` (low)
+### W5 — Diff subpanel only follows `toolName === "edit"` (low) — **open (B2)**
 
 - Where: `tool_result` handler, `split-view.ts:1092`.
 - Problem: custom tools that emit `details.diff` show the diff inside the tool
@@ -132,7 +152,7 @@ capToolText length property (1–400 char caps).
   rather than the tool name.
 - Acceptance: T4-style event with `toolName: "patch"` updates the files pane.
 
-### W6 — `reconstruct` replays every bash token through `fs` (low-med)
+### W6 — `reconstruct` replays every bash token through `fs` (low-med) — **open, do it with Q3**
 
 - Where: `reconstruct` (`split-view.ts:888`), `pathsFrom` bash branch.
 - Problem: resume replays all branch bash commands and calls
@@ -146,7 +166,7 @@ capToolText length property (1–400 char caps).
   list is deterministic and no `stat` runs for tokens that cannot be paths
   (assert via resulting list, not by spying on `fs`).
 
-### W7 — Repository hygiene
+### W7 — Repository hygiene — **partial (B7)**
 
 **Partly done** — `git init` + first commit landed 2026-11-01 (15 files;
 `node_modules/` ignored) and the README now notes the ~1 GB install. CI is not
@@ -159,12 +179,13 @@ set up yet.
   auto-installed peers (~1.0 GB `node_modules`), so the cache is expected.
 - Acceptance: CI green on the same 25/0 baseline.
 
-## Test gaps (add tests in this order)
+## Test gaps (open items in CODE_QUALITY queue order)
 
 Harness notes: `test/split-view.test.ts` is one shared `h` harness because the
-extension keeps module-level state; `flatTheme` ignores colours, so colour
-assertions need a mutable theme object (T2). `test/setup.ts` already redirects
-`PI_CODING_AGENT_DIR` to a temp dir before module import.
+extension keeps module-level state. `flatTheme` ignores colours, so colour
+assertions use the harness `setTheme` hook. `test/setup.ts` redirects
+`PI_CODING_AGENT_DIR` to a temp dir before module import, and
+`scripts/check-coverage.ts` excludes `test/**` from the coverage gate.
 
 - [ ] **T1 — `/split-trim-response` (highest value).** No suite test; the only
   feature that depends on host setting IDs. Gate on `lookup("hideThinkingBlock")`
@@ -175,22 +196,23 @@ assertions need a mutable theme object (T2). `test/setup.ts` already redirects
   `off`/`on` arg forms; unknown switch (handles absent) → warning notify, no
   throw, `trimResponse` unchanged. Verified manually already: on→`true,true`,
   off→`false,false`, message "Panel C: response only/full transcript".
-- [x] **T2 — Theme invalidation.** Mutable theme whose `fg` swap for `"text"`
-  then `"border"` must both change rendered output. Covers W1.
+- [x] **T2 — Theme invalidation.** Done: "every theme colour the band uses
+  invalidates the row cache" uses a mutable theme; covers W1 and exposed the
+  `bandMemo` staleness fixed in `renderBand`.
 - [ ] **T3 — Empty thinking blocks.** Covers W2; see acceptance there.
-- [ ] **T4 — `/split` toggle pair + `/split-save` round-trip.** Session with
-  panels on, `/split-save`, `session_shutdown`, fresh `session_start` (new ctx,
-  same temp agent dir) → widget mounted with the saved height/panel set; and
-  `/split` off → `/split` on restores the saved layout, with the "nothing saved"
-  fallback (thinking+tools) exercised. Verified manually: 24-row band with files
-  column restored.
-- [ ] **T5 — Resume/reconstruct.** `session_start` with a branch containing an
-  assistant thinking block, a `toolCall` and its `toolResult` → thinking text,
-  tool row (✓, no duration) and files entry all present; `session_tree`/
-  `session_switch` clear the previous state (no duplicate rows).
-- [ ] **T6 — Command argument handling.** `/split-height` clamp + non-numeric
-  usage message; `/split-tools-width` clamp, empty arg, non-numeric error;
-  `/split-tools-view` toggles detail in both states.
+- [ ] **T4 — `/split` toggle pair + `/split-save` round-trip (partial).** Done:
+  config load tolerates garbage, `/split-save` persists the live layout and
+  reports a write failure, and the toggle pair was verified live. Missing: a
+  fresh `session_start` in a new harness reading the saved layout back.
+- [x] **T5 — Resume/reconstruct.** Done: "session_start, session_tree and
+  session_switch replay the branch once" asserts the thinking text, the `read`
+  tool row and the `replay.ts` files entry, with no duplicate rows after either
+  branch event.
+- [ ] **T6 — Command argument handling (partial).** Done: `/split-height`
+  clamping and its usage message (via the geometry property), plus
+  `/split-tools-width` and `/split-tools-view` in the layout/save tests.
+  Missing: empty/non-numeric `/split-tools-width` errors and both explicit
+  `/split-tools-view` states.
 - [ ] **T7 — Tool panel extras.** Image result renders the one-line fallback and
   not the base64 payload; duration formatting appears for ended calls and not
   for reconstructed ones; `MAX_TOOLS` eviction keeps the newest 60.
@@ -208,7 +230,7 @@ Geometry sweep skeleton (`probe.tmp.ts`): import `splitView` from
 fake `api`/`ctx`/`tui` as the test harness (flat theme must include `inverse`,
 `renderDiff` needs it); drive `session_start`, `/split`, `/files`, one
 `tool_call`, one `tool_result` diff, one thinking stream; then loop widths
-`[80,89,90,100,120,160,200,240]` × heights `6..40`, calling
+`40..300` (the tested range; the old probe started at 80) × heights `6..40`, calling
 `/split-height` and asserting `lines.length === height` and
 `visibleWidth(line) === width` for every row. Use `terminal.rows = 60` so rows
 30–40 are not hidden by `MIN_ROWS_BELOW_BAND`.
