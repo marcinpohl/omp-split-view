@@ -22,7 +22,7 @@ its numbers in sync with these commands.
 | `bun run typecheck` | clean (`tsc --noEmit`, strict) |
 | geometry sweep (probe below) | 0 failures (40–300 cols × 6–40 rows), rows == height, every row exactly `width` cells, no control chars |
 
-Files: `split-view.ts` 1514 L, `helpers.ts` 244 L, `ui-panels-config.ts` 146 L,
+Files: `split-view.ts` 1531 L, `helpers.ts` 244 L, `ui-panels-config.ts` 146 L,
 `test/split-view.test.ts` 1378 L, `test/properties.test.ts` 318 L,
 `test/helpers.test.ts` 207 L, `test/setup.ts` 7 L, `scripts/check-coverage.ts`
 90 L, `.github/workflows/ci.yml` 17 L, `CODE_QUALITY.md`, `eslint.config.js`.

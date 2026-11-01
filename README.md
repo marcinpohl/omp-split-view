@@ -150,6 +150,22 @@ event streams. Seeds are fixed, so failures reproduce.
 dependencies: `node_modules` is ~1 GB, so the first install is slow and the
 cache is expected.
 
+### CI
+
+`.github/workflows/ci.yml` runs one `gates` job on Bun 1.4.3 for every push and
+pull request, in this order — the same sequence as the local gates:
+
+```sh
+bun install --frozen-lockfile
+bun run typecheck
+bun test
+bun run test:coverage
+bun run lint
+```
+
+The repository has no remote yet, so the workflow stays inert until one is
+added; running the five commands above locally is the equivalent check.
+
 ### Coverage
 
 Metrics, thresholds and the ranked work queue live in

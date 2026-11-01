@@ -530,6 +530,8 @@ const GENERIC_PATH_KEYS = ["path", "filePath", "file_path", "imagePath"];
 /** List-valued spellings of the same idea. */
 const GENERIC_LIST_KEYS = ["paths", "files", "filePaths"];
 
+/** Resolve one candidate value against the session cwd and record it; a
+ * non-string, empty or (unless `unconditional`) non-existent path is skipped. */
 function addPathHit(out: PathHit[], value: unknown, op: string, unconditional: boolean): void {
 	if (typeof value !== "string" || !value) return;
 	try {
@@ -560,6 +562,8 @@ function bashPathHits(command: string): PathHit[] {
 	return out;
 }
 
+/** Files one tool call touched: bash word tokens, a fixed-key tool's single
+ * target, or a custom tool's generic path keys. */
 function pathsFrom(toolName: string, input: Record<string, unknown>): PathHit[] {
 	if (toolName === "bash") return bashPathHits(typeof input.command === "string" ? input.command : "");
 	const out: PathHit[] = [];
@@ -652,6 +656,8 @@ function bandDef(theme: Theme, id: "thinking" | "tools"): BandDef {
 	};
 }
 
+/** Everything `newestRows` needs about one panel: its items, the wrapping
+ * width, the row budget and the memo it caches wrapped fragments in. */
 interface NewestRowsOptions {
 	items: string[];
 	textWidth: number;
@@ -683,6 +689,7 @@ function newestRows(options: NewestRowsOptions): string[] {
 	return rows.reverse();
 }
 
+/** One framed panel's inputs: which band, how wide, how tall, what to memo. */
 interface PanelOptions {
 	theme: Theme;
 	def: BandDef;
@@ -1134,6 +1141,8 @@ function scheduleVisibilitySync(): void {
 
 // ─── branch reconstruction ───────────────────────────────────────────────────
 
+// Narrowed views of the session branch's message union: the replay split needs
+// the assistant and tool-result shapes, not the whole agent message type.
 type BranchMessage = SessionMessageEntry["message"];
 type AssistantBranchMessage = Extract<BranchMessage, { role: "assistant" }>;
 type ToolResultBranchMessage = Extract<BranchMessage, { role: "toolResult" }>;
@@ -1165,6 +1174,8 @@ function replayToolResult(msg: ToolResultBranchMessage): void {
 	}
 }
 
+/** Rebuild panel state from the session branch (resume, tree switch, session
+ * switch), replaying it through the same ingest path live events use. */
 function reconstruct(ctx: ExtensionContext): void {
 	thinking.reset();
 	toolsBy.clear();
@@ -1206,6 +1217,7 @@ export default function splitView(pi: ExtensionAPI): void {
 	registerCommands(pi);
 }
 
+/** Every command is TUI-only: refuse with one notify in any other mode. */
 function requireTui(ctx: ExtensionContext): boolean {
 	if (ctx.mode !== "tui") {
 		notify("Split view requires the interactive TUI", "error");
@@ -1214,6 +1226,7 @@ function requireTui(ctx: ExtensionContext): boolean {
 	return true;
 }
 
+/** Wire the omp lifecycle: session load/resume, live thinking and tool deltas. */
 function registerEvents(pi: ExtensionAPI): void {
 	pi.on("session_start", (_event, ctx) => {
 		notifyFn = (message, level) => ctx.ui.notify(message, level);
@@ -1320,11 +1333,14 @@ function registerEvents(pi: ExtensionAPI): void {
 	});
 }
 
+/** All ten slash commands: toggles first, then band settings and persistence. */
 function registerCommands(pi: ExtensionAPI): void {
 	registerPanelToggles(pi);
 	registerBandSettings(pi);
 }
 
+/** Panel on/off toggles: `/split`, the two band panels, the files column and
+ * the diff subpanel. */
 function registerPanelToggles(pi: ExtensionAPI): void {
 	// ── panel toggles ──
 
@@ -1413,6 +1429,7 @@ function registerPanelToggles(pi: ExtensionAPI): void {
 	});
 }
 
+/** Band geometry, tool-view depth, response-only and `/split-save`. */
 function registerBandSettings(pi: ExtensionAPI): void {
 	pi.registerCommand("split-tools-view", {
 		description: "Toggle tool panel compact ↔ full detail",

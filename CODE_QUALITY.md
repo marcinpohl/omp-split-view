@@ -78,7 +78,7 @@ function length 100 lines.
 
 | Function | cc | cognitive | other | Location |
 | --- | --- | --- | --- | --- |
-| `syncTranscriptVisibility` | 15 | — | — | `split-view.ts:1092` |
+| `syncTranscriptVisibility` | 15 | — | — | `split-view.ts:1099` |
 | `normalizeConfig` | 14 | — | — | `ui-panels-config.ts:60` |
 
 Both are the deliberately parked Q8 pair (just over the limit, untouched). The
@@ -97,7 +97,7 @@ band and a 25%-width dock instead of the 48-col/40-row ceilings.
 `notice?` and passes the padded content width to the helpers instead of a
 closure, so no fifth parameter (and no options object) was needed.
 
-File sizes: `split-view.ts` 1514 L, `helpers.ts` 244 L,
+File sizes: `split-view.ts` 1531 L, `helpers.ts` 244 L,
 `ui-panels-config.ts` 146 L, `scripts/check-coverage.ts` 90 L, tests 1910 L.
 
 CI: `.github/workflows/ci.yml` runs the four gates plus `bun install
@@ -126,11 +126,11 @@ without folding a policy choice, so its three options are still open in
 Delta: 93 tests unchanged, no test file edited; coverage lines 99.91% →
 99.92%, functions 96.52% → 97.01% (19 extracted helpers, still four misses);
 lint 15 → 2 warnings (both Q8, untouched), 0 errors throughout;
-`split-view.ts` 1389 → 1514 L (more, not less: each extraction carries its own
-signature and doc comment, and three functions needed a second split to clear a
-fresh warning). Rendering is byte-identical step by step: `bun run demo` diffed
-against the pre-batch output after every step with only the tool duration cell
-normalised.
+`split-view.ts` 1389 → 1531 L (more, not less: each extraction carries its own
+signature and a doc comment, and three functions needed a second split to clear
+a fresh warning). Rendering is byte-identical step by step: `bun run demo`
+diffed against the pre-batch output after every step with only the tool
+duration cell normalised.
 
 - **Q6 → `pathsFrom`.** `EXACT_PATH_TOOLS` table (`read`/`write`/`edit`/
   `ast_edit`, existence check skipped) + `GENERIC_PATH_KEYS` /
