@@ -14,6 +14,7 @@ landed item updates the snapshot and ticks its row.
 | `bun run test:coverage` | line/function coverage from Bun's lcov | lines ≥ 99%, functions ≥ 90% (`scripts/check-coverage.ts`) |
 | `bun run lint` | ESLint 10 + typescript-eslint + sonarjs; also the cyclomatic/cognitive/size metrics | 0 errors (warnings are the metric report) |
 | `bun run typecheck` | `tsc --noEmit`, strict | clean |
+| `bun run check:package` | the shipped tarball: `files` coverage and declared deps via the `omp.extensions` import graph (`scripts/check-package.ts`) | `ok` — 3 shipped modules |
 | geometry property (`band properties`) | 40–300 cols × 6–40 rows: exact rows/cells, no control chars | 0 failures |
 
 Test files are excluded from the coverage totals and from the size/complexity
@@ -98,13 +99,20 @@ band and a 25%-width dock instead of the 48-col/40-row ceilings.
 `notice?` and passes the padded content width to the helpers instead of a
 closure, so no fifth parameter (and no options object) was needed.
 
-File sizes: `split-view.ts` 1531 L, `helpers.ts` 244 L,
-`ui-panels-config.ts` 146 L, `scripts/check-coverage.ts` 90 L, tests 1910 L.
+File sizes: `split-view.ts` 1559 L, `helpers.ts` 278 L,
+`ui-panels-config.ts` 155 L, `scripts/check-coverage.ts` 90 L,
+`scripts/check-package.ts` 167 L, tests 2026 L.
 
-CI: `.github/workflows/ci.yml` runs the four gates plus `bun install
---frozen-lockfile` on Bun 1.4.3 for every push and pull request. The repo has no
-remote yet, so the workflow is inert until one is added; its steps were run
-locally in order and all gate on the numbers above.
+CI: `.github/workflows/ci.yml` runs the five gates plus `bun install
+--frozen-lockfile` on Bun 1.4.3 for every push and pull request;
+`.github/workflows/publish.yml` publishes `v*` tags through `bun publish`. The
+repo has no remote yet, so both are inert until one is added; the CI steps were
+run locally in order and all gate on the numbers above.
+
+The Bun pin is load-bearing: 1.4.4 changed lcov line attribution and marks
+executed multi-line statements as missed — `split-view.ts` reports 983 counted
+lines / 933 hit on 1.4.4 versus 1034 / 1033 on 1.4.3, same tests — so the
+coverage gate fails there. Every number above is a 1.4.3 measurement.
 
 ## Work queue
 

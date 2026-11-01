@@ -20,12 +20,14 @@ its numbers in sync with these commands.
 | `bun run test:coverage` | gate passes: lines ≥ 99%, functions ≥ 90% (currently 99.92% / 97.08%) |
 | `bun run lint` | 0 errors, 2 warnings (the parked Q8 pair) |
 | `bun run typecheck` | clean (`tsc --noEmit`, strict) |
+| `bun run check:package` | `check-package: ok — 3 shipped modules (@marcinpohl/omp-split-view@0.1.0)` |
 | geometry sweep (probe below) | 0 failures (40–300 cols × 6–40 rows), rows == height, every row exactly `width` cells, no control chars |
 
-Files: `split-view.ts` 1559 L, `helpers.ts` 274 L, `ui-panels-config.ts` 155 L,
+Files: `split-view.ts` 1559 L, `helpers.ts` 278 L, `ui-panels-config.ts` 155 L,
 `test/split-view.test.ts` 1444 L, `test/properties.test.ts` 320 L,
 `test/helpers.test.ts` 255 L, `test/setup.ts` 7 L, `scripts/check-coverage.ts`
-90 L, `.github/workflows/ci.yml` 17 L, `CODE_QUALITY.md`, `eslint.config.js`.
+90 L, `scripts/check-package.ts` 167 L, `.github/workflows/ci.yml` 18 L,
+`.github/workflows/publish.yml` 39 L, `CODE_QUALITY.md`, `eslint.config.js`.
 Git repository with CI (W7/B7 done); no remote, so the workflow is inert until
 one is added.
 `fast-check` 4.x is the dev dependency behind the property tests.

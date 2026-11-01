@@ -1,0 +1,42 @@
+name: Publish
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          # 1.4.3, not 1.4.4: the lcov line attribution changed in 1.4.4 and
+          # reports executed multi-line statements as missed, which fails the
+          # coverage gate. The documented numbers come from 1.4.3.
+          bun-version: 1.4.3
+      - run: bun install --frozen-lockfile
+      - name: Tag matches the package version
+        run: |
+          version="$(bun -p 'require("./package.json").version')"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match package.json version $version" >&2
+            exit 1
+          fi
+      - run: bun run typecheck
+      - run: bun test
+      - run: bun run test:coverage
+      - run: bun run lint
+      - run: bun run check:package
+      - run: bun pm pack --dry-run
+      - run: bun publish --access public
+        env:
+          NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}

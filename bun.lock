@@ -3,9 +3,11 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "omp-split-view",
+      "name": "@marcinpohl/omp-split-view",
       "devDependencies": {
         "@eslint/js": "^10.0.1",
+        "@oh-my-pi/pi-coding-agent": "18.14.2",
+        "@oh-my-pi/pi-tui": "18.14.2",
         "@types/bun": "^1.4.4",
         "@types/node": "22",
         "eslint": "^10.14.0",
@@ -16,9 +18,13 @@
         "typescript-eslint": "^8.72.1",
       },
       "peerDependencies": {
-        "@oh-my-pi/pi-coding-agent": ">=18.0.0",
-        "@oh-my-pi/pi-tui": ">=18.0.0",
+        "@oh-my-pi/pi-coding-agent": ">=18.14.2 <19",
+        "@oh-my-pi/pi-tui": ">=18.14.2 <19",
       },
+      "optionalPeers": [
+        "@oh-my-pi/pi-coding-agent",
+        "@oh-my-pi/pi-tui",
+      ],
     },
   },
   "packages": {

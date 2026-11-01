@@ -22,8 +22,19 @@ to omp's TUI. The feature set is the same; the mount points are not (see
 
 ## Install
 
-Copy the three TypeScript files into omp's extension directory (no build step;
-omp loads `.ts` directly):
+Published on npm; install it into omp's plugin directory:
+
+```sh
+omp plugin install @marcinpohl/omp-split-view
+```
+
+Pin a version (`@0.1.0`) to stay off future releases. Verify with
+`omp plugin list` or `omp plugin doctor`, remove with
+`omp plugin uninstall @marcinpohl/omp-split-view`, and start a new omp session
+to load it.
+
+Or copy the three TypeScript files into omp's extension directory (no build
+step; omp loads `.ts` directly):
 
 ```sh
 mkdir -p ~/.omp/agent/extensions
@@ -42,7 +53,10 @@ Or install as an omp package (the manifest declares `omp.extensions`):
 omp plugin install /path/to/omp-split-view
 ```
 
-Requires oh-my-pi 18.x (`@oh-my-pi/pi-tui` / `@oh-my-pi/pi-coding-agent` 18+).
+Requires oh-my-pi ≥18.14.2 <19 and Bun ≥1.4.4 (the host's own floor). The
+plugin declares the host packages as optional peers and omp resolves
+`@oh-my-pi/*` to its own copy, so installing it never downloads a second omp
+runtime.
 
 First run is bare; `/split` turns the band on and `/split-save` makes it the
 default. Start bare regardless of saved defaults with `--no-split`.
@@ -135,6 +149,7 @@ bun install
 bun test          # helpers + component/integration + fast-check property tests
 bun run demo      # print real band frames (no TUI required)
 bun run typecheck # tsc --noEmit against @oh-my-pi/pi-tui / pi-coding-agent
+bun run check:package # verify the published tarball is self-contained
 ```
 
 `bun run demo` (`scripts/demo.ts`) drives the extension with a fake host and
@@ -150,9 +165,10 @@ invariants and, through the widget factory, band geometry for any terminal
 size, cache idempotence, theme invalidation, escape-stripping, and arbitrary
 event streams. Seeds are fixed, so failures reproduce.
 
-`bun install` pulls the whole omp runtime through the auto-installed peer
-dependencies: `node_modules` is ~1 GB, so the first install is slow and the
-cache is expected.
+`bun install` pulls the whole omp runtime through the host packages pinned in
+`devDependencies`: `node_modules` is ~1 GB, so the first install is slow and the
+cache is expected. Consumers do not pay that cost — the same packages are
+optional peers, resolved to the omp copy that installs the plugin.
 
 ### CI
 
@@ -165,10 +181,26 @@ bun run typecheck
 bun test
 bun run test:coverage
 bun run lint
+bun run check:package
 ```
 
 The repository has no remote yet, so the workflow stays inert until one is
-added; running the five commands above locally is the equivalent check.
+added; running the six commands above locally is the equivalent check.
+
+The Bun pin is deliberate: 1.4.4 changed lcov line attribution and reports
+executed multi-line statements as missed (`split-view.ts` 983 counted / 933 hit
+instead of 1034 / 1033 on the same tests), which fails the coverage gate. Every
+coverage number in this repo was measured on 1.4.3.
+
+### Publishing
+
+`.github/workflows/publish.yml` runs on `v*` tags: it re-runs the gates, fails
+unless the tag equals `v<version>` from `package.json`, then runs
+`bun publish --access public` with the `NPM_TOKEN` repository secret. A release
+is `git tag -a v<version> -m "omp-split-view <version>" && git push origin
+v<version>` once that secret exists; everything before the publish step can be
+checked locally, but the step itself cannot (`bun publish --dry-run` packs the
+tarball and then exits with `missing authentication`).
 
 ### Coverage
 
