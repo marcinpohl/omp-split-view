@@ -130,6 +130,23 @@ event streams. Seeds are fixed, so failures reproduce.
 dependencies: `node_modules` is ~1 GB, so the first install is slow and the
 cache is expected.
 
+### Linting and complexity metrics
+
+Python's pylint/radon have no maintained TypeScript port; the equivalents here
+are ESLint plugins and rules:
+
+| Python | Here | Command |
+| --- | --- | --- |
+| pylint | ESLint 10 flat config: `@eslint/js` + `typescript-eslint` + `eslint-plugin-sonarjs` (bug patterns, unused code, suspicious logic) | `bun run lint` (`bun run lint:fix` to autofix) |
+| `radon cc` | `complexity` (cyclomatic) and `sonarjs/cognitive-complexity` per function | `bun run lint` |
+| `radon raw` / size | `max-lines-per-function`, `max-depth`, `max-params` | `bun run lint` |
+| `radon mi` / Halstead | no maintained TS implementation; treated as out of scope | — |
+
+The baseline is 0 errors and 15 warnings; the warnings are the complexity
+report for the known hotspots (`filesPanelLines`, `reconstruct`, `renderBand`,
+`splitView`). Tests are exempt from the size/complexity rules. Tests assert
+behaviour, not lint cleanliness.
+
 Tests drive the extension through its registered handlers, commands, and the
 widget factory omp calls, asserting panel content and exact row widths. The
 config path is redirected to a temp directory by `test/setup.ts` (bun
