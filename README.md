@@ -132,6 +132,9 @@ cache is expected.
 
 ### Coverage
 
+Metrics, thresholds and the ranked work queue live in
+[`CODE_QUALITY.md`](CODE_QUALITY.md).
+
 ```sh
 bun run test:coverage
 ```

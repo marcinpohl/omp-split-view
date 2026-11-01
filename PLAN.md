@@ -6,6 +6,9 @@ checker, and throwaway probe scripts; none are inferred.
 
 ## Verified baseline (re-check after any change)
 
+The metric snapshot and the ranked work queue live in `CODE_QUALITY.md`; keep
+its numbers in sync with these commands.
+
 | Command | Expected |
 | --- | --- |
 | `bun test` | 62 pass, 0 fail, 29607 expect() calls |
