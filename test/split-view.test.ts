@@ -1,12 +1,13 @@
-import { beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test, vi } from "bun:test";
 import * as fc from "fast-check";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { visibleWidth } from "@oh-my-pi/pi-tui";
 import { Settings, settings, type ExtensionAPI, type ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import "@oh-my-pi/pi-coding-agent/session/settings";
 import "@oh-my-pi/pi-coding-agent/modes/settings";
 import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
-import splitView from "../split-view.ts";
+import splitView, { retainedThinkingBlocks, retainedToolEntries } from "../split-view.ts";
 import { CONFIG_FILE, loadUiPanelsConfig, saveUiPanelsConfig } from "../ui-panels-config.ts";
 
 /** Identity colorizer: keeps row geometry measurable without a live theme. */
@@ -34,6 +35,8 @@ interface Harness {
 	widget: () => { render(width: number): readonly string[] } | undefined;
 	/** Swap the theme `ctx.ui.theme` returns (cache-invalidation tests). */
 	setTheme: (theme: unknown) => void;
+	/** Swap the settings singleton the extension writes overrides into. */
+	setSettings: (value: unknown) => void;
 	/** Branch the session manager replays for resume/branch-switch tests. */
 	setBranch: (branch: unknown[]) => void;
 	/** The widget instance the host holds, for Component-contract calls. */
@@ -84,6 +87,8 @@ function createHarness(columns = 120, rows = 45): Harness {
 		},
 	};
 
+	// Swappable so a test can model a build/settings object that throws.
+	const pi: { settings: unknown } = { settings };
 	const api = {
 		on: (event: string, handler: Handler) => {
 			handlers.set(event, handler);
@@ -94,7 +99,7 @@ function createHarness(columns = 120, rows = 45): Harness {
 		registerFlag: () => {},
 		getFlag: () => false,
 		setLabel: () => {},
-		pi: { settings },
+		pi,
 		events: { on: () => () => {} },
 	};
 
@@ -120,6 +125,9 @@ function createHarness(columns = 120, rows = 45): Harness {
 		},
 		setTheme: theme => {
 			currentTheme = theme;
+		},
+		setSettings: value => {
+			pi.settings = value;
 		},
 		setBranch: next => {
 			branch = next;
@@ -558,6 +566,340 @@ describe("band properties", () => {
 			}),
 			{ numRuns: 20, seed: 20261101 },
 		);
+		// A generated run can leave the band too tall to fit, which makes every
+		// label unrenderable and makes the per-run `ensure` above toggle panels
+		// OFF instead of on. Restore the mount point the later suites assume.
+		h.setSize(120, 45);
+		await h.command("split-height", "20");
+		await ensure("Thinking", "split-thinking");
+		await ensure("Tool Usage", "split-tools");
+		await ensure("📂 Files", "files");
+		expect(h.widget()).toBeDefined();
+	});
+});
+
+/**
+ * Targeted at the four highest-complexity functions (`filesPanelLines` cc 31,
+ * `renderBand` cc 23, `toolLines` cc 21, `reconstruct` cc 20, `pathsFrom` cc 18):
+ * each test drives a branch that line coverage already counted as "hit" only
+ * because a sibling branch ran, and asserts the user-visible result.
+ */
+describe("complex renderers", () => {
+	const rows = () => h.widget()!.render(120);
+	const joined = () => rows().join("\n");
+	/** Toggle-style commands announce the new state; read it, don't guess. */
+	const setToggle = async (command: string, message: RegExp) => {
+		await h.command(command);
+		if (!message.test(h.notifications.at(-1)?.message ?? "")) await h.command(command);
+	};
+	const setToolMode = (full: boolean) => setToggle("split-tools-view", full ? /full/ : /compact/);
+	const setDiff = (on: boolean) => setToggle("split-diff", on ? /\bon$/ : /\boff$/);
+	/** `session_tree` rebuilds every buffer from the branch, leaving layout alone. */
+	const resetBuffers = async (branch: unknown[] = []) => {
+		h.setBranch(branch);
+		await h.emit("session_tree");
+	};
+	/** Rendered rows, or "" when the band is unmounted/hidden. */
+	const visible = () => h.widget()?.render(120).join("\n") ?? "";
+	/** Panel toggles announce the new state; drive them to a known state. */
+	const setPanel = async (command: string, on: RegExp) => {
+		await h.command(command);
+		if (!on.test(h.notifications.at(-1)?.message ?? "")) await h.command(command);
+	};
+
+	beforeAll(async () => {
+		h.setSize(120, 45);
+		await h.command("split-height", "20");
+		await setPanel("split-thinking", /Thinking on/);
+		await setPanel("split-tools", /Tools on/);
+		await setPanel("files", /Files panel on/);
+		await setDiff(true);
+		await setToolMode(false);
+		// The band must be mounted and complete before any test reads rows.
+		expect(visible()).toContain("Thinking");
+		expect(visible()).toContain("Tool Usage");
+		expect(visible()).toContain("📂 Files");
+	});
+
+	afterAll(async () => {
+		await resetBuffers();
+		await setToolMode(false);
+		await setDiff(true);
+		await h.command("split-trim-response", "off");
+		h.setSize(120, 45);
+		await h.command("split-height", "20");
+		await h.command("split-tools-width", "35");
+	});
+
+	test("a long tool result previews two lines and counts the rest", async () => {
+		await resetBuffers();
+		await setToolMode(true);
+		await h.emit("tool_execution_start", { toolCallId: "out1", toolName: "bash", args: { command: "seq 5" } });
+		await h.emit("tool_execution_end", {
+			toolCallId: "out1",
+			result: { content: [{ type: "text", text: "lineA\nlineB\nlineC\nlineD\nlineE" }] },
+			isError: false,
+		});
+		const text = joined();
+		expect(text).toContain("lineA");
+		expect(text).toContain("lineB");
+		expect(text).toContain("· +3 more");
+		// The preview is capped: the third line must not leak into the panel.
+		expect(text).not.toContain("lineC");
+	});
+
+	test("an image result renders a one-line fallback, never the base64 payload", async () => {
+		await resetBuffers();
+		await setToolMode(true);
+		// 1x1 transparent PNG; the panel must show a description, not the payload.
+		const png =
+			"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==";
+		await h.emit("tool_execution_start", { toolCallId: "img1", toolName: "read", args: { path: "shot.png" } });
+		await h.emit("tool_execution_end", {
+			toolCallId: "img1",
+			result: { content: [{ type: "image", data: png, mimeType: "image/png" }] },
+			isError: false,
+		});
+		const text = joined();
+		expect(text).toContain("[Image: [image/png]");
+		expect(text).not.toContain("iVBORw0KGgo");
+	});
+
+	test("a tool result diff renders under its own tool row in full mode", async () => {
+		await resetBuffers();
+		await setToolMode(true);
+		await h.emit("tool_execution_start", { toolCallId: "d1", toolName: "patch", args: { path: "x.ts" } });
+		await h.emit("tool_execution_end", {
+			toolCallId: "d1",
+			result: { content: "applied", details: { diff: "-gone\n+kept" } },
+			isError: false,
+		});
+		// Only `tool_execution_end` ran, so the files-pane diff stays empty: the
+		// rows below belong to the tool entry itself.
+		const text = joined();
+		expect(text).toContain("-gone");
+		expect(text).toContain("+kept");
+		expect(text).toContain("Last Edit");
+	});
+
+	test("compact mode separates entries and withholds the timer for one second", async () => {
+		await resetBuffers();
+		await setToolMode(false);
+		await h.emit("tool_execution_start", { toolCallId: "c1", toolName: "bash", args: { command: "true" } });
+		await h.emit("tool_execution_end", { toolCallId: "c1", result: { content: "ok" }, isError: false });
+		await h.emit("tool_execution_start", { toolCallId: "c2", toolName: "read", args: { path: "a.ts" } });
+		await h.emit("tool_execution_end", { toolCallId: "c2", result: { content: "ok" }, isError: false });
+		const lines = rows();
+		const bashRow = lines.findIndex(line => line.includes("bash"));
+		const readRow = lines.findIndex(line => line.includes("read"));
+		// One blank body row between two compact entries, newest last. The row
+		// itself is a composite of every column, so it is checked for the
+		// absence of tool content rather than for being empty.
+		expect(bashRow).toBeGreaterThan(-1);
+		expect(readRow).toBe(bashRow + 2);
+		expect(lines[bashRow + 1]).not.toMatch(/[✓●✗]|bash|read/);
+
+		// A finished call carries its elapsed time; one that just started must
+		// stay untimed until the one-second gate (a sub-second live counter
+		// would re-render on every frame). The >=1s live form is covered by
+		// "the live tool ticker refreshes while a call runs and stops after".
+		expect(lines[bashRow]).toMatch(/✓ bash \d+\.\d+s \{/);
+		await h.emit("tool_execution_start", { toolCallId: "c3", toolName: "sleep", args: { command: "sleep 2" } });
+		expect(joined()).toMatch(/● sleep \{/);
+		await h.emit("tool_execution_end", { toolCallId: "c3", result: { content: "" }, isError: false });
+	});
+
+	test("streamed thinking is coalesced: one frame per flush, not per delta", async () => {
+		await resetBuffers();
+		vi.useFakeTimers();
+		try {
+			await h.emit("message_update", { assistantMessageEvent: { type: "thinking_start" } });
+			// Prime the composed band for the current version, as a frame would.
+			const primed = joined();
+			expect(primed).not.toContain("live tail");
+			// Deltas only mark the buffer dirty: the interval is the flush gate,
+			// so a frame rendered inside that window still sees the old rows.
+			await h.emit("message_update", { assistantMessageEvent: { type: "thinking_delta", delta: "live tail" } });
+			expect(joined()).toBe(primed);
+			vi.advanceTimersByTime(100);
+			// The flush bumps the version, which invalidates the band cache.
+			expect(joined()).toContain("live tail");
+		} finally {
+			vi.useRealTimers();
+		}
+		await h.emit("message_update", { assistantMessageEvent: { type: "thinking_end", content: "live tail" } });
+	});
+
+	test("the tool panel keeps only the newest entries past its cap", async () => {
+		await resetBuffers();
+		await setToolMode(false);
+		// One past MAX_TOOLS (60): the oldest entry must be dropped, not the newest.
+		for (let i = 0; i < 65; i++) {
+			// A short key keeps the id inside the narrow panel's arg column.
+			await h.emit("tool_execution_start", { toolCallId: `ev${i}`, toolName: "bash", args: { c: `n${i}` } });
+			await h.emit("tool_execution_end", { toolCallId: `ev${i}`, result: { content: "" }, isError: false });
+		}
+		expect(retainedToolEntries()).toBe(60);
+		// The newest call still has a row; evicting the wrong end would drop it.
+		expect(joined()).toContain("n64");
+	});
+
+	test("files sharing a directory collapse under one indented group header", async () => {
+		await resetBuffers();
+		for (const name of ["a", "b", "c", "d"])
+			await h.emit("tool_call", { toolName: "read", input: { path: `/tmp/grp/${name}.ts` } });
+		const text = joined();
+		expect(text).toContain("grp/");
+		// Children carry an extra indent so the header groups them visually:
+		// the header row is `│ grp/` and its files are `│   r d.ts`.
+		expect(text).toMatch(/│ {3}r d\.ts/);
+		expect(text).not.toContain("… +");
+	});
+
+	test("a long file list counts what it hides and keeps the newest rows", async () => {
+		await resetBuffers();
+		for (let i = 0; i < 8; i++) await h.emit("tool_call", { toolName: "read", input: { path: `/tmp/tr${i}.ts` } });
+		const text = joined();
+		expect(text).toContain("/tmp/");
+		expect(text).toContain("tr7.ts"); // newest first
+		expect(text).not.toContain("tr0.ts"); // oldest dropped from the list
+		expect(text).toContain("… +5 more");
+	});
+
+	test("touching one file twice shows a count badge and merged operation letters", async () => {
+		await resetBuffers();
+		await h.emit("tool_call", { toolName: "read", input: { path: "/tmp/badge.ts" } });
+		await h.emit("tool_call", { toolName: "edit", input: { path: "/tmp/badge.ts" } });
+		expect(joined()).toContain("Files (1)");
+		expect(joined()).toMatch(/rw×2 badge\.ts/);
+	});
+
+	test("group headers shorten home paths with ~ and keep outside paths absolute", async () => {
+		await resetBuffers();
+		for (const name of ["a", "b", "c", "d"])
+			await h.emit("tool_call", { toolName: "read", input: { path: `${homedir()}/omp-probe/${name}.ts` } });
+		expect(joined()).toContain("~/omp-probe/");
+
+		await resetBuffers();
+		for (const name of ["a", "b", "c", "d"])
+			await h.emit("tool_call", { toolName: "read", input: { path: `/etc/omp-probe/${name}.ts` } });
+		// Outside both cwd and home: no "~" or "../" rewriting.
+		expect(joined()).toContain("/etc/omp-probe/");
+	});
+
+	test("the diff subpanel explains an empty state and marks a truncated diff", async () => {
+		await resetBuffers();
+		await setDiff(true);
+		let text = joined();
+		expect(text).toContain("Last Edit");
+		expect(text).toContain("No edit yet");
+		expect(text).toContain("No files touched yet");
+		expect(text).toContain("r read · w write · s seen(bash)");
+
+		const long = Array.from({ length: 40 }, (_, i) => `-old${i}\n+new${i}`).join("\n");
+		await h.emit("tool_result", { toolName: "edit", input: { path: "/tmp/trunc.ts" }, details: { diff: long } });
+		text = joined();
+		expect(text).toContain("✎ trunc.ts");
+		expect(text).toMatch(/… \+\d+ more/);
+
+		// A short diff fits whole: the marker must disappear with it.
+		await h.emit("tool_result", { toolName: "edit", input: { path: "/tmp/short.ts" }, details: { diff: "-a\n+b" } });
+		text = joined();
+		expect(text).toContain("✎ short.ts");
+		expect(text).toContain("+b");
+		expect(text).not.toContain(" more");
+	});
+
+	test("bash contributes only real files, not flags, operators or redirects", async () => {
+		await resetBuffers();
+		writeFileSync("/tmp/omp-sv-probe.txt", "x");
+		// A file literally named `-n` exists, so flag rejection cannot lean on
+		// the existence check alone: the `-` prefix must be rejected on sight.
+		writeFileSync("/tmp/-n", "x");
+		try {
+			await h.emit("tool_call", {
+				toolName: "bash",
+				input: {
+					// Quoted token: strip the quotes and count it (deduped against
+					// the identical path earlier in the line).
+					command: 'grep -n probe < /tmp/omp-sv-probe.txt > /tmp/omp-sv-out.txt; echo "omp-sv-probe.txt" | wc -l',
+				},
+			});
+		} finally {
+			rmSync("/tmp/omp-sv-probe.txt", { force: true });
+			rmSync("/tmp/-n", { force: true });
+		}
+		const text = joined();
+		expect(text).toContain("Files (1)");
+		expect(text).toContain("s omp-sv-probe.txt");
+		// Neither the redirect target (absent) nor the flag (present) counts.
+		expect(text).not.toContain("omp-sv-out.txt");
+	});
+
+	test("a custom tool's path keys contribute one deduplicated existing file", async () => {
+		await resetBuffers();
+		writeFileSync("/tmp/omp-sv-key.txt", "x");
+		try {
+			await h.emit("tool_call", {
+				toolName: "spawn",
+				input: {
+					filePath: "/tmp/omp-sv-key.txt",
+					file_path: "/tmp/omp-sv-key.txt",
+					files: ["/tmp/omp-sv-key.txt", "/tmp/omp-sv-missing.txt"],
+				},
+			});
+		} finally {
+			rmSync("/tmp/omp-sv-key.txt", { force: true });
+		}
+		const text = joined();
+		expect(text).toContain("Files (1)");
+		// Four path fields resolve to one file: no phantom count badge.
+		expect(text).toContain("r omp-sv-key.txt");
+		expect(text).not.toContain("×");
+	});
+
+	test("replay applies the edit diff and keeps the last path for a pathless diff", async () => {
+		await setDiff(true);
+		await resetBuffers([
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [
+						{ type: "thinking", thinking: "first thought" },
+						{ type: "thinking", thinking: "second thought" },
+					],
+				},
+			},
+			// A result with no matching call must not throw or invent a file.
+			{ type: "message", message: { role: "toolResult", toolCallId: "ghost", toolName: "bash", content: "orphan" } },
+			{
+				type: "message",
+				message: {
+					role: "toolResult",
+					toolCallId: "e9",
+					toolName: "edit",
+					details: { path: "/tmp/replay-edit.ts", diff: "-superseded\n+first" },
+				},
+			},
+			// No `details.path`: the previously replayed path must be kept.
+			{
+				type: "message",
+				message: { role: "toolResult", toolCallId: "e9", toolName: "edit", details: { diff: "-ignored\n+second" } },
+			},
+		]);
+		const lines = rows();
+		const text = lines.join("\n");
+		expect(text).toContain("first thought");
+		expect(text).toContain("second thought");
+		// Blocks are separated, not concatenated into one paragraph.
+		expect(lines.findIndex(line => line.includes("second thought"))).toBeGreaterThan(
+			lines.findIndex(line => line.includes("first thought")) + 1,
+		);
+		expect(text).toContain("Files (0)");
+		expect(text).toContain("✎ replay-edit.ts");
+		expect(text).toContain("+second");
+		expect(text).not.toContain("+first");
 	});
 });
 
@@ -717,6 +1059,100 @@ describe("persistence and lifecycle", () => {
 		component.invalidate();
 		expect(component.render(120)).toEqual(before);
 		assertExactWidth(before, 120);
+	});
+
+	test("empty thinking blocks are not retained", async () => {
+		const before = retainedThinkingBlocks();
+		for (let i = 0; i < 500; i++) {
+			await h.emit("message_update", { assistantMessageEvent: { type: "thinking_start" } });
+			await h.emit("message_update", { assistantMessageEvent: { type: "thinking_end", content: "" } });
+		}
+		expect(retainedThinkingBlocks()).toBe(before);
+		await h.emit("message_update", { assistantMessageEvent: { type: "thinking_start" } });
+		await h.emit("message_update", { assistantMessageEvent: { type: "thinking_delta", delta: "real thought" } });
+		await h.emit("message_update", { assistantMessageEvent: { type: "thinking_end", content: "real thought" } });
+		expect(retainedThinkingBlocks()).toBe(before + 1);
+		expect(h.widget()!.render(120).join("\n")).toContain("real thought");
+	});
+
+	test("a non-edit tool result updates the files-pane diff", async () => {
+		// input.path wins.
+		await h.emit("tool_result", {
+			toolName: "patch",
+			input: { path: "/tmp/prop.ts" },
+			details: { diff: "@@ -1 +1 @@\n-old\n+patched" },
+		});
+		let joined = h.widget()!.render(120).join("\n");
+		expect(joined).toContain("✎ prop.ts");
+		expect(joined).toContain("+patched");
+
+		// No input.path: details.path is the fallback.
+		await h.emit("tool_result", {
+			toolName: "patch",
+			input: {},
+			details: { path: "/tmp/prop2.ts", diff: "@@ -1 +1 @@\n-a\n+second" },
+		});
+		joined = h.widget()!.render(120).join("\n");
+		expect(joined).toContain("✎ prop2.ts");
+		expect(joined).toContain("+second");
+
+		// No resolvable path: leave the pane untouched (input is not even a record).
+		await h.emit("tool_result", {
+			toolName: "patch",
+			input: "",
+			details: { diff: "@@ -1 +1 @@\n-x\n+orphan" },
+		});
+		joined = h.widget()!.render(120).join("\n");
+		expect(joined).toContain("✎ prop2.ts");
+		expect(joined).not.toContain("+orphan");
+	});
+
+	test("a files-only layout below 90 columns shows why it is hidden", async () => {
+		await h.command("split-thinking"); // off
+		await h.command("split-tools"); // off
+		for (const width of [40, 60, 89]) {
+			h.setSize(width, 45);
+			const lines = h.widget()!.render(width);
+			expect(lines.length).toBe(20);
+			assertExactWidth(lines, width);
+			expect(lines.join("\n")).toContain("Files panel needs ≥90 cols");
+			expect(lines.join("\n")).toContain("📂 Files");
+		}
+		h.setSize(120, 45);
+		await h.command("split-thinking"); // back on
+		await h.command("split-tools"); // back on
+	});
+
+	test("/split-trim-response argument forms toggle and report", async () => {
+		await h.command("split-trim-response", "off");
+		expect(effective("display.hideToolActivity")).toBe(false);
+		await h.command("split-trim-response", "ON"); // case-insensitive
+		expect(effective("hideThinkingBlock")).toBe(true);
+		expect(effective("display.hideToolActivity")).toBe(true);
+		// An explicit argument is absolute: "on" again stays on, unlike a toggle.
+		await h.command("split-trim-response", "ON");
+		expect(effective("display.hideToolActivity")).toBe(true);
+		await h.command("split-trim-response", "banana"); // unknown arg toggles
+		expect(effective("display.hideToolActivity")).toBe(false);
+		expect(h.notifications.at(-1)?.message).toContain("Panel C:");
+	});
+
+	test("unsupported settings warn and do not apply an override", async () => {
+		// Force the "off" policy first: with the same policy already applied,
+		// syncTranscriptVisibility returns early and never reaches the failing call.
+		await h.command("split-trim-response", "off");
+		const before = effective("display.hideToolActivity");
+		h.setSettings(new Proxy({}, { get() { throw new Error("no settings"); } }));
+		try {
+			await h.command("split-trim-response", "on");
+		} finally {
+			h.setSettings(settings);
+		}
+		expect(effective("display.hideToolActivity")).toBe(before);
+		expect(h.notifications.at(-1)).toMatchObject({
+			level: "warning",
+			message: expect.stringContaining("Response-only needs"),
+		});
 	});
 
 	test("session_shutdown unmounts the widget and clears timers", async () => {

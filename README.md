@@ -84,7 +84,9 @@ toggles between bare omp and that saved layout.
 - **Files panel** — read/written/seen files newest-first, grouped by
   directory, with a live edit-diff subpanel (`/split-diff` hides the diff and
   keeps the list). File tracking comes from tool calls: `read`, `write`,
-  `edit`, `ast_edit`, plus paths mentioned on a `bash` command line.
+  `edit`, `ast_edit`, plus paths mentioned on a `bash` command line. The diff
+  subpanel follows any tool result that reports `details.diff` plus a path —
+  built-in `edit` as well as custom tools that emit the same payload.
 - **Response-only mode** — sets omp's native `hideThinkingBlock` and
   `display.hideToolActivity` switches as runtime overrides, so the transcript
   shows user + assistant text only. Turning it off clears the overrides and
@@ -93,8 +95,9 @@ toggles between bare omp and that saved layout.
   model or tool text are stripped at ingestion, so a tool result or thinking
   delta cannot drive the terminal.
 - **Geometry** — the band hides itself on terminals too short for
-  transcript + editor; the files column drops out below 90 columns; every
-  rendered row is exactly the terminal width from 40 columns up (tested).
+  transcript + editor; the files column drops out below 90 columns (a
+  files-only layout keeps its frame and says so, instead of rendering blank);
+  every rendered row is exactly the terminal width from 40 columns up (tested).
 
 ## Differences from the pi original
 

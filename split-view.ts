@@ -207,7 +207,9 @@ const thinking = {
 				this.current.lines.push(this.current.tail);
 				this.current.tail = "";
 			}
-			this.blocks.push(this.current);
+			// Same guard as start(): an empty start/end pair must not leave a
+			// block that no row ever consumes but the session keeps forever.
+			if (this.current.lines.length || this.current.tail) this.blocks.push(this.current);
 			this.current = null;
 			this.trim();
 		}
@@ -250,6 +252,11 @@ const thinking = {
 	},
 };
 
+/** Test seam: blocks retained for rendering (empty blocks must not count). */
+export function retainedThinkingBlocks(): number {
+	return thinking.blocks.length + (thinking.current ? 1 : 0);
+}
+
 /** Raw thinking lines, oldest first, blocks separated by a blank line. */
 function thinkingLines(): string[] {
 	const out: string[] = [];
@@ -283,6 +290,13 @@ interface ToolEntry {
 let toolsVersionCounter = 0;
 const toolsBy = new Map<string, ToolEntry>();
 const toolOrder: string[] = [];
+
+/** Test seam: live tool entries. `MAX_TOOLS` eviction must bound this; the
+ * band only renders the newest rows, so the cap has no render-observable
+ * signature of its own. */
+export function retainedToolEntries(): number {
+	return toolsBy.size;
+}
 
 let toolsFlushTimer: NodeJS.Timeout | null = null;
 let toolsDirty = false;
@@ -711,7 +725,12 @@ function renderBand(theme: Theme, width: number, bodyRows: number, rows: number)
 			? Math.max(MIN_DOCK_COLS, Math.min(dockColsFor(width, filesWidth), width - 40))
 			: 0;
 	if (filesWidthCols > 0) ids.push("files");
-	if (ids.length === 0) return [];
+	if (ids.length === 0) {
+		// Files-only on a narrow terminal: keep the frame and say why.
+		if (filesOn && !thinkingOn && !toolsOn)
+			return filesPanelLines(theme, width, bandHeight, `Files panel needs ≥${MIN_TERM_WIDTH} cols`);
+		return [];
+	}
 
 	let lines: string[];
 	if (ids.length === 1) {
@@ -776,8 +795,13 @@ class BandHub implements Component {
  * band. It is a band column rather than a floating dock: omp composites
  * overlays over the whole viewport (band and editor included), so an overlay
  * dock would cover the band instead of sitting beside the transcript.
+ *
+ * `notice` replaces the file list with one hint row (keeping the frame, the
+ * title, the diff subpanel and the height contract) for the cases where there
+ * is nothing to list but silence would look like a bug — the files-only
+ * layout on a terminal too narrow to dock the column.
  */
-function filesPanelLines(theme: Theme, width: number, height: number): string[] {
+function filesPanelLines(theme: Theme, width: number, height: number, notice?: string): string[] {
 	const inner = Math.max(1, width - 2);
 	const pad = (text: string) => text + " ".repeat(Math.max(0, inner - visibleWidth(text)));
 	const row = (content: string) =>
@@ -828,17 +852,21 @@ function filesPanelLines(theme: Theme, width: number, height: number): string[] 
 	while (shown.length > 0 && shown[shown.length - 1].files === 0) shown.pop();
 
 	const body: string[] = [];
-	let filesShown = 0;
-	for (const entry of shown) {
-		body.push(entry.line);
-		filesShown += entry.files;
+	if (notice) {
+		body.push(row(` ${theme.fg("dim", truncateInline(notice, Math.max(1, inner - 2)))}`));
+	} else {
+		let filesShown = 0;
+		for (const entry of shown) {
+			body.push(entry.line);
+			filesShown += entry.files;
+		}
+		if (entries.length === 0) body.push(row(` ${theme.fg("dim", "No files touched yet")}`));
+		else if (entries.length > filesShown && body.length < listRows) {
+			const hiddenFiles = `… +${entries.length - filesShown} more`;
+			body.push(row(` ${theme.fg("dim", hiddenFiles)}`));
+		}
+		if (body.length < listRows) body.push(row(` ${theme.fg("dim", LEGEND)}`));
 	}
-	if (entries.length === 0) body.push(row(` ${theme.fg("dim", "No files touched yet")}`));
-	else if (entries.length > filesShown && body.length < listRows) {
-		const hiddenFiles = `… +${entries.length - filesShown} more`;
-		body.push(row(` ${theme.fg("dim", hiddenFiles)}`));
-	}
-	if (body.length < listRows) body.push(row(` ${theme.fg("dim", LEGEND)}`));
 	while (body.length < listRows) body.push(row(""));
 
 	const diffBody: string[] = [];
@@ -1127,15 +1155,16 @@ export default function splitView(pi: ExtensionAPI): void {
 	});
 
 	pi.on("tool_result", event => {
-		// Custom tools share this union with a string toolName, so narrow on the
-		// payload instead of trusting the discriminant alone.
-		if (event.toolName !== "edit" || !isRecord(event.details)) return;
+		// Any tool may report a diff; key off the payload, not the discriminant.
+		if (!isRecord(event.details)) return;
 		const { details } = event;
 		const diff = details.diff;
 		if (typeof diff !== "string" || !diff) return;
-		let filePath = editDiff.path;
-		if (typeof event.input.path === "string") filePath = event.input.path;
+		const input = isRecord(event.input) ? event.input : {};
+		let filePath: string | undefined;
+		if (typeof input.path === "string") filePath = input.path;
 		else if (typeof details.path === "string") filePath = details.path;
+		if (!filePath) return; // no resolvable path: keep the tool row's own diff
 		setEditDiff(filePath, diff);
 		requestRender();
 	});

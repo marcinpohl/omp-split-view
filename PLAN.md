@@ -72,19 +72,19 @@ that order's terms. After every item run `bun test`, `bun run test:coverage`,
 | PLAN item | Status | CODE_QUALITY row |
 | --- | --- | --- |
 | W1 theme cache misses `text` | done | — |
-| W2 zero-line thinking blocks | open | B5 |
+| W2 zero-line thinking blocks | done | B5 |
 | W3 `capToolText` tiny caps | done | — |
-| W4 files-only blank < 90 cols | open | B1 |
-| W5 diff follows tool name | open | B2 |
+| W4 files-only blank < 90 cols | done | B1 |
+| W5 diff follows tool name | done | B2 |
 | W6 `reconstruct` bash replay | open (fold into Q3) | Q3 |
 | W7 repository hygiene | partial (CI open) | B7 |
-| T1 `/split-trim-response` | open | B4 |
+| T1 `/split-trim-response` | done | B4 |
 | T2 theme invalidation | done | — |
-| T3 empty thinking blocks | open (with W2) | B5 |
+| T3 empty thinking blocks | done (with W2) | B5 |
 | T4 `/split` + `/split-save` round-trip | partial | — |
 | T5 resume/reconstruct | done | — |
 | T6 command argument handling | partial | — |
-| T7 tool panel extras | open | B6 |
+| T7 tool panel extras | done | B6 |
 
 ### W1 — Theme cache misses `text` (low, one line)
 
@@ -101,7 +101,14 @@ cleared whenever the fingerprint changes (proved by the theme property test).
   reaching the rendered rows.
 - Note: `"text"` is a valid `ThemeColor` (`node_modules/@oh-my-pi/pi-tui/src/theme/schema.ts:129`).
 
-### W2 — Zero-line thinking blocks accumulate (low) — **open (B5)**
+### W2 — Zero-line thinking blocks accumulate (low) — **done (B5)**
+
+**Done** — `thinking.end` pushes only when `lines.length || tail`. The leak is
+proved directly rather than indirectly: `split-view.ts` exports
+`retainedThinkingBlocks()`, and the test emits 500 empty start/end pairs (count
+unchanged), then one real thought (count +1, text rendered). Verified
+load-bearing: reverting the guard fails the test with `Expected 0, Received
+500`.
 
 - Where: `thinking.end` (`split-view.ts:198`), `thinking.trim` (`split-view.ts:211`).
 - Problem: `end()` pushes `this.current` unconditionally; `trim()` counts only
@@ -128,7 +135,13 @@ capToolText length property (1–400 char caps).
   behaviour. Do not return the marker alone — it exceeds the cap by design.
 - Acceptance: unit test `capToolText("x".repeat(200), 8).length <= 8`.
 
-### W4 — Files-only layout is silently blank below 90 columns (low) — **open (B1)**
+### W4 — Files-only layout is silently blank below 90 columns (low) — **done (B1)**
+
+**Done** — the empty-ids branch of `renderBand` keeps the frame for a
+files-only layout and renders `Files panel needs ≥90 cols` in place of the list
+(`filesPanelLines` gained an optional `notice`). The test sweeps 40/60/89 cols:
+exactly `bandHeight` rows, every row exactly `width` cells, hint plus
+`📂 Files` title present.
 
 - Where: `renderBand`, `split-view.ts:656-683` (`filesWidthCols` gate).
 - Problem: with only the files panel on, widths 80 and 89 render 0 rows and no
@@ -141,7 +154,13 @@ capToolText length property (1–400 char caps).
 - Acceptance: geometry sweep includes files-only at 80/89 → `rows.length ===
   height`, every row exactly `width`, output contains the hint.
 
-### W5 — Diff subpanel only follows `toolName === "edit"` (low) — **open (B2)**
+### W5 — Diff subpanel only follows `toolName === "edit"` (low) — **done (B2)**
+
+**Done** — the handler now keys off `details.diff` plus a resolvable path
+(`input.path` → `details.path`). Behaviour change to note: a result with a diff
+but no resolvable path returns early instead of reusing the previous diff path.
+The test covers all three branches with `toolName: "patch"` and is load-bearing
+(restoring the `toolName` gate fails it).
 
 - Where: `tool_result` handler, `split-view.ts:1092`.
 - Problem: custom tools that emit `details.diff` show the diff inside the tool
@@ -187,19 +206,24 @@ assertions use the harness `setTheme` hook. `test/setup.ts` redirects
 `PI_CODING_AGENT_DIR` to a temp dir before module import, and
 `scripts/check-coverage.ts` excludes `test/**` from the coverage gate.
 
-- [ ] **T1 — `/split-trim-response` (highest value).** No suite test; the only
-  feature that depends on host setting IDs. Gate on `lookup("hideThinkingBlock")`
-  and `lookup("display.hideToolActivity")` being defined; call
-  `await Settings.init({ agentDir: process.env.PI_CODING_AGENT_DIR, inMemory: true })`
-  from `@oh-my-pi/pi-coding-agent`, pass the real `settings` singleton as
-  `api.pi.settings`, then assert: on → both handles read `true`; off → `false`;
-  `off`/`on` arg forms; unknown switch (handles absent) → warning notify, no
-  throw, `trimResponse` unchanged. Verified manually already: on→`true,true`,
-  off→`false,false`, message "Panel C: response only/full transcript".
+- [x] **T1 — `/split-trim-response` (highest value).** Done, two tests. A new
+  harness seam `setSettings` swaps `api.pi.settings` (the file already passes
+  the real `settings` singleton and `Settings.init()` runs in `beforeAll`).
+  `/split-trim-response argument forms toggle and report`: `off` → `false`,
+  `ON` → both handles `true`, a second `ON` stays on (explicit args are
+  absolute, not toggles), `banana` toggles, and the `Panel C:` notify fires.
+  The lowercase parse and the idempotent explicit arg are both load-bearing
+  (dropping `.toLowerCase()` fails the test). `unsupported settings warn and
+  do not apply an override` swaps in a `Proxy` whose every read throws, so the
+  existing `catch` sets `visibilityUnsupported`: `warning` notify, no override
+  applied, and the test must stay last in the file because that flag is
+  process-global. Missing-ID detection is not simulated — both handles exist,
+  so a throwing settings object is the only reachable route into that branch.
 - [x] **T2 — Theme invalidation.** Done: "every theme colour the band uses
   invalidates the row cache" uses a mutable theme; covers W1 and exposed the
   `bandMemo` staleness fixed in `renderBand`.
-- [ ] **T3 — Empty thinking blocks.** Covers W2; see acceptance there.
+- [x] **T3 — Empty thinking blocks.** Done with W2: direct block count via
+  `retainedThinkingBlocks()` (the "too indirect" fallback was not needed).
 - [ ] **T4 — `/split` toggle pair + `/split-save` round-trip (partial).** Done:
   config load tolerates garbage, `/split-save` persists the live layout and
   reports a write failure, and the toggle pair was verified live. Missing: a
@@ -213,9 +237,14 @@ assertions use the harness `setTheme` hook. `test/setup.ts` redirects
   `/split-tools-width` and `/split-tools-view` in the layout/save tests.
   Missing: empty/non-numeric `/split-tools-width` errors and both explicit
   `/split-tools-view` states.
-- [ ] **T7 — Tool panel extras.** Image result renders the one-line fallback and
-  not the base64 payload; duration formatting appears for ended calls and not
-  for reconstructed ones; `MAX_TOOLS` eviction keeps the newest 60.
+- [x] **T7 — Tool panel extras.** Done in the `complex renderers` suite: an
+  image result renders the one-line fallback and not the base64 payload, a
+  finished call shows its elapsed time while a call that just started shows
+  none before the one-second gate (the ≥1s live counter stays covered by the
+  ticker test), and `MAX_TOOLS` eviction keeps the newest 60 — the cap was not
+  row-observable (the band renders only the newest rows), so it is asserted
+  through the `retainedToolEntries()` seam. Mutations: removing the eviction
+  block leaves 65 entries; `pop()` instead of `shift()` drops the newest call.
 
 Keep every new test deterministic and isolated; do not re-pin incidental text
 (legend strings, emoji order) unless it is a stated contract.
