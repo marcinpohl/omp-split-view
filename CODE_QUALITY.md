@@ -1,7 +1,7 @@
 # Code quality — measurements and work queue
 
-Snapshot: 2026-11-01, after the T1/W2/W4/W5 behaviour batch (base commit
-`36c125f`; the batch itself is uncommitted). This file is the dispatcher:
+Snapshot: 2026-11-01, after the Q1–Q7 structural batch plus B7 CI (base commit
+`b80a002`; the batch itself is uncommitted). This file is the dispatcher:
 metrics live here, the ordered queue below is what to work on next, and every
 landed item updates the snapshot and ticks its row.
 
@@ -25,22 +25,24 @@ targets control characters.
 
 | File | Lines | Funcs | Test file | Tests |
 | --- | --- | --- | --- | --- |
-| `split-view.ts` | 99.90% | 97.85% | `test/split-view.test.ts` | 57 |
+| `split-view.ts` | 99.90% | 98.21% | `test/split-view.test.ts` | 57 |
 | `helpers.ts` | 100.00% | 94.12% | `test/helpers.test.ts` | 19 |
 | `ui-panels-config.ts` | 100.00% | 80.00% | `test/properties.test.ts` | 17 |
-| **overall** | **99.91%** | **96.52%** | | **93** |
+| **overall** | **99.92%** | **97.01%** | | **93** |
 
 32,410 assertions, ~3.9 s wall time. Uncovered:
 
-- `split-view.ts:121` — `themeGetter` default that throws if something renders
+- `split-view.ts:122` — `themeGetter` default that throws if something renders
   before `session_start` binds a theme. Deliberate, unreachable.
-- Functions: 111/115 counted (`FNF`/`FNH` in `coverage/lcov.info`, `test/**`
+- Functions: 130/134 counted (`FNF`/`FNH` in `coverage/lcov.info`, `test/**`
   excluded as the gate does). The four misses are the throwing `themeGetter`
   default, `BandHub.dispose` (no-op host hook), and the two no-op default
   exports that exist so omp's extension auto-discovery does not report a load
   error (`helpers.ts:210`, `ui-panels-config.ts:142`). Bun 1.4's lcov omits the
   per-function `FN`/`FNDA` records, so those identities come from reading the
-  four sites; only the totals come from the report.
+  four sites; only the totals come from the report. Every helper extracted by
+  Q1–Q7 is reached by the existing suite, so the denominator grew by 19 while
+  the miss list stayed at four.
 
 Property coverage is behavioural, not line-based: helpers (truncation, caps,
 config normalization, visibility), band geometry for arbitrary terminal sizes,
@@ -71,64 +73,102 @@ from an earlier test, so delta coalescing is now asserted directly.
 
 ### Lint and complexity (radon `cc` / `raw` equivalents)
 
-15 warnings, 0 errors. Limits: cyclomatic 12, cognitive 15, depth 4, params 4,
+2 warnings, 0 errors. Limits: cyclomatic 12, cognitive 15, depth 4, params 4,
 function length 100 lines.
 
 | Function | cc | cognitive | other | Location |
 | --- | --- | --- | --- | --- |
-| `filesPanelLines` | 31 | 50 | — | `split-view.ts:816` |
-| `toolLines` | 21 | 39 | — | `split-view.ts:437` |
-| `reconstruct` | 20 | 36 | — | `split-view.ts:1036` |
-| `renderBand` | 23 | 29 | — | `split-view.ts:703` |
-| `pathsFrom` | 18 | 24 | — | `split-view.ts:496` |
-| `syncTranscriptVisibility` | 15 | — | — | `split-view.ts:991` |
-| `normalizeConfig` | 14 | — | — | `ui-panels-config.ts:58` |
-| `splitView` | — | — | 279 lines | `split-view.ts:1084` |
-| `newestRows` | — | — | 6 params | `split-view.ts:620` |
-| `renderPanel` | — | — | 5 params | `split-view.ts:646` |
+| `syncTranscriptVisibility` | 15 | — | — | `split-view.ts:1092` |
+| `normalizeConfig` | 14 | — | — | `ui-panels-config.ts:60` |
+
+Both are the deliberately parked Q8 pair (just over the limit, untouched). The
+structural batch cleared the other thirteen warnings and introduced none: two
+helpers needed one extra split each while landing (`fileRows` → `fileEntryRow`
++ `fileRunRows`, `renderBand` → `panelLayout` + `narrowFilesNotice`, then
+`splitView` → `registerEvents` + `registerCommands` →
+`registerPanelToggles`/`registerBandSettings`), which is why the extraction
+count is higher than the Q rows name.
 
 Band/dock geometry now scales (`defaultBandHeight`, `maxBandHeight`,
 `AUTO_DOCK_*` in `helpers.ts`), so 4K and ultrawide terminals get a 45%-height
 band and a 25%-width dock instead of the 48-col/40-row ceilings.
 
-`filesPanelLines` sits exactly at the 4-parameter limit after taking the hint
-row as `notice?`; the Q1 split must not add a fifth, or extract an options
-object (Q7's pattern) as part of the extraction.
+`filesPanelLines` still takes 4 parameters: the Q1 split keeps the hint row as
+`notice?` and passes the padded content width to the helpers instead of a
+closure, so no fifth parameter (and no options object) was needed.
 
-File sizes: `split-view.ts` 1389 L, `helpers.ts` 244 L,
+File sizes: `split-view.ts` 1514 L, `helpers.ts` 244 L,
 `ui-panels-config.ts` 146 L, `scripts/check-coverage.ts` 90 L, tests 1910 L.
+
+CI: `.github/workflows/ci.yml` runs the four gates plus `bun install
+--frozen-lockfile` on Bun 1.4.3 for every push and pull request. The repo has no
+remote yet, so the workflow is inert until one is added; its steps were run
+locally in order and all gate on the numbers above.
 
 ## Work queue
 
 Ordered. Priority is about risk and leverage, not effort. A row is done only
 when its acceptance metric is met and the snapshot above is updated.
 
-### P1 — complexity hotspots (they shape every future edit)
-
-| ID | Evidence | Work | Acceptance |
-| --- | --- | --- | --- |
-| Q1 | `filesPanelLines` cc 31 / ccog 50 | Split into `fileRows()` (grouping/newest-first), `filesBody()` (slot budget, `… more`, legend) and `filesDiffBody()`. Keep `filesPanelLines` as composition only. | cc ≤ 12, ccog ≤ 15; all files tests + property geometry unchanged |
-| Q2 | `toolLines` cc 21 / ccog 39 | Extract `toolEntryLines(entry, width, full)` and `toolDiffLines(entry)`. | cc ≤ 12, ccog ≤ 15 |
-| Q3 | `reconstruct` cc 20 / ccog 36 | Extract `replayAssistant(msg)` / `replayToolResult(msg)`; fold the bash-replay policy (PLAN W6) into `replayToolResult` while it is open. | cc ≤ 12, ccog ≤ 15; branch-replay test still passes |
-
-### P2 — structure and missing behaviour
-
-| ID | Evidence | Work | Acceptance |
-| --- | --- | --- | --- |
-| Q4 | `renderBand` cc 23 / ccog 29 | Extract `allocateWidths(ids, width)` and `composePanels(...)`; keep the cache/fingerprint logic in `renderBand`. | cc ≤ 12, ccog ≤ 15 |
-| Q5 | `splitView` 273 lines | Move command registration into `registerCommands(pi)` and event wiring into `registerEvents(pi)`; the factory then only orchestrates. | function ≤ 100 lines;
-`bun run lint` has one warning fewer |
-| B7 | No CI (PLAN W7) | Single job: `bun install`, `bun test`, `bun run test:coverage`, `bun run lint`, `bun run typecheck`. | green on the snapshot numbers |
-
 ### P3 — small or deferred
 
 | ID | Evidence | Work | Acceptance |
 | --- | --- | --- | --- |
-| Q6 | `pathsFrom` cc 18 / ccog 24 | Data-driven table for the path keys; one loop. | cc ≤ 12 |
-| Q7 | `newestRows` 6 params, `renderPanel` 5 params | Options objects (`{ items, textWidth, maxRows, style, memo, panel }`). | both under 5 params |
 | Q8 | `syncTranscriptVisibility` cc 15, `normalizeConfig` cc 14 | Just over the limit; touch only if the function changes for another reason. Rule: no new warnings. | — |
 
-### Landed (was B1, B2, B4, B5, B6)
+Nothing else is queued. The remaining open item is behavioural, not
+structural: PLAN W6 (bash replay in `reconstruct`) — Q3 extracted the replay
+without folding a policy choice, so its three options are still open in
+`PLAN.md`.
+
+### Landed — Q1–Q7 + B7 (structural batch)
+
+Delta: 93 tests unchanged, no test file edited; coverage lines 99.91% →
+99.92%, functions 96.52% → 97.01% (19 extracted helpers, still four misses);
+lint 15 → 2 warnings (both Q8, untouched), 0 errors throughout;
+`split-view.ts` 1389 → 1514 L (more, not less: each extraction carries its own
+signature and doc comment, and three functions needed a second split to clear a
+fresh warning). Rendering is byte-identical step by step: `bun run demo` diffed
+against the pre-batch output after every step with only the tool duration cell
+normalised.
+
+- **Q6 → `pathsFrom`.** `EXACT_PATH_TOOLS` table (`read`/`write`/`edit`/
+  `ast_edit`, existence check skipped) + `GENERIC_PATH_KEYS` /
+  `GENERIC_LIST_KEYS` loops, `addPathHit` and `bashPathHits` extracted. cc 18 /
+  ccog 24 → under limit. The `sonarjs/super-linear-regex` disable moved with
+  the token regex.
+- **Q7 → options objects.** `NewestRowsOptions` and `PanelOptions`; both
+  functions destructure in the body (a destructured parameter does not reduce
+  the reported parameter count), all three callsites updated. 6 and 5 params →
+  1 each.
+- **Q2 → `toolLines`.** `toolPrefix`, `toolDetailLines`, `toolDiffLines`; the
+  compact-mode blank separator and oldest-first ordering untouched. cc 22 /
+  ccog 39 → under limit.
+- **Q1 → `filesPanelLines`.** `filesRow`, `fileRows`, `filesBody`,
+  `filesDiffBody`; the grouping loop needed a second split (`fileEntryRow` +
+  `fileRunRows`) because `fileRows` landed at ccog 16. `filesPanelLines` keeps
+  4 parameters and pads only after `filesBody`, which is how the truncated list
+  and the notice row share the frame.
+- **Q4 → `renderBand`.** `allocateWidths` + `composeColumns` as planned, plus
+  `panelLayout` and `narrowFilesNotice`: after the first two the function was
+  still cc 17 / ccog 16 (the `? 1 : 0` cache-key ternaries and the id pushes),
+  so the id/dock computation and the files-only hint moved out too. The cache
+  is still bypassed (not stored) on the notice and empty branches.
+- **Q3 → `reconstruct`.** `replayAssistant` / `replayToolResult` typed from
+  `SessionMessageEntry` (imported from
+  `@oh-my-pi/pi-coding-agent/session/session-entries`); cc 20 / ccog 36 → under
+  limit. W6 explicitly not folded.
+- **Q5 → `splitView`.** `requireTui` promoted to module scope, event wiring →
+  `registerEvents`, commands → `registerCommands` →
+  `registerPanelToggles` + `registerBandSettings` (a single registrar was 174
+  lines, over the 100 limit). Registration order is unchanged: ten commands,
+  ten `pi.on` hooks, factory body now 12 lines.
+- **B7 → CI.** `.github/workflows/ci.yml`: one `gates` job on Bun 1.4.3 running
+  `bun install --frozen-lockfile`, `bun run typecheck`, `bun test`,
+  `bun run test:coverage`, `bun run lint`. No remote exists yet, so it stays
+  inert; the same sequence was run locally against `bun.lock` and exited 0.
+
+### Landed — B1, B2, B4, B5, B6 (behaviour batch)
 
 Delta: 62 → 81 tests, overall functions 96.36% → 96.43% (both count seams are
 covered), lines unchanged at 99.91%, lint unchanged at 15 warnings / 0 errors.
@@ -156,12 +196,12 @@ covered), lines unchanged at 99.91%, lint unchanged at 15 warnings / 0 errors.
 
 ## Next up
 
-1. **Q1** — `filesPanelLines` is the most complex function (now cc 31 / ccog 50
-   after the hint row) and already had one geometry bug; splitting it makes the
-   budget logic reviewable.
-2. **Q2**, then **Q3** (with W6 bash replay), then **Q4**/**Q5**.
-3. **B7** last: CI should lock in the state after the structural work, not
-   before it.
+1. **W6** — the only open item (bash replay in `reconstruct`); pick one of the
+   three policies in `PLAN.md` before touching the replay path again.
+2. **Q8** — parked by design: the two functions sit one step over the limit and
+   the rule is to touch them only when another change touches them.
+3. Nothing structural is left: keep the four gates green and update this
+   snapshot in the same commit as any future change.
 
 ## Keeping this file honest
 

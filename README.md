@@ -163,7 +163,7 @@ Bun instruments TypeScript directly (no istanbul/nyc/`--experimental` flags)
 and writes an lcov report; `scripts/check-coverage.ts` parses it and fails the
 command below `lines = 99%` / `functions = 90%` (override with
 `COVERAGE_LINES` / `COVERAGE_FUNCTIONS`). Test fixtures are excluded from the
-totals. Current: 99.91% lines / 96.43% functions — the only uncovered line is
+totals. Current: 99.92% lines / 97.01% functions — the only uncovered line is
 the `themeGetter` default that throws before `session_start` binds a theme; the
 uncovered functions are no-op extension exports.
 
@@ -179,10 +179,14 @@ are ESLint plugins and rules:
 | `radon raw` / size | `max-lines-per-function`, `max-depth`, `max-params` | `bun run lint` |
 | `radon mi` / Halstead | no maintained TS implementation; treated as out of scope | — |
 
-The baseline is 0 errors and 15 warnings; the warnings are the complexity
-report for the known hotspots (`filesPanelLines`, `reconstruct`, `renderBand`,
-`splitView`). Tests are exempt from the size/complexity rules. Tests assert
-behaviour, not lint cleanliness.
+The baseline is 0 errors and 2 warnings, both parked by design
+(`syncTranscriptVisibility` cc 15, `normalizeConfig` cc 14): they sit one step
+over the cyclomatic limit and are only touched when another change touches
+them. The Q1–Q7 structural batch cleared the previous hotspots
+(`filesPanelLines`, `toolLines`, `reconstruct`, `renderBand`, `pathsFrom`,
+`splitView`, and the `newestRows`/`renderPanel` parameter counts). Tests are
+exempt from the size/complexity rules. Tests assert behaviour, not lint
+cleanliness.
 
 Tests drive the extension through its registered handlers, commands, and the
 widget factory omp calls, asserting panel content and exact row widths. The

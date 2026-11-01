@@ -6,7 +6,8 @@ checker, and throwaway probe scripts; none are inferred.
 
 `CODE_QUALITY.md` owns the measured snapshot (tests/coverage/lint) and the
 ranked queue; this file owns the behaviour descriptions and acceptance text.
-Status below is reconciled against `CODE_QUALITY.md` as of commit `bc86769`.
+Status below is reconciled against `CODE_QUALITY.md` as of the Q1–Q7/B7
+structural batch (the commit that added `.github/workflows/ci.yml`).
 
 ## Verified baseline (re-check after any change)
 
@@ -15,17 +16,18 @@ its numbers in sync with these commands.
 
 | Command | Expected |
 | --- | --- |
-| `bun test` | 62 pass, 0 fail, 29607 expect() calls |
-| `bun run test:coverage` | gate passes: lines ≥ 99%, functions ≥ 90% (currently 99.91% / 96.36%) |
-| `bun run lint` | 0 errors, 15 warnings (the cyclomatic/cognitive report) |
+| `bun test` | 93 pass, 0 fail, 32410 expect() calls |
+| `bun run test:coverage` | gate passes: lines ≥ 99%, functions ≥ 90% (currently 99.92% / 97.01%) |
+| `bun run lint` | 0 errors, 2 warnings (the parked Q8 pair) |
 | `bun run typecheck` | clean (`tsc --noEmit`, strict) |
 | geometry sweep (probe below) | 0 failures (40–300 cols × 6–40 rows), rows == height, every row exactly `width` cells, no control chars |
 
-Files: `split-view.ts` 1337 L, `helpers.ts` 212 L, `ui-panels-config.ts` 144 L,
-`test/split-view.test.ts` 727 L, `test/properties.test.ts` 310 L,
-`test/helpers.test.ts` 172 L, `test/setup.ts` 7 L, `scripts/check-coverage.ts`
-90 L, `CODE_QUALITY.md`, `eslint.config.js`. Git repository; no CI yet
-(W7/B7).
+Files: `split-view.ts` 1514 L, `helpers.ts` 244 L, `ui-panels-config.ts` 146 L,
+`test/split-view.test.ts` 1378 L, `test/properties.test.ts` 318 L,
+`test/helpers.test.ts` 207 L, `test/setup.ts` 7 L, `scripts/check-coverage.ts`
+90 L, `.github/workflows/ci.yml` 17 L, `CODE_QUALITY.md`, `eslint.config.js`.
+Git repository with CI (W7/B7 done); no remote, so the workflow is inert until
+one is added.
 `fast-check` 4.x is the dev dependency behind the property tests.
 `eslint`/`typescript-eslint`/`sonarjs` back `bun run lint`; coverage comes from
 Bun's built-in instrumentation plus the lcov gate in `scripts/check-coverage.ts`
@@ -76,8 +78,8 @@ that order's terms. After every item run `bun test`, `bun run test:coverage`,
 | W3 `capToolText` tiny caps | done | — |
 | W4 files-only blank < 90 cols | done | B1 |
 | W5 diff follows tool name | done | B2 |
-| W6 `reconstruct` bash replay | open (fold into Q3) | Q3 |
-| W7 repository hygiene | partial (CI open) | B7 |
+| W6 `reconstruct` bash replay | open (Q3 landed; policy not folded) | Q3 |
+| W7 repository hygiene | done | B7 |
 | T1 `/split-trim-response` | done | B4 |
 | T2 theme invalidation | done | — |
 | T3 empty thinking blocks | done (with W2) | B5 |
@@ -193,12 +195,17 @@ section 5 prints the resulting table for 120×45, 200×60, 400×100 and 500×60.
 - Acceptance: no fixed geometric cap below the terminal size; a chosen height
   is never overridden; a request that would hide the band is clamped instead.
 
-### W6 — `reconstruct` replays every bash token through `fs` (low-med) — **open, do it with Q3**
+### W6 — `reconstruct` replays every bash token through `fs` (low-med) — **open (Q3 landed without folding it)**
 
-- Where: `reconstruct` (`split-view.ts:888`), `pathsFrom` bash branch.
+- Where: `replayToolResult`/`record` → `pathsFrom` → `bashPathHits`
+  (`split-view.ts`).
 - Problem: resume replays all branch bash commands and calls
   `existsSync`+`statSync` per token, re-deriving "seen" files from the current
   filesystem; cost grows with branch length and deleted/moved files disappear.
+- Note: Q3 split `reconstruct` into `replayAssistant`/`replayToolResult` and
+  left this policy alone on purpose (the structural batch was not allowed to
+  change behaviour), so the decision is still open and now lives in one
+  function (`replayToolResult` → `record`).
 - Change options (pick one, note the choice):
   - (a) no replay for bash: only live `tool_call` events populate "seen";
   - (b) cap replay to the last N bash calls in the branch;
@@ -207,18 +214,19 @@ section 5 prints the resulting table for 120×45, 200×60, 400×100 and 500×60.
   list is deterministic and no `stat` runs for tokens that cannot be paths
   (assert via resulting list, not by spying on `fs`).
 
-### W7 — Repository hygiene — **partial (B7)**
+### W7 — Repository hygiene — **done (B7)**
 
-**Partly done** — `git init` + first commit landed 2026-11-01 (15 files;
-`node_modules/` ignored) and the README now notes the ~1 GB install. CI is not
-set up yet.
+**Done** — `git init` + first commit landed 2026-11-01 (15 files;
+`node_modules/` ignored) and the README notes the ~1 GB install. B7 added
+`.github/workflows/ci.yml`: one `gates` job on Bun 1.4.3 running `bun install
+--frozen-lockfile`, `bun run typecheck`, `bun test`, `bun run test:coverage` and
+`bun run lint`.
 
-- `git init`, first commit of the current tree (respect the existing
-  `.gitignore`, which already ignores `node_modules/`).
-- Add CI (single job): `bun install`, `bun test`, `bun run typecheck`.
-- Note in README that `bun install` pulls the whole omp runtime through
-  auto-installed peers (~1.0 GB `node_modules`), so the cache is expected.
-- Acceptance: CI green on the same 25/0 baseline.
+- Where: `.github/workflows/ci.yml`; install note in `README.md`.
+- Note: the repo still has no remote, so the workflow is inert until one is
+  added; the same sequence was run locally in order.
+- Acceptance: met locally on the current snapshot — 93 pass / 0 fail, coverage
+  gate exit 0, `0 errors, 2 warnings`, typecheck clean.
 
 ## Test gaps (open items in CODE_QUALITY queue order)
 

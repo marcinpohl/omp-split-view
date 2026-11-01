@@ -64,6 +64,7 @@ import { renderDiff } from "@oh-my-pi/pi-tui/chrome/diff";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
+import type { SessionMessageEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import {
 	MAX_BAND_HEIGHT,
 	MIN_BAND_HEIGHT,
@@ -433,51 +434,68 @@ function previewLinesFor(rows: number): number {
 	return Math.max(2, Math.min(6, Math.floor(rows / 8)));
 }
 
+/** Status row for one tool: glyph, name, elapsed time, fitted args tail. */
+function toolPrefix(theme: Theme, entry: ToolEntry, textWidth: number): string {
+	const { tone, glyph } = toolState(entry);
+	const mark = theme.fg(tone, glyph);
+	const name = theme.fg(entry.active ? "accent" : tone, entry.name);
+	let duration = "";
+	if (entry.startedAt !== undefined) {
+		if (entry.endedAt !== undefined)
+			duration = theme.fg("dim", ` ${formatDuration(entry.endedAt - entry.startedAt)}`);
+		else if (entry.active && Date.now() - entry.startedAt >= 1000)
+			duration = theme.fg("warning", ` ${formatDuration(Date.now() - entry.startedAt, true)}`);
+	}
+	const prefix = `${mark} ${name}${duration}`;
+	const room = textWidth - visibleWidth(prefix) - 1;
+	const args = entry.args && room >= 8 ? theme.fg("muted", ` ${truncateInline(entry.args, room)}`) : "";
+	return prefix + args;
+}
+
+/** Full-mode detail rows: output preview (+hidden count) and image fallback. */
+function toolDetailLines(theme: Theme, entry: ToolEntry, textWidth: number, previewCap: number): string[] {
+	const out: string[] = [];
+	const content = (entry.output || "")
+		.split(/\r?\n/)
+		.map(line => line.trim())
+		.filter(Boolean);
+	if (content.length === 0) {
+		if (entry.active) out.push(theme.fg("dim", "  · …"));
+	} else {
+		const { shown, hidden } = outputPreview(content, previewCap);
+		for (const line of shown) out.push(theme.fg("toolOutput", `  · ${truncateInline(line, textWidth - 4)}`));
+		if (hidden > 0) out.push(theme.fg("dim", `  · +${hidden} more`));
+	}
+	if (entry.image) {
+		const dims = getImageDimensions(entry.image.data, entry.image.mimeType) ?? undefined;
+		out.push(theme.fg("toolOutput", `  · ${imageFallback(entry.image.mimeType, dims)}`));
+	}
+	return out;
+}
+
+/** Full-mode diff block under a tool row; empty when the result had no diff. */
+function toolDiffLines(theme: Theme, diff: string | undefined): string[] {
+	if (!diff) return [];
+	const out = [""];
+	for (const line of renderDiff(diff, { theme }).split(/\r?\n/)) out.push(`    ${line}`);
+	return out;
+}
+
 /** Panel rows for the tools view, styled, oldest first. */
 function toolLines(theme: Theme, width: number, previewCap = 2): string[] {
-	const out: string[] = [];
 	const full = toolMode === "full";
 	const textWidth = Math.max(8, width - 3);
+	const out: string[] = [];
 	for (const id of toolOrder) {
 		const entry = toolsBy.get(id);
 		if (!entry) continue;
-		const { tone, glyph } = toolState(entry);
-		const mark = theme.fg(tone, glyph);
-		const name = theme.fg(entry.active ? "accent" : tone, entry.name);
-		let duration = "";
-		if (entry.startedAt !== undefined) {
-			if (entry.endedAt !== undefined)
-				duration = theme.fg("dim", ` ${formatDuration(entry.endedAt - entry.startedAt)}`);
-			else if (entry.active && Date.now() - entry.startedAt >= 1000)
-				duration = theme.fg("warning", ` ${formatDuration(Date.now() - entry.startedAt, true)}`);
-		}
-		const prefix = `${mark} ${name}${duration}`;
-		const room = textWidth - visibleWidth(prefix) - 1;
-		const args = entry.args && room >= 8 ? theme.fg("muted", ` ${truncateInline(entry.args, room)}`) : "";
-		out.push(prefix + args);
+		out.push(toolPrefix(theme, entry, textWidth));
 		if (!full) {
 			if (out.length > 1) out.splice(out.length - 1, 0, "");
 			continue;
 		}
-		const content = (entry.output || "")
-			.split(/\r?\n/)
-			.map(line => line.trim())
-			.filter(Boolean);
-		if (content.length === 0) {
-			if (entry.active) out.push(theme.fg("dim", "  · …"));
-		} else {
-			const { shown, hidden } = outputPreview(content, previewCap);
-			for (const line of shown) out.push(theme.fg("toolOutput", `  · ${truncateInline(line, textWidth - 4)}`));
-			if (hidden > 0) out.push(theme.fg("dim", `  · +${hidden} more`));
-		}
-		if (entry.image) {
-			const dims = getImageDimensions(entry.image.data, entry.image.mimeType) ?? undefined;
-			out.push(theme.fg("toolOutput", `  · ${imageFallback(entry.image.mimeType, dims)}`));
-		}
-		if (entry.diff) {
-			out.push("");
-			for (const line of renderDiff(entry.diff, { theme }).split(/\r?\n/)) out.push(`    ${line}`);
-		}
+		out.push(...toolDetailLines(theme, entry, textWidth, previewCap));
+		out.push(...toolDiffLines(theme, entry.diff));
 	}
 	return out;
 }
@@ -493,46 +511,67 @@ interface FileEntry {
 const files = new Map<string, FileEntry>();
 let filesVersion = 0;
 
-function pathsFrom(toolName: string, input: Record<string, unknown>): { abs: string; op: string }[] {
-	const out: { abs: string; op: string }[] = [];
-	if (toolName === "bash") {
-		const command = typeof input.command === "string" ? input.command : "";
-		for (const raw of command.split(/\s+/)) {
-			// Both classes are anchored and single-width; sonarjs flags the `+$`
-			// suffix as super-linear, which does not apply to a one-character class.
-			// eslint-disable-next-line sonarjs/super-linear-regex
-			const token = raw.replace(/^[("'`]+/, "").replace(/[)"'`;:,]+$/, "");
-			if (!token || token.startsWith("-") || /[|&><`$*?]/.test(token)) continue;
-			try {
-				const abs = path.resolve(sessionCwd, token);
-				if (existsSync(abs) && statSync(abs).isFile()) out.push({ abs, op: "s" });
-			} catch {
-				/* skip unreadable tokens */
-			}
-		}
-		return out;
+/** One file a tool call touched. */
+interface PathHit {
+	abs: string;
+	op: string;
+}
+
+/** Every tool whose input names its single target under a fixed key, with the
+ * op letter recorded for it; the file need not exist (the tool acted on it). */
+const EXACT_PATH_TOOLS: Record<string, { keys: string[]; op: string } | undefined> = {
+	read: { keys: ["path"], op: "r" },
+	write: { keys: ["path"], op: "w" },
+	edit: { keys: ["path"], op: "w" },
+	ast_edit: { keys: ["path"], op: "w" },
+};
+/** Single-value keys of a tool with no fixed contract: the file must exist. */
+const GENERIC_PATH_KEYS = ["path", "filePath", "file_path", "imagePath"];
+/** List-valued spellings of the same idea. */
+const GENERIC_LIST_KEYS = ["paths", "files", "filePaths"];
+
+function addPathHit(out: PathHit[], value: unknown, op: string, unconditional: boolean): void {
+	if (typeof value !== "string" || !value) return;
+	try {
+		const abs = path.resolve(sessionCwd, value);
+		if (!unconditional && (!existsSync(abs) || !statSync(abs).isFile())) return;
+		out.push({ abs, op });
+	} catch {
+		/* skip */
 	}
-	const add = (value: unknown, op: string, unconditional: boolean) => {
-		if (typeof value !== "string" || !value) return;
+}
+
+/** Files named by a bash command line: its word tokens that resolve to files. */
+function bashPathHits(command: string): PathHit[] {
+	const out: PathHit[] = [];
+	for (const raw of command.split(/\s+/)) {
+		// Both classes are anchored and single-width; sonarjs flags the `+$`
+		// suffix as super-linear, which does not apply to a one-character class.
+		// eslint-disable-next-line sonarjs/super-linear-regex
+		const token = raw.replace(/^[("'`]+/, "").replace(/[)"'`;:,]+$/, "");
+		if (!token || token.startsWith("-") || /[|&><`$*?]/.test(token)) continue;
 		try {
-			const abs = path.resolve(sessionCwd, value);
-			if (!unconditional && (!existsSync(abs) || !statSync(abs).isFile())) return;
-			out.push({ abs, op });
+			const abs = path.resolve(sessionCwd, token);
+			if (existsSync(abs) && statSync(abs).isFile()) out.push({ abs, op: "s" });
 		} catch {
-			/* skip */
+			/* skip unreadable tokens */
 		}
-	};
-	if (toolName === "read") {
-		add(input.path, "r", true);
+	}
+	return out;
+}
+
+function pathsFrom(toolName: string, input: Record<string, unknown>): PathHit[] {
+	if (toolName === "bash") return bashPathHits(typeof input.command === "string" ? input.command : "");
+	const out: PathHit[] = [];
+	const exact = EXACT_PATH_TOOLS[toolName];
+	if (exact) {
+		for (const key of exact.keys) addPathHit(out, input[key], exact.op, true);
 		return out;
 	}
-	if (toolName === "write" || toolName === "edit" || toolName === "ast_edit") {
-		add(input.path, "w", true);
-		return out;
-	}
-	for (const key of ["path", "filePath", "file_path", "imagePath"]) add(input[key], "r", false);
-	for (const key of ["paths", "files", "filePaths"]) {
-		if (Array.isArray(input[key])) for (const value of input[key]) add(value, "r", false);
+	for (const key of GENERIC_PATH_KEYS) addPathHit(out, input[key], "r", false);
+	for (const key of GENERIC_LIST_KEYS) {
+		const value = input[key];
+		if (Array.isArray(value)) for (const item of value) addPathHit(out, item, "r", false);
 	}
 	return out;
 }
@@ -613,18 +652,21 @@ function bandDef(theme: Theme, id: "thinking" | "tools"): BandDef {
 	};
 }
 
+interface NewestRowsOptions {
+	items: string[];
+	textWidth: number;
+	maxRows: number;
+	style: (line: string) => string;
+	memo: Map<string, string[]>;
+	panel: string;
+}
+
 /**
  * Newest-first line wrapping: only the items that fill `maxRows` are wrapped,
  * so a long history costs nothing per frame. Returns rows oldest-first.
  */
-function newestRows(
-	items: string[],
-	textWidth: number,
-	maxRows: number,
-	style: (line: string) => string,
-	memo: Map<string, string[]>,
-	panel: string,
-): string[] {
+function newestRows(options: NewestRowsOptions): string[] {
+	const { items, textWidth, maxRows, style, memo, panel } = options;
 	const rows: string[] = [];
 	for (let i = items.length - 1; i >= 0 && rows.length < maxRows; i--) {
 		const item = items[i];
@@ -641,15 +683,18 @@ function newestRows(
 	return rows.reverse();
 }
 
+interface PanelOptions {
+	theme: Theme;
+	def: BandDef;
+	width: number;
+	bodyRows: number;
+	memo: Map<string, string[]>;
+}
+
 /** One framed panel: top border with title, exactly `bodyRows` body rows,
  * bottom border. Every line is exactly `width` display cells wide. */
-function renderPanel(
-	theme: Theme,
-	def: BandDef,
-	width: number,
-	bodyRows: number,
-	memo: Map<string, string[]>,
-): string[] {
+function renderPanel(options: PanelOptions): string[] {
+	const { theme, def, width, bodyRows, memo } = options;
 	const inner = Math.max(1, width - 2);
 	const label = truncateToWidth(
 		theme.fg(def.color, ` ${def.title} `) + (def.streaming() ? theme.fg("warning", "●") : ""),
@@ -662,7 +707,14 @@ function renderPanel(
 		theme.fg("border", "╮");
 	const bottom = theme.fg("border", `╰${"─".repeat(inner)}╯`);
 	const textWidth = Math.max(1, width - 3);
-	const visible = newestRows(def.lines(width, bodyRows), textWidth, bodyRows, def.style, memo, def.title);
+	const visible = newestRows({
+		items: def.lines(width, bodyRows),
+		textWidth,
+		maxRows: bodyRows,
+		style: def.style,
+		memo,
+		panel: def.title,
+	});
 	const bodyRow = (text: string) => {
 		// Clip, don't just pad: wrapped lines and empty-state hints can be
 		// wider than a narrow panel, and an over-wide row corrupts the frame.
@@ -700,6 +752,63 @@ function themeFingerprint(theme: Theme): string {
 	].join("|");
 }
 
+/** Panel widths: files keeps its dock, then thinking | tools split the
+ * remainder right-to-left; a lone panel takes the whole width. */
+function allocateWidths(width: number, ids: PanelId[], filesCols: number): Map<PanelId, number> {
+	const widths = new Map<PanelId, number>();
+	if (ids.length === 1) {
+		widths.set(ids[0], width);
+		return widths;
+	}
+	let remaining = width;
+	if (filesCols > 0) {
+		widths.set("files", filesCols);
+		remaining -= filesCols;
+	}
+	if (thinkingOn && toolsOn) {
+		const toolsWidth = bandToolsColsFor(remaining, toolsWidthPct);
+		widths.set("thinking", remaining - toolsWidth);
+		widths.set("tools", toolsWidth);
+	} else {
+		const only = thinkingOn ? "thinking" : "tools";
+		widths.set(only, remaining);
+	}
+	return widths;
+}
+
+/** Render the enabled panels and join them row by row into one band. */
+function composeColumns(theme: Theme, ids: PanelId[], widths: Map<PanelId, number>, bodyRows: number): string[] {
+	const parts = ids.map(id => {
+		// Every id has a width: allocateWidths sets each one it was given.
+		const panelWidth = widths.get(id) ?? 0;
+		if (id === "files") return filesPanelLines(theme, panelWidth, bandHeight);
+		return renderPanel({ theme, def: bandDef(theme, id), width: panelWidth, bodyRows, memo: bandMemo });
+	});
+	if (parts.length === 1) return parts[0];
+	return parts[0].map((line, index) => line + parts.slice(1).map(part => part[index] ?? "").join(""));
+}
+
+/** Enabled panel ids for this width, plus the files dock width (0 = no dock). */
+function panelLayout(width: number): { ids: PanelId[]; filesWidthCols: number } {
+	const ids: PanelId[] = [];
+	if (thinkingOn) ids.push("thinking");
+	if (toolsOn) ids.push("tools");
+	// A files column needs room for its frame plus something beside it.
+	const filesWidthCols =
+		filesOn && width >= MIN_TERM_WIDTH
+			? Math.max(MIN_DOCK_COLS, Math.min(dockColsFor(width, filesWidth), width - 40))
+			: 0;
+	if (filesWidthCols > 0) ids.push("files");
+	return { ids, filesWidthCols };
+}
+
+/** Files-only on a narrow terminal: keep the frame and say why. */
+function narrowFilesNotice(theme: Theme, width: number): string[] {
+	if (filesOn && !thinkingOn && !toolsOn)
+		return filesPanelLines(theme, width, bandHeight, `Files panel needs ≥${MIN_TERM_WIDTH} cols`);
+	return [];
+}
+
 function renderBand(theme: Theme, width: number, bodyRows: number, rows: number): string[] {
 	// Short terminals hide the band instead of squeezing the transcript.
 	if (rows - bandHeight < MIN_ROWS_BELOW_BAND) return [];
@@ -728,53 +837,11 @@ function renderBand(theme: Theme, width: number, bodyRows: number, rows: number)
 	].join(":");
 	if (key === bandCacheKey) return bandCache;
 
-	const ids: PanelId[] = [];
-	if (thinkingOn) ids.push("thinking");
-	if (toolsOn) ids.push("tools");
-	// A files column needs room for its frame plus something beside it.
-	const filesWidthCols =
-		filesOn && width >= MIN_TERM_WIDTH
-			? Math.max(MIN_DOCK_COLS, Math.min(dockColsFor(width, filesWidth), width - 40))
-			: 0;
-	if (filesWidthCols > 0) ids.push("files");
-	if (ids.length === 0) {
-		// Files-only on a narrow terminal: keep the frame and say why.
-		if (filesOn && !thinkingOn && !toolsOn)
-			return filesPanelLines(theme, width, bandHeight, `Files panel needs ≥${MIN_TERM_WIDTH} cols`);
-		return [];
-	}
+	const { ids, filesWidthCols } = panelLayout(width);
+	if (ids.length === 0) return narrowFilesNotice(theme, width);
 
-	let lines: string[];
-	if (ids.length === 1) {
-		const only = ids[0];
-		lines =
-			only === "files"
-				? filesPanelLines(theme, width, bandHeight)
-				: renderPanel(theme, bandDef(theme, only), width, bodyRows, bandMemo);
-	} else {
-		// Widths are allocated right to left: files keeps its dock width, then
-		// the thinking | tools split divides the remainder.
-		const widths = new Map<PanelId, number>();
-		let remaining = width;
-		if (filesWidthCols > 0) {
-			widths.set("files", filesWidthCols);
-			remaining -= filesWidthCols;
-		}
-		if (thinkingOn && toolsOn) {
-			const toolsWidth = bandToolsColsFor(remaining, toolsWidthPct);
-			widths.set("thinking", remaining - toolsWidth);
-			widths.set("tools", toolsWidth);
-		} else {
-			const only = thinkingOn ? "thinking" : "tools";
-			widths.set(only, remaining);
-		}
-		const parts = ids.map(id => {
-			const panelWidth = widths.get(id) ?? remaining;
-			if (id === "files") return filesPanelLines(theme, panelWidth, bandHeight);
-			return renderPanel(theme, bandDef(theme, id), panelWidth, bodyRows, bandMemo);
-		});
-		lines = parts[0].map((line, index) => line + parts.slice(1).map(part => part[index] ?? "").join(""));
-	}
+	const widths = allocateWidths(width, ids, filesWidthCols);
+	const lines = composeColumns(theme, ids, widths, bodyRows);
 	bandCacheKey = key;
 	bandCache = lines;
 	return lines;
@@ -802,6 +869,121 @@ class BandHub implements Component {
 
 // ─── files panel (band column) ──────────────────────────────────────────────
 
+/** Framed files-panel row: border, right-padded content, border. */
+function filesRow(theme: Theme, inner: number, content: string): string {
+	const clipped = truncateToWidth(content, inner);
+	return (
+		theme.fg("border", "│") +
+		clipped +
+		" ".repeat(Math.max(0, inner - visibleWidth(clipped))) +
+		theme.fg("border", "│")
+	);
+}
+
+/** One file row (indented under a group header, or at list level) plus count. */
+function fileEntryRow(
+	theme: Theme,
+	inner: number,
+	entry: FileEntry,
+	indent: string,
+): { line: string; files: number } {
+	const count = entry.count > 1 ? `×${entry.count}` : "";
+	const meta = theme.fg("muted", `${entry.ops}${count}`);
+	return {
+		line: filesRow(theme, inner, `${indent}${meta} ${theme.fg("text", sanitizeText(path.basename(entry.path)))}`),
+		files: 1,
+	};
+}
+
+/** Rows for one contiguous directory run: a header row when the run is long
+ * enough to group (`files: 0`), then its indented files (`files: 1`). */
+function fileRunRows(
+	theme: Theme,
+	inner: number,
+	dir: string,
+	run: FileEntry[],
+): { line: string; files: number }[] {
+	if (run.length <= 3) return run.map(entry => fileEntryRow(theme, inner, entry, " "));
+	const label = sanitizeText(displayPath(dir));
+	const groupTitle = label === "." ? "./" : `${label}/`;
+	return [
+		{ line: filesRow(theme, inner, ` ${theme.fg("accent", groupTitle)}`), files: 0 },
+		...run.map(entry => fileEntryRow(theme, inner, entry, "   ")),
+	];
+}
+
+/** Grouped file rows, newest first. */
+function fileRows(theme: Theme, inner: number, entries: FileEntry[]): { line: string; files: number }[] {
+	const rows: { line: string; files: number }[] = [];
+	let i = 0;
+	while (i < entries.length) {
+		const dir = path.dirname(entries[i].path);
+		let j = i;
+		while (j < entries.length && path.dirname(entries[j].path) === dir) j++;
+		rows.push(...fileRunRows(theme, inner, dir, entries.slice(i, j)));
+		i = j;
+	}
+	return rows;
+}
+
+/** List body: slot budget, "… +N more" marker, legend. Not padded. */
+function filesBody(theme: Theme, inner: number, listRows: number, entries: FileEntry[]): string[] {
+	const rows = fileRows(theme, inner, entries);
+	// One row is kept back for the legend; the "… more" marker only costs a row
+	// when the list really is truncated, so a short band still shows its files.
+	const entrySlots = Math.max(1, listRows - 1);
+	const truncated = rows.length > entrySlots;
+	let take = truncated ? Math.max(0, entrySlots - 1) : rows.length;
+	if (truncated && take === 0) take = entrySlots;
+	const shown = rows.slice(0, take);
+	// Never end the list on a directory header whose files were cut off.
+	while (shown.length > 0 && shown[shown.length - 1].files === 0) shown.pop();
+
+	const body: string[] = [];
+	let filesShown = 0;
+	for (const entry of shown) {
+		body.push(entry.line);
+		filesShown += entry.files;
+	}
+	if (entries.length === 0) body.push(filesRow(theme, inner, ` ${theme.fg("dim", "No files touched yet")}`));
+	else if (entries.length > filesShown && body.length < listRows) {
+		const hiddenFiles = `… +${entries.length - filesShown} more`;
+		body.push(filesRow(theme, inner, ` ${theme.fg("dim", hiddenFiles)}`));
+	}
+	if (body.length < listRows) body.push(filesRow(theme, inner, ` ${theme.fg("dim", LEGEND)}`));
+	return body;
+}
+
+/** Diff subpanel: separator, title, rendered diff (or "No edit yet"), padded to
+ * `diffRows + 2`. Returns `[]` when `enabled` is false. */
+function filesDiffBody(theme: Theme, inner: number, diffRows: number, enabled: boolean): string[] {
+	if (!enabled) return [];
+	const body: string[] = [];
+	body.push(theme.fg("border", `├${"─".repeat(inner)}┤`));
+	const title = editDiff.path
+		? theme.fg("accent", ` ✎ ${truncateToWidth(sanitizeText(displayPath(editDiff.path)), inner - 4)} `)
+		: theme.fg("dim", " Last Edit ");
+	body.push(
+		theme.fg("border", "│") +
+			title +
+			theme.fg("border", "─".repeat(Math.max(0, inner - visibleWidth(title)))) +
+			theme.fg("border", "│"),
+	);
+	if (editDiff.diff) {
+		const rendered = renderDiff(editDiff.diff, { theme, filePath: editDiff.path }).split(/\r?\n/);
+		const shown = rendered.slice(0, Math.max(0, diffRows - 1));
+		for (const line of shown) body.push(filesRow(theme, inner, ` ${line}`));
+		if (rendered.length > shown.length && diffRows > 0) {
+			const hiddenLines = `… +${rendered.length - shown.length} more`;
+			body.push(filesRow(theme, inner, ` ${theme.fg("dim", hiddenLines)}`));
+		}
+	} else if (diffRows > 0) {
+		body.push(filesRow(theme, inner, ` ${theme.fg("dim", "No edit yet")}`));
+	}
+	while (body.length < diffRows + 2) body.push(filesRow(theme, inner, ""));
+	return body;
+}
+
 /**
  * Framed files panel: touched files plus the edit-diff subpanel, sized to the
  * band. It is a band column rather than a floating dock: omp composites
@@ -815,105 +997,24 @@ class BandHub implements Component {
  */
 function filesPanelLines(theme: Theme, width: number, height: number, notice?: string): string[] {
 	const inner = Math.max(1, width - 2);
-	const pad = (text: string) => text + " ".repeat(Math.max(0, inner - visibleWidth(text)));
-	const row = (content: string) =>
-		theme.fg("border", "│") + pad(truncateToWidth(content, inner)) + theme.fg("border", "│");
-
 	const entries = recentEntries();
 	// A tall enough panel splits into list and diff; a short one keeps the list.
 	const withDiff = showDiff && height >= 10;
 	const listRows = withDiff ? Math.max(3, Math.floor(height / 2) - 4) : Math.max(1, height - 4);
 	const diffRows = withDiff ? Math.max(0, height - listRows - 6) : 0;
 
-	const meta = (entry: FileEntry) => {
-		const count = entry.count > 1 ? `×${entry.count}` : "";
-		return theme.fg("muted", `${entry.ops}${count}`);
-	};
+	const body: string[] = notice
+		? [filesRow(theme, inner, ` ${theme.fg("dim", truncateInline(notice, Math.max(1, inner - 2)))}`)]
+		: filesBody(theme, inner, listRows, entries);
+	while (body.length < listRows) body.push(filesRow(theme, inner, ""));
 
-	const rows: { line: string; files: number }[] = [];
-	let i = 0;
-	while (i < entries.length) {
-		const dir = path.dirname(entries[i].path);
-		let j = i;
-		while (j < entries.length && path.dirname(entries[j].path) === dir) j++;
-		const run = entries.slice(i, j);
-		if (run.length > 3) {
-			const label = sanitizeText(displayPath(dir));
-			const groupTitle = label === "." ? "./" : `${label}/`;
-			rows.push({
-				line: row(` ${theme.fg("accent", groupTitle)}`),
-				files: 0,
-			});
-			for (const entry of run)
-				rows.push({ line: row(`   ${meta(entry)} ${theme.fg("text", sanitizeText(path.basename(entry.path)))}`), files: 1 });
-		} else {
-			for (const entry of run)
-				rows.push({ line: row(` ${meta(entry)} ${theme.fg("text", sanitizeText(path.basename(entry.path)))}`), files: 1 });
-		}
-		i = j;
-	}
-
-	// One row is kept back for the legend; the "… more" marker only costs a row
-	// when the list really is truncated, so a short band still shows its files.
-	const entrySlots = Math.max(1, listRows - 1);
-	const truncated = rows.length > entrySlots;
-	let take = truncated ? Math.max(0, entrySlots - 1) : rows.length;
-	if (truncated && take === 0) take = entrySlots;
-	const shown = rows.slice(0, take);
-	// Never end the list on a directory header whose files were cut off.
-	while (shown.length > 0 && shown[shown.length - 1].files === 0) shown.pop();
-
-	const body: string[] = [];
-	if (notice) {
-		body.push(row(` ${theme.fg("dim", truncateInline(notice, Math.max(1, inner - 2)))}`));
-	} else {
-		let filesShown = 0;
-		for (const entry of shown) {
-			body.push(entry.line);
-			filesShown += entry.files;
-		}
-		if (entries.length === 0) body.push(row(` ${theme.fg("dim", "No files touched yet")}`));
-		else if (entries.length > filesShown && body.length < listRows) {
-			const hiddenFiles = `… +${entries.length - filesShown} more`;
-			body.push(row(` ${theme.fg("dim", hiddenFiles)}`));
-		}
-		if (body.length < listRows) body.push(row(` ${theme.fg("dim", LEGEND)}`));
-	}
-	while (body.length < listRows) body.push(row(""));
-
-	const diffBody: string[] = [];
-	if (withDiff) {
-		diffBody.push(theme.fg("border", `├${"─".repeat(inner)}┤`));
-		const title = editDiff.path
-			? theme.fg("accent", ` ✎ ${truncateToWidth(sanitizeText(displayPath(editDiff.path)), inner - 4)} `)
-			: theme.fg("dim", " Last Edit ");
-		diffBody.push(
-			theme.fg("border", "│") +
-				title +
-				theme.fg("border", "─".repeat(Math.max(0, inner - visibleWidth(title)))) +
-				theme.fg("border", "│"),
-		);
-		if (editDiff.diff) {
-			const rendered = renderDiff(editDiff.diff, { theme, filePath: editDiff.path }).split(/\r?\n/);
-			const shown = rendered.slice(0, Math.max(0, diffRows - 1));
-			for (const line of shown) diffBody.push(row(` ${line}`));
-			if (rendered.length > shown.length && diffRows > 0) {
-				const hiddenLines = `… +${rendered.length - shown.length} more`;
-				diffBody.push(row(` ${theme.fg("dim", hiddenLines)}`));
-			}
-		} else if (diffRows > 0) {
-			diffBody.push(row(` ${theme.fg("dim", "No edit yet")}`));
-		}
-		while (diffBody.length < diffRows + 2) diffBody.push(row(""));
-	}
-
-	const filesTitle = `📂 Files (${entries.length})`;
+	const title = `📂 Files (${entries.length})`;
 	return [
 		theme.fg("border", `╭${"─".repeat(inner)}╮`),
-		row(` ${theme.fg("accent", filesTitle)}`),
+		filesRow(theme, inner, ` ${theme.fg("accent", title)}`),
 		theme.fg("border", `├${"─".repeat(inner)}┤`),
 		...body,
-		...diffBody,
+		...filesDiffBody(theme, inner, diffRows, withDiff),
 		theme.fg("border", `╰${"─".repeat(inner)}╯`),
 	];
 }
@@ -1033,6 +1134,37 @@ function scheduleVisibilitySync(): void {
 
 // ─── branch reconstruction ───────────────────────────────────────────────────
 
+type BranchMessage = SessionMessageEntry["message"];
+type AssistantBranchMessage = Extract<BranchMessage, { role: "assistant" }>;
+type ToolResultBranchMessage = Extract<BranchMessage, { role: "toolResult" }>;
+
+/** Replay one assistant message: collect thinking text, rebuild its tool calls. */
+function replayAssistant(msg: AssistantBranchMessage, thoughts: string[]): void {
+	for (const block of msg.content) {
+		if (block.type === "thinking" && typeof block.thinking === "string") thoughts.push(block.thinking);
+		if (block.type !== "toolCall") continue;
+		try {
+			// Rebuild through the same ingest path live events use.
+			ingestToolCall(block.id, block.name, block.arguments);
+			record(block.name, block.arguments ?? {});
+		} catch {
+			/* skip malformed call */
+		}
+	}
+}
+
+/** Replay one tool result through the live ingest path, and apply an edit diff. */
+function replayToolResult(msg: ToolResultBranchMessage): void {
+	try {
+		ingestToolResult(msg.toolCallId, msg, msg.isError);
+		const details = isRecord(msg.details) ? msg.details : {};
+		if (msg.toolName === "edit" && typeof details.diff === "string" && details.diff)
+			setEditDiff(typeof details.path === "string" ? details.path : editDiff.path, details.diff);
+	} catch {
+		/* skip malformed result */
+	}
+}
+
 function reconstruct(ctx: ExtensionContext): void {
 	thinking.reset();
 	toolsBy.clear();
@@ -1047,29 +1179,8 @@ function reconstruct(ctx: ExtensionContext): void {
 	for (const entry of ctx.sessionManager.getBranch()) {
 		if (entry.type !== "message") continue;
 		const msg = entry.message;
-		if (msg.role === "assistant") {
-			for (const block of msg.content) {
-				if (block.type === "thinking" && typeof block.thinking === "string") thoughts.push(block.thinking);
-				if (block.type !== "toolCall") continue;
-				try {
-					// Rebuild through the same ingest path live events use.
-					ingestToolCall(block.id, block.name, block.arguments);
-					record(block.name, block.arguments ?? {});
-				} catch {
-					/* skip malformed call */
-				}
-			}
-			continue;
-		}
-		if (msg.role !== "toolResult") continue;
-		try {
-			ingestToolResult(msg.toolCallId, msg, msg.isError);
-			const details = isRecord(msg.details) ? msg.details : {};
-			if (msg.toolName === "edit" && typeof details.diff === "string" && details.diff)
-				setEditDiff(typeof details.path === "string" ? details.path : editDiff.path, details.diff);
-		} catch {
-			/* skip malformed result */
-		}
+		if (msg.role === "assistant") replayAssistant(msg, thoughts);
+		else if (msg.role === "toolResult") replayToolResult(msg);
 	}
 	if (thoughts.length) {
 		for (const text of thoughts) thinking.blocks.push({ lines: text.split(/\r?\n/), tail: "" });
@@ -1091,14 +1202,19 @@ export default function splitView(pi: ExtensionAPI): void {
 		default: false,
 	});
 
-	const requireTui = (ctx: ExtensionContext): boolean => {
-		if (ctx.mode !== "tui") {
-			notify("Split view requires the interactive TUI", "error");
-			return false;
-		}
-		return true;
-	};
+	registerEvents(pi);
+	registerCommands(pi);
+}
 
+function requireTui(ctx: ExtensionContext): boolean {
+	if (ctx.mode !== "tui") {
+		notify("Split view requires the interactive TUI", "error");
+		return false;
+	}
+	return true;
+}
+
+function registerEvents(pi: ExtensionAPI): void {
 	pi.on("session_start", (_event, ctx) => {
 		notifyFn = (message, level) => ctx.ui.notify(message, level);
 		themeGetter = () => ctx.ui.theme;
@@ -1202,7 +1318,14 @@ export default function splitView(pi: ExtensionAPI): void {
 		unmountWidget(ctx);
 		notifyFn = null;
 	});
+}
 
+function registerCommands(pi: ExtensionAPI): void {
+	registerPanelToggles(pi);
+	registerBandSettings(pi);
+}
+
+function registerPanelToggles(pi: ExtensionAPI): void {
 	// ── panel toggles ──
 
 	pi.registerCommand("split", {
@@ -1288,7 +1411,9 @@ export default function splitView(pi: ExtensionAPI): void {
 			notify(`Edit diff ${showDiff ? "on" : "off"}`);
 		},
 	});
+}
 
+function registerBandSettings(pi: ExtensionAPI): void {
 	pi.registerCommand("split-tools-view", {
 		description: "Toggle tool panel compact ↔ full detail",
 		handler: async (_args, ctx) => {
