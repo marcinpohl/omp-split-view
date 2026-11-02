@@ -26,6 +26,7 @@
 		"lint:fix": "eslint . --fix",
 		"test:coverage": "bun test --coverage --coverage-reporter=text --coverage-reporter=lcov && bun scripts/check-coverage.ts",
 		"check:package": "bun scripts/check-package.ts",
+		"prepack": "bun run check:package",
 		"prepublishOnly": "bun run check:package"
 	},
 	"license": "MIT",

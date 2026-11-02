@@ -250,11 +250,19 @@ working once that tag's workflow has completed.
 The packed file set is installable as published — verified for this tree:
 
 ```sh
-bun pm pack                              # 6 files: package.json, LICENSE, README, 3 modules
+bun pm pack                              # runs check:package (scripts.prepack),
+                                         # then packs 6 files: package.json,
+                                         # LICENSE, README, 3 modules
 mkdir -p /tmp/omp-pkg && tar -xzf *.tgz -C /tmp/omp-pkg
 omp plugin install /tmp/omp-pkg/package  # a .tgz path is read as a directory (ENOTDIR)
-omp plugin list && omp plugin doctor     # lists @marcinpohl/omp-split-view, status ok
+omp plugin list && omp plugin doctor     # lists @marcinpohl/omp-split-view, v0.1.0, status ok
 ```
+
+The packed entry itself was loaded against the host API surface as well: importing
+`./split-view.ts` from the extracted package registers 11 event handlers and 11
+slash commands and re-exports the four state seams. `check-package` (and therefore
+`bun pm pack`) fails if any module reachable from `omp.extensions` is missing from
+`files`, or if a bare import is not declared as a dependency or peer.
 
 `omp plugin install` links a local directory and a published install copies
 files into `~/.omp/plugins/node_modules`, so the extracted tarball is the
@@ -277,9 +285,9 @@ Bun instruments TypeScript directly (no istanbul/nyc/`--experimental` flags)
 and writes an lcov report; `scripts/check-coverage.ts` parses it and fails the
 command below `lines = 99%` / `functions = 90%` (override with
 `COVERAGE_LINES` / `COVERAGE_FUNCTIONS`). Test fixtures are excluded from the
-totals. Current: 99.93% lines / 97.55% functions — the only uncovered line is
+totals. Current: 99.93% lines / 97.66% functions — the only uncovered line is
 the `themeGetter` default that throws before `session_start` binds a theme, and
-of 164 counted functions four are missed: that same throwing default,
+of 172 counted functions four are missed: that same throwing default,
 `BandHub.dispose`, and the two no-op default exports that exist so omp's
 extension auto-discovery does not report a load error.
 
