@@ -316,9 +316,9 @@ Bun instruments TypeScript directly (no istanbul/nyc/`--experimental` flags)
 and writes an lcov report; `scripts/check-coverage.ts` parses it and fails the
 command below `lines = 99%` / `functions = 90%` (override with
 `COVERAGE_LINES` / `COVERAGE_FUNCTIONS`). Test fixtures are excluded from the
-totals. Current: 99.93% lines / 97.66% functions — the only uncovered line is
+totals. Current: 99.94% lines / 97.95% functions — the only uncovered line is
 the `themeGetter` default that throws before `session_start` binds a theme, and
-of 172 counted functions four are missed: that same throwing default,
+of 196 counted functions four are missed: that same throwing default,
 `BandHub.dispose`, and the two no-op default exports that exist so omp's
 extension auto-discovery does not report a load error.
 
