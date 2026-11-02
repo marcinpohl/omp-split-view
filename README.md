@@ -95,10 +95,11 @@ interrupted write cannot leave truncated JSON that would load as defaults.
   the first paint.
 - **Tool Usage panel** — every tool call with status, duration (live elapsed
   counter while running), compact or full detail, and its output preview
-  (the newest lines, with a `+N earlier lines` count above them). Both counts
-  describe the whole result, not just the retained window. Full-mode detail is
-  budgeted to the band: the card keeps its own row and closes with
-  `+N more detail rows` instead of pushing that row off the top.
+  (the newest lines, with a `+N earlier lines` count above them). The
+  earlier-lines count covers the whole result, not just the retained window.
+  Full-mode detail is budgeted to the band: the card keeps its own row and
+  closes with `+N more detail rows` — the card rows the band withheld — instead
+  of pushing that row off the top.
   History is rebuilt from the session branch on resume/branch switch. Image
   results (e.g. `read` on a PNG) render as a one-line text fallback in the
   band; omp's transcript still renders them inline.
@@ -277,8 +278,10 @@ and writes an lcov report; `scripts/check-coverage.ts` parses it and fails the
 command below `lines = 99%` / `functions = 90%` (override with
 `COVERAGE_LINES` / `COVERAGE_FUNCTIONS`). Test fixtures are excluded from the
 totals. Current: 99.93% lines / 97.55% functions — the only uncovered line is
-the `themeGetter` default that throws before `session_start` binds a theme; the
-uncovered functions are no-op extension exports.
+the `themeGetter` default that throws before `session_start` binds a theme, and
+of 164 counted functions four are missed: that same throwing default,
+`BandHub.dispose`, and the two no-op default exports that exist so omp's
+extension auto-discovery does not report a load error.
 
 ### Linting and complexity metrics
 

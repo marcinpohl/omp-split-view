@@ -44,7 +44,7 @@ targets control characters.
   excluded as the gate does). The four misses are the throwing `themeGetter`
   default, `BandHub.dispose` (no-op host hook), and the two no-op default
   exports that exist so omp's extension auto-discovery does not report a load
-  error (`helpers.ts:310`, `ui-panels-config.ts:171`). Bun 1.4's lcov omits the
+  error (`helpers.ts:310`, `ui-panels-config.ts:174`). Bun 1.4's lcov omits the
   per-function `FN`/`FNDA` records, so those identities come from reading the
   four sites; only the totals come from the report. Every helper extracted by
   Q1–Q7 plus the split-view batch (`capDiffText`, `imageLabel`,
