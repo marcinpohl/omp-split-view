@@ -137,6 +137,44 @@ Fixed during the advisor-compatibility pass (A1 in `CODE_QUALITY.md`):
   band byte-identical, the band equals the main-only subsequence of any
   interleaving, and the tally matches an independent model live and replayed.
 
+Fixed during the 2026-11-02 audit pass (R4 in `CODE_QUALITY.md`):
+
+- **A tall card pushed its own row off the band.** `toolLines` built every
+  card and let `newestRows` keep the newest wrapped rows, so at band 20 a
+  200-line diff rendered only mid-diff rows — no tool name. Cards are budgeted
+  newest-first against the rows left (`toolCardBody`), the identity row always
+  comes out of that budget, and omitted detail closes with `+N more detail
+  rows`; `toolPrefix`/`toolDiffLines` truncate to the column so a card's row
+  count is knowable before it is placed. Acceptance: the band contains `edit`
+  and `+136 more detail rows` at exactly 20 rows; a 4-row body keeps `bash`,
+  `+3 earlier lines` and `+6 more detail rows`. Property: 0–200 diff lines ×
+  6–40 row bands keep the row, the exact height and the exact width. Mutation:
+  an unbudgeted `rows.push(...detail)` fails all three.
+- **`+N earlier lines` described the character cap, not the result.** The
+  marker counted the retained 32 KiB window, so a 40,000-line result reported
+  `+4675`. `resultText` now returns the reported text uncapped and
+  `setToolOutput(..., countAll)` counts every non-empty line once at ingest;
+  streaming updates still count only their window (one sanitize pass over the
+  partial, as before). Acceptance: `+39998 earlier lines` for 40,000 lines.
+  Property: 0–25,000 lines × 18–60 row bands — the newest `min(cap, total)`
+  render, the oldest and the boundary line do not, the marker equals
+  `total − shown`. Mutation: `capToolText` back in `resultText`.
+- **`/split` ON restored the panel booleans only.** A layout saved at 24 rows /
+  45 % / 60 cols / `4k` came back at the live size (8 rows / 60 %).
+  `applySavedMetrics`, shared with `session_start`, adopts `toolMode`,
+  `bandHeight` and whether it is pinned, `geometry`, `toolsWidthPct` and
+  `filesWidth`; the nothing-saved fallback keeps the live size. Acceptance:
+  save → diverge (8 rows / 60 % / `wide` / compact) → off → on restores 24
+  rows, `[0, 33, 60]`, full-mode output, no diff subpanel, and the
+  argument-less `/split-geometry` flips `4k → wide`. Mutation: dropping the
+  call leaves 8 rows.
+- **One settings exception disabled transcript hiding for the process.** A
+  throwing settings object latched `visibilityUnsupported`, so no later
+  `session_start` retried the switches. `session_start` clears the latch; the
+  in-session latch that stops repeated throwing stays. Acceptance: after the
+  unsupported-settings test, `session_start` with `trimResponse: true` gives
+  `display.hideToolActivity === true`. Mutation: dropping the reset.
+
 ## Decision before W1 (resolved)
 
 Fresh-install behaviour stays **bare** (`normalizeConfig({})` → `split:false`).
