@@ -1,10 +1,14 @@
 /**
- * Property-based tests (fast-check) for the pure helpers and the config
- * normalizer: invariants hold for arbitrary input, not just pinned examples.
+ * Property-based tests (fast-check) for the observable helpers — text
+ * pipelines, capped windows, framed rows — and the config normalizer: their
+ * invariants hold for arbitrary input, not just pinned examples. This is the
+ * only home for property tests; `helpers.test.ts` pins concrete examples.
  * Fixed seeds keep failures reproducible.
  */
 import { describe, expect, test } from "bun:test";
 import * as fc from "fast-check";
+import { visibleWidth } from "@oh-my-pi/pi-tui";
+import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import {
 	AUTO_DOCK_MAX_COLS,
 	AUTO_DOCK_MIN_COLS,
@@ -22,9 +26,13 @@ import {
 	defaultBandHeight,
 	dockColsFor,
 	formatDuration,
+	framedRow,
 	isHighSurrogate,
 	isLowSurrogate,
 	lastImageBlock,
+	nonEmptyLines,
+	resultText,
+	resultTextTail,
 	sanitizeText,
 	transcriptVisibility,
 	truncateInline,
@@ -454,5 +462,238 @@ describe("normalizeConfig", () => {
 			expect(cfg.toolsWidthPct).toBe(35);
 			expect(cfg.filesWidth).toBeNull();
 		}
+	});
+});
+
+/** Text a frame actually receives: the extension sanitizes before a row, so no
+ * escapes or controls (they would be width-invisible across the pad). */
+const FRAME_CONTENT = fc
+	.array(
+		fc.constantFrom("", " ", "a", "word", "📂 Files (12)", "漢字", "e\u0301", "-".repeat(37), "x y z", "  pad  "),
+		{ maxLength: 8 },
+	)
+	.map(parts => parts.join(""));
+
+/** Identity colorizer: frame geometry is measurable without a live theme. */
+const flatFrameTheme = { fg: (_color: string, text: string) => text } as unknown as Theme;
+
+describe("framedRow", () => {
+	test("every row is exactly inner + 2 cells and never wraps", () => {
+		fc.assert(
+			fc.property(fc.integer({ min: 0, max: 80 }), FRAME_CONTENT, (inner, content) => {
+				const row = framedRow(flatFrameTheme, inner, content);
+				expect(visibleWidth(row)).toBe(inner + 2);
+				expect(row).not.toContain("\n");
+				expect(row.startsWith("│")).toBe(true);
+				expect(row.endsWith("│")).toBe(true);
+			}),
+			{ numRuns: 300, seed: SEED },
+		);
+	});
+
+	test("a rule is its content plus fill, and clipping never overflows", () => {
+		fc.assert(
+			fc.property(
+				fc.integer({ min: 0, max: 40 }),
+				FRAME_CONTENT,
+				fc.record({
+					fill: fc.constantFrom("─", "·", " "),
+					left: fc.constantFrom("╭", "├", "│", "╰"),
+					right: fc.constantFrom("╮", "┤", "│", "╯"),
+				}),
+				(inner, content, { fill, left, right }) => {
+					const row = framedRow(flatFrameTheme, inner, content, { fill, left, right });
+					const middle = row.slice(1, -1);
+					expect(visibleWidth(row)).toBe(inner + 2);
+					expect(visibleWidth(middle)).toBe(inner);
+					const contentWidth = visibleWidth(content);
+					// Within the frame the content is kept verbatim; past it, clipped.
+					if (contentWidth <= inner) expect(middle).toBe(content + fill.repeat(inner - contentWidth));
+					else expect(middle).not.toBe(content);
+				},
+			),
+			{ numRuns: 300, seed: SEED },
+		);
+	});
+
+	test("the borders and a non-space fill carry the border colour", () => {
+		fc.assert(
+			fc.property(fc.integer({ min: 1, max: 30 }), fc.constantFrom("─", "━", "·"), (inner, fill) => {
+				const colors: string[] = [];
+				const theme = {
+					fg: (color: string, text: string) => {
+						colors.push(color);
+						return `<${text}>`;
+					},
+				} as unknown as Theme;
+				const row = framedRow(theme, inner, "", { fill, left: "├", right: "┤" });
+				// A bare rule would leave the dashes uncoloured with a real theme.
+				expect(row).toBe(`<├><${fill.repeat(inner)}><┤>`);
+				expect(colors).toEqual(["border", "border", "border"]);
+			}),
+			{ numRuns: 100, seed: SEED },
+		);
+	});
+});
+
+describe("nonEmptyLines", () => {
+	/** Independent formulation: normalize CRLF, then keep trimmed non-blanks. */
+	const oracle = (text: string): string[] => {
+		const out: string[] = [];
+		for (const line of text.replace(/\r\n/g, "\n").split("\n")) {
+			const trimmed = line.trim();
+			if (trimmed !== "") out.push(trimmed);
+		}
+		return out;
+	};
+
+	test("equals the trimmed, non-blank lines of the text", () => {
+		fc.assert(
+			fc.property(fc.string({ unit: "binary" }), text => {
+				expect(nonEmptyLines(text)).toEqual(oracle(text));
+			}),
+			{ numRuns: 300, seed: SEED },
+		);
+	});
+
+	test("is idempotent and yields only trimmed, non-blank, control-free lines", () => {
+		fc.assert(
+			fc.property(fc.string({ unit: "binary" }), text => {
+				const lines = nonEmptyLines(sanitizeText(text));
+				for (const line of lines) {
+					expect(line).toBe(line.trim());
+					expect(line.length).toBeGreaterThan(0);
+					expect(line).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/);
+				}
+				expect(nonEmptyLines(lines.join("\n"))).toEqual(lines);
+			}),
+			{ numRuns: 300, seed: SEED },
+		);
+	});
+});
+
+/** One tool-result content block: well-formed text, a non-text block, or junk. */
+const CONTENT_BLOCK = fc.oneof(
+	fc.record({ type: fc.constant("text"), text: fc.string({ unit: "binary" }) }),
+	fc.record({ type: fc.constantFrom("image", "toolCall", "thinking"), data: fc.string({ unit: "binary" }) }),
+	fc.record({ type: fc.constant("text") }),
+	fc.string({ unit: "binary" }),
+	fc.constant(null),
+	fc.constant(42),
+);
+
+type TextBlock = { type: "text"; text: string };
+
+const isTextBlock = (block: unknown): block is TextBlock =>
+	typeof block === "object" &&
+	block !== null &&
+	(block as { type?: unknown }).type === "text" &&
+	typeof (block as { text?: unknown }).text === "string";
+
+describe("resultText", () => {
+	test("joins the text blocks in order and ignores every other block", () => {
+		fc.assert(
+			fc.property(fc.array(CONTENT_BLOCK, { maxLength: 8 }), blocks => {
+				const text = resultText({ content: blocks });
+				const texts = blocks.filter(isTextBlock).map(block => block.text);
+				// Non-text blocks contribute nothing: dropping them changes no byte.
+				expect(resultText({ content: texts.map(t => ({ type: "text", text: t })) })).toBe(text);
+				expect(text.length).toBe(texts.reduce((sum, t) => sum + t.length, 0));
+				// Ordered concatenation, checked by scanning rather than joining.
+				let at = 0;
+				for (const t of texts) {
+					expect(text.indexOf(t, at)).toBe(at);
+					at += t.length;
+				}
+			}),
+			{ numRuns: 300, seed: SEED },
+		);
+	});
+
+	test("a string is itself, and a missing, non-string or non-array content is empty", () => {
+		fc.assert(
+			fc.property(
+				fc.string({ unit: "binary" }),
+				fc.oneof(fc.constant(undefined), fc.integer(), fc.constant(null), fc.record({ a: fc.integer() })),
+				(text, content) => {
+					expect(resultText(text)).toBe(text);
+					expect(resultText({ content: text })).toBe(text);
+					expect(resultText({ content: [{ type: "text", text }] })).toBe(text);
+					expect(resultText({ content })).toBe("");
+				},
+			),
+			{ numRuns: 300, seed: SEED },
+		);
+	});
+});
+
+/** Arbitrary text cut into the blocks a tool result may arrive in. */
+const SPLIT_TEXT = fc
+	.tuple(fc.string({ unit: "binary" }), fc.array(fc.nat({ max: 8 }), { maxLength: 4 }))
+	.map(([text, cuts]) => {
+		const points = [...new Set(cuts.map(cut => cut % (text.length + 1)))].sort((a, b) => a - b);
+		const blocks: string[] = [];
+		let at = 0;
+		for (const point of [...points, text.length]) {
+			const part = text.slice(at, point);
+			if (part !== "") blocks.push(part);
+			at = point;
+		}
+		return { text, blocks };
+	});
+
+describe("resultTextTail", () => {
+	test("is the newest window of resultText, code-point aligned", () => {
+		fc.assert(
+			fc.property(SPLIT_TEXT, fc.integer({ min: 0, max: 60 }), ({ text, blocks }, cap) => {
+				const content = blocks.map(t => ({ type: "text", text: t }));
+				const full = resultText({ content });
+				const tail = resultTextTail({ content }, cap);
+				expect(full).toBe(text);
+				expect(tail.length).toBeLessThanOrEqual(cap);
+				if (cap >= full.length) {
+					// Inside the cap the two helpers are interchangeable.
+					expect(tail).toBe(full);
+				} else {
+					expect(full.endsWith(tail)).toBe(true);
+					// A cut never leaves an orphan low surrogate at the front.
+					if (tail.length > 0) expect(isLowSurrogate(tail.charCodeAt(0))).toBe(false);
+				}
+			}),
+			{ numRuns: 400, seed: SEED },
+		);
+	});
+
+	test("does not depend on how the text is split into blocks", () => {
+		fc.assert(
+			fc.property(SPLIT_TEXT, fc.integer({ min: 0, max: 60 }), ({ text, blocks }, cap) => {
+				const blockTail = resultTextTail({ content: blocks.map(t => ({ type: "text", text: t })) }, cap);
+				expect(blockTail).toBe(resultTextTail(text, cap));
+				expect(blockTail).toBe(resultTextTail({ content: [{ type: "text", text }] }, cap));
+			}),
+			{ numRuns: 400, seed: SEED },
+		);
+	});
+
+	test("a non-positive cap and junk shapes yield nothing", () => {
+		fc.assert(
+			fc.property(
+				fc.oneof(fc.string({ unit: "binary" }), fc.constant(null), fc.integer()),
+				fc.integer({ min: -50, max: 0 }),
+				(result, cap) => {
+					expect(resultTextTail(result, cap)).toBe("");
+				},
+			),
+			{ numRuns: 200, seed: SEED },
+		);
+		fc.assert(
+			fc.property(
+				fc.oneof(fc.constant(undefined), fc.integer(), fc.constant(null), fc.record({ a: fc.integer() })),
+				content => {
+					expect(resultTextTail({ content }, 40)).toBe("");
+				},
+			),
+			{ numRuns: 100, seed: SEED },
+		);
 	});
 });

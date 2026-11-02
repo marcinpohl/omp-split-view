@@ -1,9 +1,18 @@
 /**
- * helpers.ts — pure, side-effect-free helpers for split-view.ts (unit-tested
- * in test/helpers.test.ts). No host imports at runtime.
+ * helpers.ts — helpers for split-view.ts: examples in test/helpers.test.ts,
+ * invariants over arbitrary input in test/properties.test.ts. The only runtime
+ * import is the TUI's width primitives, which framed rows must match exactly.
  */
 
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import { truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui";
+import type { Theme } from "@oh-my-pi/pi-tui/theme";
+
+/** A non-null object; host payloads arrive untyped and every reader narrows
+ * before touching a field. */
+export function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
 
 /** True if c is a UTF-16 high (lead) surrogate. */
 export function isHighSurrogate(c: number): boolean {
@@ -37,20 +46,43 @@ export function truncateInline(s: string, max = 40): string {
 	return `${flat.slice(0, end)}…`;
 }
 
+/**
+ * One framed row: left border, content clipped to `inner` cells, padded to
+ * exactly `inner`, right border. `fill`/`left`/`right` swap the frame
+ * characters so a titled rule and a plain body row come from one primitive.
+ * The whole frame — borders and fill — is drawn in the theme's border colour,
+ * which is what keeps `╭────╮` a border span rather than a bare rule.
+ * Invariant: `visibleWidth(result) === inner + 2` for any content and
+ * `inner >= 0`; content is clipped, never wrapped.
+ */
+export function framedRow(
+	theme: Theme,
+	inner: number,
+	content: string,
+	options?: { fill?: string; left?: string; right?: string },
+): string {
+	const fill = options?.fill ?? " ";
+	const clipped = truncateToWidth(content, Math.max(0, inner));
+	const pad = Math.max(0, inner - visibleWidth(clipped));
+	// A space fill needs no colour of its own: wrapping it would only grow the
+	// escape stream without changing a single cell.
+	let padding = "";
+	if (pad > 0) padding = fill === " " ? " ".repeat(pad) : theme.fg("border", fill.repeat(pad));
+	return theme.fg("border", options?.left ?? "│") + clipped + padding + theme.fg("border", options?.right ?? "│");
+}
+
 /** Storage cap for one tool's text (args JSON or result output). */
 export const MAX_TOOL_TEXT_CHARS = 32 * 1024;
 
-/** Newest whole code points of `s` that fit in `budget` UTF-16 units. */
+/** Newest whole code points of `s` that fit in `budget` UTF-16 units: the
+ * suffix never starts on an orphan low surrogate, and text within `budget` is
+ * returned unchanged. Every "keep the newest part of a string" site goes through
+ * it (the storage cap, the streamed tail, the display-line cap and the stream
+ * tail), so those windows cannot drift apart. */
 function newestUnits(s: string, budget: number): string {
-	let end = s.length;
-	let units = 0;
-	while (end > 0 && units < budget) {
-		const w = end >= 2 && isHighSurrogate(s.charCodeAt(end - 2)) ? 2 : 1;
-		if (units + w > budget) break;
-		units += w;
-		end -= w;
-	}
-	return s.slice(end);
+	if (s.length <= budget) return s;
+	const kept = s.slice(s.length - budget);
+	return isLowSurrogate(kept.charCodeAt(0)) ? kept.slice(1) : kept;
 }
 
 /** Keep the NEWEST suffix within the cap, prefixed by a truncation marker;
@@ -61,6 +93,79 @@ export function capToolText(s: string, cap = MAX_TOOL_TEXT_CHARS): string {
 	// A marker longer than the cap would defeat the cap: drop it instead.
 	if (marker.length >= cap) return newestUnits(s, cap);
 	return marker + newestUnits(s, cap - marker.length);
+}
+
+/** Non-empty, whitespace-trimmed lines of `text` for a row preview. */
+export function nonEmptyLines(text: string): string[] {
+	return text
+		.split(/\r?\n/)
+		.map(line => line.trim())
+		.filter(Boolean);
+}
+
+/** Text a tool reported, unsanitized and uncapped. Sanitization and the
+ * character cap both live in `setToolOutput`, so the final result pays for one
+ * pass instead of two, and the cap applies to what is stored — never to what
+ * is counted. */
+export function resultText(result: unknown): string {
+	if (typeof result === "string") return result;
+	if (!isRecord(result)) return "";
+	const content = result.content;
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	const text: string[] = [];
+	for (const block of content) {
+		if (!isRecord(block) || block.type !== "text" || typeof block.text !== "string") continue;
+		text.push(block.text);
+	}
+	return text.join("");
+}
+
+/** Newest `cap` units of a block list: one backwards pass that counts every
+ * text block and keeps only the newest `cap` units, so a cumulative partial
+ * costs O(blocks + cap) instead of O(its whole length). */
+function tailBlocks(content: unknown[], cap: number): string {
+	const kept: string[] = [];
+	let total = 0;
+	let need = cap;
+	for (let i = content.length - 1; i >= 0; i--) {
+		const block = content[i];
+		if (!isRecord(block) || block.type !== "text" || typeof block.text !== "string") continue;
+		const text: string = block.text;
+		// Counted even past `need`: the total is what says whether the kept
+		// suffix is the whole text (and so must be returned untouched).
+		total += text.length;
+		if (need <= 0) continue;
+		if (text.length > need) {
+			kept.push(text.slice(-need));
+			need = 0;
+		} else {
+			kept.push(text);
+			need -= text.length;
+		}
+	}
+	const joined = kept.reverse().join("");
+	// Inside the cap this is byte-identical to `resultText`, even for text that
+	// starts on a lone surrogate.
+	if (total <= cap) return joined;
+	// A block boundary can split a pair just as a slice can, so the check runs
+	// on the joined suffix rather than on the per-block cut.
+	return isLowSurrogate(joined.charCodeAt(0)) ? joined.slice(1) : joined;
+}
+
+/** The last `cap` UTF-16 units of what `resultText` would return, without
+ * materializing the whole text: a streamed partial is cumulative, so joining it
+ * to keep the newest window would cost O(stream) on every update. Within `cap`
+ * this is byte-identical to `resultText`; past it the kept suffix never starts
+ * on an orphan low surrogate (same rule as `capToolText`). */
+export function resultTextTail(result: unknown, cap: number): string {
+	if (cap <= 0) return "";
+	if (typeof result === "string") return newestUnits(result, cap);
+	if (!isRecord(result)) return "";
+	const content = result.content;
+	if (typeof content === "string") return newestUnits(content, cap);
+	if (!Array.isArray(content)) return "";
+	return tailBlocks(content, cap);
 }
 
 /** Display and storage cap for one edit diff: the first `maxLines` lines and at
@@ -243,20 +348,14 @@ export function appendStreamTail(
 		t = t.slice(nl + 1);
 		nl = t.indexOf("\n");
 	}
-	if (t.length > maxTail) {
-		let start = t.length - Math.floor(maxTail / 2);
-		if (isLowSurrogate(t.charCodeAt(start))) start++;
-		t = t.slice(start);
-	}
+	if (t.length > maxTail) t = newestUnits(t, Math.floor(maxTail / 2));
 	return t;
 }
 
 /** Cap one display line to its newest `max` UTF-16 units ("… " prefix). */
 export function capDisplayLine(line: string, max: number): string {
 	if (line.length <= max) return line;
-	let start = line.length - (max - 2);
-	if (isLowSurrogate(line.charCodeAt(start))) start++;
-	return `… ${line.slice(start)}`;
+	return `… ${newestUnits(line, max - 2)}`;
 }
 
 /** One inline-image block of a tool result (base64 data + MIME type). */

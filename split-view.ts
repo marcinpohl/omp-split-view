@@ -68,6 +68,7 @@ import type { SessionMessageEntry } from "@oh-my-pi/pi-coding-agent/session/sess
 import {
 	GEOMETRY_PROFILES,
 	MAX_BAND_HEIGHT,
+	MAX_TOOL_TEXT_CHARS,
 	MIN_BAND_HEIGHT,
 	MIN_DOCK_COLS,
 	MIN_ROWS_BELOW_BAND,
@@ -80,8 +81,13 @@ import {
 	defaultBandHeight,
 	dockColsFor,
 	formatDuration,
+	framedRow,
+	isRecord,
 	lastImageBlock,
 	maxBandHeight,
+	nonEmptyLines,
+	resultText,
+	resultTextTail,
 	sanitizeText,
 	transcriptVisibility,
 	truncateInline,
@@ -110,6 +116,9 @@ const MAX_TAIL_CHARS = 16000;
 const MAX_FILES = 500;
 const MIN_TERM_WIDTH = 90;
 const MAX_TOOL_OUTPUT_LINES = 20;
+/** Raw text the streaming path hands to `setToolOutput`: the display window
+ * plus slack, so a cumulative partial never costs O(its whole length). */
+const STREAM_RAW_CAP = MAX_TOOL_TEXT_CHARS + 4096;
 const MAX_TOOL_DIFF_LINES = 150;
 const MAX_BODY_ROWS = 400;
 const MAX_LINE_CHARS = MAX_TAIL_CHARS;
@@ -438,28 +447,6 @@ function stopToolTicker(): void {
 	toolTicker = null;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null;
-}
-
-/** Text a tool reported, unsanitized and uncapped. Sanitization and the
- * character cap both live in `setToolOutput`, so a streaming update pays for
- * one pass over the cumulative partial instead of two, and the cap applies to
- * what is stored — never to what is counted. */
-function resultText(result: unknown): string {
-	if (typeof result === "string") return result;
-	if (!isRecord(result)) return "";
-	const content = result.content;
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	const text: string[] = [];
-	for (const block of content) {
-		if (!isRecord(block) || block.type !== "text" || typeof block.text !== "string") continue;
-		text.push(block.text);
-	}
-	return text.join("");
-}
-
 function argsJson(args: unknown): string {
 	try {
 		return capToolText(sanitizeText(JSON.stringify(args ?? {})));
@@ -470,26 +457,19 @@ function argsJson(args: unknown): string {
 
 /** Replace the stored output window with `text`'s sanitized tail and raise the
  * reported line count. `countAll` counts every non-empty line of the full text
- * (final results); a streaming update counts only the retained window. Both
- * paths sanitize the whole text once — one linear pass over the cumulative
- * partial, unavoidable if the stored tail is to be free of control characters.
- * Beyond that pass, a streaming update is O(retained) (cap, count, tail); the
- * final-result count is linear in the full text, paid once per tool call. */
+ * (final results); a streaming update counts only the retained window. The
+ * caller passes at most `STREAM_RAW_CAP` units — the streaming path derives
+ * that tail from the cumulative partial without joining it — so an update
+ * costs O(retained window) (sanitize, cap, count, tail) instead of growing with
+ * the stream. The final result still counts the whole sanitized text, once per
+ * tool call. */
 function setToolOutput(entry: ToolEntry, text: string, countAll = false): void {
 	const sanitized = sanitizeText(text);
-	const lines = capToolText(sanitized)
-		.split(/\r?\n/)
-		.map(line => line.trim())
-		.filter(Boolean);
+	const lines = nonEmptyLines(capToolText(sanitized));
 	// A whitespace-only final result carries no content: keep whatever the
 	// stream already reported instead of blanking the panel.
 	if (lines.length === 0) return;
-	const total = countAll
-		? sanitized
-				.split(/\r?\n/)
-				.map(line => line.trim())
-				.filter(Boolean).length
-		: lines.length;
+	const total = countAll ? nonEmptyLines(sanitized).length : lines.length;
 	// Updates are cumulative; the max survives a shorter final result.
 	entry.outputLineCount = Math.max(entry.outputLineCount ?? 0, total);
 	entry.output = lines.slice(-MAX_TOOL_OUTPUT_LINES).join("\n");
@@ -669,6 +649,12 @@ function toolLines(theme: Theme, width: number, previewCap: number, maxRows: num
 
 interface FileEntry {
 	path: string;
+	/** Directory used to group rows, resolved at ingest so a render never
+	 * calls `path.dirname` per comparison. */
+	dir: string;
+	/** Sanitized file name shown on the row, resolved at ingest like
+	 * `imageLabel`. */
+	base: string;
 	ops: string;
 	count: number;
 }
@@ -753,7 +739,13 @@ function record(toolName: string, input: Record<string, unknown>): void {
 			files.set(abs, prev);
 		} else {
 			if (files.size >= MAX_FILES) files.delete(files.keys().next().value as string);
-			files.set(abs, { path: abs, ops: op, count: 1 });
+			files.set(abs, {
+				path: abs,
+				dir: path.dirname(abs),
+				base: sanitizeText(path.basename(abs)),
+				ops: op,
+				count: 1,
+			});
 		}
 	}
 	filesVersion++;
@@ -875,12 +867,8 @@ function renderPanel(options: PanelOptions): string[] {
 		theme.fg(def.color, ` ${def.title} `) + (def.streaming() ? theme.fg("warning", "●") : ""),
 		inner,
 	);
-	const top =
-		theme.fg("border", "╭") +
-		label +
-		theme.fg("border", "─".repeat(Math.max(0, inner - visibleWidth(label)))) +
-		theme.fg("border", "╮");
-	const bottom = theme.fg("border", `╰${"─".repeat(inner)}╯`);
+	const top = framedRow(theme, inner, label, { fill: "─", left: "╭", right: "╮" });
+	const bottom = framedRow(theme, inner, "", { fill: "─", left: "╰", right: "╯" });
 	const textWidth = Math.max(1, width - 3);
 	const visible = newestRows({
 		items: def.lines(width, bodyRows),
@@ -890,24 +878,46 @@ function renderPanel(options: PanelOptions): string[] {
 		memo,
 		panel: def.title,
 	});
-	const bodyRow = (text: string) => {
-		// Clip, don't just pad: wrapped lines and empty-state hints can be
-		// wider than a narrow panel, and an over-wide row corrupts the frame.
-		const clipped = truncateToWidth(text, textWidth);
-		return `${theme.fg("border", "│")} ${clipped}${" ".repeat(Math.max(0, textWidth - visibleWidth(clipped)))}${theme.fg("border", "│")}`;
-	};
+	// Clip, don't just pad: wrapped lines and empty-state hints can be wider
+	// than a narrow panel, and an over-wide row corrupts the frame.
 	const out = [top];
-	for (let i = 0; i < bodyRows; i++)
-		out.push(bodyRow(visible[i] ?? (i === 0 ? theme.fg("dim", def.empty) : "")));
+	for (let i = 0; i < bodyRows; i++) {
+		const text = visible[i] ?? (i === 0 ? theme.fg("dim", def.empty) : "");
+		out.push(framedRow(theme, inner, ` ${truncateToWidth(text, textWidth)}`));
+	}
 	out.push(bottom);
 	return out;
 }
 
-let bandCacheKey = "";
-let bandCache: string[] = [];
-const bandMemo = new Map<string, string[]>();
+/** Wrapped fragments of one body item, keyed by panel + width + text: a long
+ * history re-wraps nothing per frame (and a theme switch clears it, because the
+ * fragments carry SGR codes). */
+const wrapMemo = new Map<string, string[]>();
 let bandFingerprint = "";
+/** Rendered panel lines, keyed on that panel's own inputs only. */
+const panelMemos = new Map<PanelId, { key: string; lines: readonly string[] }>();
+/** Composed band, reused while every panel returns the same arrays. */
+let composedCache: { width: number; parts: readonly (readonly string[])[]; lines: string[] } | null = null;
+const panelBuilds: Record<PanelId, number> = { thinking: 0, tools: 0, files: 0 };
 
+/** Test seam: panel bodies built since process start. */
+export function panelRenderCounts(): Readonly<{ thinking: number; tools: number; files: number }> {
+	return { ...panelBuilds };
+}
+
+/** Build one panel unless its key is unchanged, counting every real build for
+ * the "a rebuild is confined to its panel" property. */
+function memoPanel(id: PanelId, key: string, build: () => readonly string[]): readonly string[] {
+	const hit = panelMemos.get(id);
+	if (hit && hit.key === key) return hit.lines;
+	const lines = build();
+	panelMemos.set(id, { key, lines });
+	panelBuilds[id]++;
+	return lines;
+}
+
+/** Every colour the band paints with, sampled: a theme switch must drop the
+ * wrapped fragments and the panel rows, because both carry these SGR codes. */
 function themeFingerprint(theme: Theme): string {
 	return [
 		theme.fg("border", "x"),
@@ -947,14 +957,27 @@ function allocateWidths(width: number, ids: PanelId[], filesCols: number): Map<P
 	return widths;
 }
 
-/** Render the enabled panels and join them row by row into one band. */
-function composeColumns(theme: Theme, ids: PanelId[], widths: Map<PanelId, number>, bodyRows: number): string[] {
-	const parts = ids.map(id => {
-		// Every id has a width: allocateWidths sets each one it was given.
-		const panelWidth = widths.get(id) ?? 0;
-		if (id === "files") return filesPanelLines(theme, panelWidth, bandHeight);
-		return renderPanel({ theme, def: bandDef(theme, id), width: panelWidth, bodyRows, memo: bandMemo });
-	});
+/** One panel's rows, reused while that panel's own inputs are unchanged. */
+function panelLines(theme: Theme, id: PanelId, width: number, bodyRows: number): readonly string[] {
+	// The files column sizes off the whole band (it owns the diff subpanel), so
+	// its key carries `bandHeight` rather than the body row count.
+	if (id === "files")
+		return memoPanel(
+			id,
+			`f|${width}|${bandHeight}|${showDiff ? 1 : 0}|${filesVersion}|${editDiff.version}`,
+			() => filesPanelLines(theme, width, bandHeight),
+		);
+	const key =
+		id === "thinking"
+			? `t|${width}|${bodyRows}|${thinking.version}`
+			: `x|${width}|${bodyRows}|${toolMode}|${toolsVersionCounter}`;
+	return memoPanel(id, key, () =>
+		renderPanel({ theme, def: bandDef(theme, id), width, bodyRows, memo: wrapMemo }),
+	);
+}
+
+/** Join the enabled panels row by row into one band. */
+function composeColumns(parts: readonly (readonly string[])[]): readonly string[] {
 	if (parts.length === 1) return parts[0];
 	return parts[0].map((line, index) => line + parts.slice(1).map(part => part[index] ?? "").join(""));
 }
@@ -964,6 +987,13 @@ function composeColumns(theme: Theme, ids: PanelId[], widths: Map<PanelId, numbe
  * `/split-geometry` reports this same number, so the message cannot drift. */
 function clampedDockCols(cols: number): number {
 	return Math.max(MIN_DOCK_COLS, Math.min(dockColsFor(cols, filesWidth, GEOMETRY_PROFILES[geometryMode]), cols - 40));
+}
+
+/** Drop every derived render cache: theme switch, and host `invalidate()`. */
+function clearRenderCaches(): void {
+	wrapMemo.clear();
+	panelMemos.clear();
+	composedCache = null;
 }
 
 /** Enabled panel ids for this width, plus the files dock width (0 = no dock). */
@@ -977,52 +1007,39 @@ function panelLayout(width: number): { ids: PanelId[]; filesWidthCols: number } 
 	return { ids, filesWidthCols };
 }
 
-/** Files-only on a narrow terminal: keep the frame and say why. */
+/** Files-only on a narrow terminal: keep the frame and say why. Not memoised —
+ * it depends on the panel flags, which the panel keys do not carry. */
 function narrowFilesNotice(theme: Theme, width: number): string[] {
 	if (filesOn && !thinkingOn && !toolsOn)
 		return filesPanelLines(theme, width, bandHeight, `Files panel needs ≥${MIN_TERM_WIDTH} cols`);
 	return [];
 }
 
-function renderBand(theme: Theme, width: number, bodyRows: number, rows: number): string[] {
+/** The band's rows for one frame: each panel from its own memo, the column join
+ * from the composed cache, nothing rebuilt unless its own inputs moved. */
+function renderBand(theme: Theme, width: number, bodyRows: number, rows: number): readonly string[] {
 	// Short terminals hide the band instead of squeezing the transcript.
 	if (rows - bandHeight < MIN_ROWS_BELOW_BAND) return [];
 	const fingerprint = themeFingerprint(theme);
-	// Wrapped fragments carry the theme's SGR codes, so a theme switch must
-	// drop the memo as well as the composed band.
 	if (fingerprint !== bandFingerprint) {
-		bandMemo.clear();
+		clearRenderCaches();
 		bandFingerprint = fingerprint;
 	}
-	const key = [
-		width,
-		bandHeight,
-		toolsWidthPct,
-		thinkingOn ? 1 : 0,
-		toolsOn ? 1 : 0,
-		filesOn ? 1 : 0,
-		showDiff ? 1 : 0,
-		filesWidth,
-		// The dock width depends on the preset. `/split-geometry` and a session
-		// load also clear the memo, but an unmount/remount at a new shape with a
-		// pinned height changes nothing else in this key.
-		geometryMode,
-		filesVersion,
-		editDiff.version,
-		toolMode,
-		thinking.version,
-		toolsVersionCounter,
-		fingerprint,
-	].join(":");
-	if (key === bandCacheKey) return bandCache;
-
 	const { ids, filesWidthCols } = panelLayout(width);
 	if (ids.length === 0) return narrowFilesNotice(theme, width);
 
 	const widths = allocateWidths(width, ids, filesWidthCols);
-	const lines = composeColumns(theme, ids, widths, bodyRows);
-	bandCacheKey = key;
-	bandCache = lines;
+	const parts = ids.map(id => panelLines(theme, id, widths.get(id) ?? 0, bodyRows));
+	const cached = composedCache;
+	if (
+		cached &&
+		cached.width === width &&
+		cached.parts.length === parts.length &&
+		parts.every((part, i) => part === cached.parts[i])
+	)
+		return cached.lines;
+	const lines = [...composeColumns(parts)];
+	composedCache = { width, parts, lines };
 	return lines;
 }
 
@@ -1038,7 +1055,7 @@ class BandHub implements Component {
 	}
 
 	invalidate(): void {
-		bandCacheKey = "";
+		clearRenderCaches();
 	}
 
 	dispose(): void {
@@ -1047,17 +1064,6 @@ class BandHub implements Component {
 }
 
 // ─── files panel (band column) ──────────────────────────────────────────────
-
-/** Framed files-panel row: border, right-padded content, border. */
-function filesRow(theme: Theme, inner: number, content: string): string {
-	const clipped = truncateToWidth(content, inner);
-	return (
-		theme.fg("border", "│") +
-		clipped +
-		" ".repeat(Math.max(0, inner - visibleWidth(clipped))) +
-		theme.fg("border", "│")
-	);
-}
 
 /** One file row (indented under a group header, or at list level) plus count. */
 function fileEntryRow(
@@ -1069,7 +1075,7 @@ function fileEntryRow(
 	const count = entry.count > 1 ? `×${entry.count}` : "";
 	const meta = theme.fg("muted", `${entry.ops}${count}`);
 	return {
-		line: filesRow(theme, inner, `${indent}${meta} ${theme.fg("text", sanitizeText(path.basename(entry.path)))}`),
+		line: framedRow(theme, inner, `${indent}${meta} ${theme.fg("text", entry.base)}`),
 		files: 1,
 	};
 }
@@ -1086,7 +1092,7 @@ function fileRunRows(
 	const label = sanitizeText(displayPath(dir));
 	const groupTitle = label === "." ? "./" : `${label}/`;
 	return [
-		{ line: filesRow(theme, inner, ` ${theme.fg("accent", groupTitle)}`), files: 0 },
+		{ line: framedRow(theme, inner, ` ${theme.fg("accent", groupTitle)}`), files: 0 },
 		...run.map(entry => fileEntryRow(theme, inner, entry, "   ")),
 	];
 }
@@ -1096,9 +1102,9 @@ function fileRows(theme: Theme, inner: number, entries: FileEntry[]): { line: st
 	const rows: { line: string; files: number }[] = [];
 	let i = 0;
 	while (i < entries.length) {
-		const dir = path.dirname(entries[i].path);
+		const dir = entries[i].dir;
 		let j = i;
-		while (j < entries.length && path.dirname(entries[j].path) === dir) j++;
+		while (j < entries.length && entries[j].dir === dir) j++;
 		rows.push(...fileRunRows(theme, inner, dir, entries.slice(i, j)));
 		i = j;
 	}
@@ -1124,12 +1130,12 @@ function filesBody(theme: Theme, inner: number, listRows: number, entries: FileE
 		body.push(entry.line);
 		filesShown += entry.files;
 	}
-	if (entries.length === 0) body.push(filesRow(theme, inner, ` ${theme.fg("dim", "No files touched yet")}`));
+	if (entries.length === 0) body.push(framedRow(theme, inner, ` ${theme.fg("dim", "No files touched yet")}`));
 	else if (entries.length > filesShown && body.length < listRows) {
 		const hiddenFiles = `… +${entries.length - filesShown} more`;
-		body.push(filesRow(theme, inner, ` ${theme.fg("dim", hiddenFiles)}`));
+		body.push(framedRow(theme, inner, ` ${theme.fg("dim", hiddenFiles)}`));
 	}
-	if (body.length < listRows) body.push(filesRow(theme, inner, ` ${theme.fg("dim", LEGEND)}`));
+	if (body.length < listRows) body.push(framedRow(theme, inner, ` ${theme.fg("dim", LEGEND)}`));
 	return body;
 }
 
@@ -1138,28 +1144,23 @@ function filesBody(theme: Theme, inner: number, listRows: number, entries: FileE
 function filesDiffBody(theme: Theme, inner: number, diffRows: number, enabled: boolean): string[] {
 	if (!enabled) return [];
 	const body: string[] = [];
-	body.push(theme.fg("border", `├${"─".repeat(inner)}┤`));
+	body.push(framedRow(theme, inner, "", { fill: "─", left: "├", right: "┤" }));
 	const title = editDiff.path
 		? theme.fg("accent", ` ✎ ${truncateToWidth(sanitizeText(displayPath(editDiff.path)), inner - 4)} `)
 		: theme.fg("dim", " Last Edit ");
-	body.push(
-		theme.fg("border", "│") +
-			title +
-			theme.fg("border", "─".repeat(Math.max(0, inner - visibleWidth(title)))) +
-			theme.fg("border", "│"),
-	);
+	body.push(framedRow(theme, inner, title, { fill: "─" }));
 	if (editDiff.diff) {
 		const rendered = renderDiff(editDiff.diff, { theme, filePath: editDiff.path }).split(/\r?\n/);
 		const shown = rendered.slice(0, Math.max(0, diffRows - 1));
-		for (const line of shown) body.push(filesRow(theme, inner, ` ${line}`));
+		for (const line of shown) body.push(framedRow(theme, inner, ` ${line}`));
 		if (rendered.length > shown.length && diffRows > 0) {
 			const hiddenLines = `… +${rendered.length - shown.length} more`;
-			body.push(filesRow(theme, inner, ` ${theme.fg("dim", hiddenLines)}`));
+			body.push(framedRow(theme, inner, ` ${theme.fg("dim", hiddenLines)}`));
 		}
 	} else if (diffRows > 0) {
-		body.push(filesRow(theme, inner, ` ${theme.fg("dim", "No edit yet")}`));
+		body.push(framedRow(theme, inner, ` ${theme.fg("dim", "No edit yet")}`));
 	}
-	while (body.length < diffRows + 2) body.push(filesRow(theme, inner, ""));
+	while (body.length < diffRows + 2) body.push(framedRow(theme, inner, ""));
 	return body;
 }
 
@@ -1183,18 +1184,18 @@ function filesPanelLines(theme: Theme, width: number, height: number, notice?: s
 	const diffRows = withDiff ? Math.max(0, height - listRows - 6) : 0;
 
 	const body: string[] = notice
-		? [filesRow(theme, inner, ` ${theme.fg("dim", truncateInline(notice, Math.max(1, inner - 2)))}`)]
+		? [framedRow(theme, inner, ` ${theme.fg("dim", truncateInline(notice, Math.max(1, inner - 2)))}`)]
 		: filesBody(theme, inner, listRows, entries);
-	while (body.length < listRows) body.push(filesRow(theme, inner, ""));
+	while (body.length < listRows) body.push(framedRow(theme, inner, ""));
 
 	const title = `📂 Files (${entries.length})`;
 	return [
-		theme.fg("border", `╭${"─".repeat(inner)}╮`),
-		filesRow(theme, inner, ` ${theme.fg("accent", title)}`),
-		theme.fg("border", `├${"─".repeat(inner)}┤`),
+		framedRow(theme, inner, "", { fill: "─", left: "╭", right: "╮" }),
+		framedRow(theme, inner, ` ${theme.fg("accent", title)}`),
+		framedRow(theme, inner, "", { fill: "─", left: "├", right: "┤" }),
 		...body,
 		...filesDiffBody(theme, inner, diffRows, withDiff),
-		theme.fg("border", `╰${"─".repeat(inner)}╯`),
+		framedRow(theme, inner, "", { fill: "─", left: "╰", right: "╯" }),
 	];
 }
 
@@ -1223,7 +1224,6 @@ function mountWidget(ctx: ExtensionContext): void {
 			geometryMode = resolveGeometryMode();
 			if (bandHeightAuto) {
 				bandHeight = defaultBandHeight(tui.terminal.rows, GEOMETRY_PROFILES[geometryMode]);
-				bandCacheKey = "";
 			}
 			return new BandHub(tui);
 		},
@@ -1272,7 +1272,6 @@ function applySavedMetrics(raw: UiPanelsConfig, cfg: NormalizedUiPanelsConfig): 
 	}
 	toolsWidthPct = cfg.toolsWidthPct;
 	filesWidth = cfg.filesWidth;
-	bandCacheKey = "";
 }
 
 // ─── transcript visibility (native omp display switches) ────────────────────
@@ -1440,7 +1439,6 @@ function reconstruct(ctx: ExtensionContext): void {
 		thinking.trim();
 		thinking.version++;
 	}
-	bandCacheKey = "";
 }
 
 // ─── extension ───────────────────────────────────────────────────────────────
@@ -1575,7 +1573,7 @@ function registerToolEvents(pi: ExtensionAPI): void {
 		if (!isMainAgent(ctx)) return;
 		const entry = toolsBy.get(event.toolCallId);
 		if (entry) {
-			setToolOutput(entry, resultText(event.partialResult));
+			setToolOutput(entry, resultTextTail(event.partialResult, STREAM_RAW_CAP));
 			markToolsDirty();
 		}
 	});
@@ -1724,7 +1722,6 @@ function applyGeometry(ctx: ExtensionContext): void {
 	geometryMode = resolveGeometryMode();
 	if (bandHeightAuto && rows > 0)
 		bandHeight = defaultBandHeight(rows, GEOMETRY_PROFILES[geometryMode]);
-	bandCacheKey = "";
 	applyLayout(ctx);
 	const dock = clampedDockCols(cols);
 	const label = geometrySetting === "auto" ? `auto (${geometryMode})` : geometryMode;
@@ -1763,7 +1760,6 @@ function registerBandSettings(pi: ExtensionAPI): void {
 			if (!requireTui(ctx)) return;
 			toolMode = toolMode === "compact" ? "full" : "compact";
 			toolsVersionCounter++;
-			bandCacheKey = "";
 			requestRender();
 			notify(`Tool panel: ${toolMode}`);
 		},
@@ -1782,7 +1778,6 @@ function registerBandSettings(pi: ExtensionAPI): void {
 			}
 			bandHeight = Math.max(MIN_BAND_HEIGHT, Math.min(limit, height));
 			bandHeightAuto = false;
-			bandCacheKey = "";
 			applyLayout(ctx);
 			notify(`Band height: ${bandHeight} rows`);
 		},
@@ -1803,7 +1798,6 @@ function registerBandSettings(pi: ExtensionAPI): void {
 				return;
 			}
 			toolsWidthPct = Math.max(20, Math.min(60, pct));
-			bandCacheKey = "";
 			reconcile(ctx);
 			notify(`Tools panel width: ${toolsWidthPct}%`);
 		},

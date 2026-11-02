@@ -4,7 +4,8 @@ Snapshot: 2026-11-02, after the Q1–Q7 structural batch, B7 CI, the split-view
 improvement pass, the geometry preset switch (G1), advisor compatibility
 (A1), test-suite simplification (T1), code simplification (C1), W6 bash
 replay, the R1 review pass, R2 mount-once/auto-height fixes, the R3
-tool-preview window and the R4 render-budget/saved-layout batch (all landed).
+tool-preview window, the R4 render-budget/saved-layout batch and the H1 band
+hot-path batch (all landed).
 This file is the dispatcher: metrics live here, the ordered queue below is
 what to work on next, and every landed item updates the snapshot and ticks
 its row.
@@ -13,7 +14,7 @@ its row.
 
 | Command | Measures | Gate |
 | --- | --- | --- |
-| `bun test` | behaviour + property tests | 129 tests, 0 failures |
+| `bun test` | behaviour + property tests | 155 tests, 0 failures |
 | `bun run test:coverage` | line/function coverage from Bun's lcov | lines ≥ 99%, functions ≥ 90% (`scripts/check-coverage.ts`) |
 | `bun run lint` | ESLint 10 + typescript-eslint + sonarjs; also the cyclomatic/cognitive/size metrics | 0 errors, 0 warnings |
 | `bun run typecheck` | `tsc --noEmit`, strict | clean |
@@ -31,30 +32,44 @@ targets control characters.
 
 | File | Lines | Funcs | Test file | Tests |
 | --- | --- | --- | --- | --- |
-| `split-view.ts` | 99.91% | 98.53% | `test/split-view.test.ts` | 85 |
-| `helpers.ts` | 100.00% | 94.44% | `test/helpers.test.ts` | 19 |
-| `ui-panels-config.ts` | 100.00% | 88.89% | `test/properties.test.ts` | 25 |
-| **overall** | **99.93%** | **97.55%** | | **129** |
+| `split-view.ts` | 99.91% | 98.54% | `test/split-view.test.ts` | 95 |
+| `helpers.ts` | 100.00% | 96.00% | `test/helpers.test.ts` | 25 |
+| `ui-panels-config.ts` | 100.00% | 88.89% | `test/properties.test.ts` | 35 |
+| **overall** | **99.93%** | **97.66%** | | **155** |
 
-45,752 assertions, ~3.9 s wall time. Uncovered:
+59,014 assertions, ~3.8 s wall time. Uncovered:
 
-- `split-view.ts:128` — `themeGetter` default that throws if something renders
+- `split-view.ts:137` — `themeGetter` default that throws if something renders
   before `session_start` binds a theme. Deliberate, unreachable.
-- Functions: 160/164 counted (`FNF`/`FNH` in `coverage/lcov.info`, `test/**`
+- Functions: 168/172 counted (`FNF`/`FNH` in `coverage/lcov.info`, `test/**`
   excluded as the gate does). The four misses are the throwing `themeGetter`
   default, `BandHub.dispose` (no-op host hook), and the two no-op default
   exports that exist so omp's extension auto-discovery does not report a load
-  error (`helpers.ts:310`, `ui-panels-config.ts:174`). Bun 1.4's lcov omits the
+  error (`helpers.ts:409`, `ui-panels-config.ts:174`). Bun 1.4's lcov omits the
   per-function `FN`/`FNDA` records, so those identities come from reading the
   four sites; only the totals come from the report. Every helper extracted by
-  Q1–Q7 plus the split-view batch (`capDiffText`, `imageLabel`,
-  `retainedEditDiff`) is reached by the existing suite.
+  Q1–Q7 plus the split-view batches (`capDiffText`, `imageLabel`,
+  `retainedEditDiff`, `framedRow`, `resultTextTail`) is reached by the existing
+  suite.
 
 Property coverage is behavioural, not line-based: helpers (truncation, caps,
 config normalization, visibility), band geometry for arbitrary terminal sizes,
 cache idempotence, theme invalidation, escape stripping, arbitrary event
 streams, advisor/main interleavings, and tally replay. Fixed fast-check seeds
 (`20261101`) keep failures reproducible.
+
+H1 added properties for every piece it touched, so the invariants are checked
+over input rather than pinned to the examples above: `framedRow` (row width is
+`inner + 2` for any width/content, the middle is content plus fill, clipping
+never overflows, the fill carries the border colour), `nonEmptyLines` (against a
+loop oracle, then idempotence and control-free output), `resultText` (ordered
+concatenation checked by scanning, non-text blocks contributing nothing) and
+`resultTextTail` (newest window of `resultText`, code-point aligned, invariant
+under any block split). On the band: a render that changes nothing builds
+nothing, `invalidate()` then render equals the memoised rows for arbitrary state
+sequences, one panel's change rebuilds exactly that panel for any
+width/height, cumulative streaming renders the same live and settled rows as one
+delivery of the same text, and every tracked basename reaches a files row.
 
 `geometry profiles` and `geometry preset properties` cover the preset switch
 end to end: both curves against literal shares and bounds at any size, the
@@ -91,6 +106,14 @@ unrenderable, widget unmounted) — a post-assert restore now re-establishes the
 mount point; and `flushThinking` had only ever been covered by a leftover timer
 from an earlier test, so delta coalescing is now asserted directly.
 
+The H1 batch added one assertion to that suite — a path with an embedded CSI is
+sanitized in the files row — and put its two other renderer checks where they
+belong: the panel-confinement and streamed-vs-once examples were folded into the
+two `band memo properties`, which assert the same contracts over generated
+widths, heights and panel kinds instead of one pinned layout. Property tests
+have a single home (`test/properties.test.ts`); the example suites pin concrete
+behaviour only.
+
 ### Lint and complexity (radon `cc` / `raw` equivalents)
 
 0 warnings, 0 errors. Limits: cyclomatic 12, cognitive 15, depth 4, params 4,
@@ -118,10 +141,10 @@ caller that does not pass one gets the pre-switch behavior.
 `notice?` and passes the padded content width to the helpers instead of a
 closure, so no fifth parameter (and no options object) was needed.
 
-File sizes: `split-view.ts` 1854 L, `helpers.ts` 312 L,
+File sizes: `split-view.ts` 1853 L, `helpers.ts` 411 L,
 `ui-panels-config.ts` 176 L, `scripts/check-coverage.ts` 90 L,
-`scripts/check-package.ts` 169 L, tests 3018 L (`split-view` 2351,
-`properties` 458, `helpers` 202, `setup` 7).
+`scripts/check-package.ts` 169 L, tests 3989 L (`split-view` 2982,
+`properties` 699, `helpers` 301, `setup` 7).
 
 CI: `.github/workflows/ci.yml` runs the five gates plus `bun install
 --frozen-lockfile` on Bun 1.4.3 for every push and pull request;
@@ -147,6 +170,94 @@ when its acceptance metric is met and the snapshot above is updated.
 | Q8 | ~~`syncTranscriptVisibility` cc 15, `normalizeConfig` cc 16~~ — **done (C1)** | Extracted `pendingVisibilityPolicy` and the config field readers. | 0 warnings |
 
 Nothing else is queued: W6 landed with policy (a) and the queue is empty.
+
+### Landed — band hot path: bounded streaming, per-panel memo, ingest precompute (H1)
+
+Delta: 134 → 155 tests (95 in `split-view.test.ts`, 25 in
+`helpers.test.ts`, 35 in `properties.test.ts`: +6 helper examples, +1 renderer
+example, +4 split-view properties, +10 property tests for the new/moved
+helpers), assertions 47,004 → 59,011. Coverage 99.93% lines / 97.66% functions
+(gate 99/90); lint 0/0; typecheck and package gate unchanged (3 shipped
+modules). `split-view.ts` 1859 → 1853 L, `helpers.ts` 312 → 411 L,
+`test/split-view.test.ts` 2672 → 2982 L, `test/helpers.test.ts` 202 → 301 L,
+`test/properties.test.ts` 458 → 699 L.
+
+- **Streaming is O(retained window), not O(stream).** `tool_execution_update`
+  passed the *whole* cumulative partial to `setToolOutput`, which sanitized and
+  capped it again on every update. `resultTextTail` walks a result's text
+  blocks backwards and keeps only the last `STREAM_RAW_CAP` (32 KiB + 4 KiB
+  slack) UTF-16 units without joining the cumulative string, so an update's
+  input is bounded by construction. Probe (200 updates of 5 000 chars, 1 MB
+  cumulative, flat cumulative strings pre-built outside the timed loop, warm,
+  median of 5, ingest pipeline only): 24.4 ms → **14.1 ms**, 36 864 units
+  maximum per update. Building the partial by `+=` inside the loop instead
+  inflates *both* columns (rope flattening) — the first run of the probe read
+  34 → 23.9 ms for that reason, which is the probe's cost, not the extension's.
+  The final result still counts the whole sanitized text once per tool call.
+- **A panel rebuild is confined to the panel whose data changed.** One
+  whole-band key meant any thinking flush or tool tick rebuilt the files column
+  too, including `renderDiff(400 lines)` (1.12 ms) and the 500-entry list
+  (0.76 ms). `panelMemos` keys each panel on its own inputs (`width`,
+  `bodyRows`/`bandHeight`, and the version counters plus `toolMode`/`showDiff`),
+  `composedCache` reuses the composed band while every panel returns the same
+  arrays, and the seven manual `bandCacheKey = ""` invalidations are gone:
+  every input they covered (mode, height, geometry, widths, content versions)
+  is now part of a panel key or of its width. `panelRenderCounts()` is the test
+  seam; the new property asserts a thinking flush adds exactly one thinking
+  build and no tools/files build, and likewise for a tool call and a file.
+- **Files rows are precomputed at ingest.** `FileEntry` carries `dir` and
+  `base`, so grouping compares strings instead of `path.dirname` per comparison
+  and `sanitizeText(path.basename())` no longer runs per row per frame; a
+  500-entry micro-probe of the removed work drops 0.20 ms → 0.01 ms per build.
+  `path.dirname`/`path.basename` now appear only on the `record` ingest line.
+- **One framing primitive.** `filesRow`, the two hand-built rules in
+  `filesDiffBody`, the border rows in `filesPanelLines` and `renderPanel`'s
+  `bodyRow`/top/bottom collapsed into `helpers.framedRow` (unit-tested
+  invariant: `visibleWidth(row) === inner + 2`, content clipped never wrapped).
+  The fill is drawn in the theme's border colour, so `╭────╮` stays one
+  border-coloured rule; a space fill skips the SGR wrapper, so body rows cost
+  no extra escapes. This is `helpers.ts`'s first runtime import — the TUI's
+  width primitives, which the frame has to match exactly — and the header
+  invariant line says so.
+- **The block-shaped tail keeps the surrogate rule too.** The string path
+  dropped an orphan low surrogate, but a cut *inside* a text block produced a
+  suffix of exactly `cap` units, which the early return left untouched. A
+  per-block "was anything sliced" flag is still wrong: the block-split property
+  found a text cut at a *block boundary* that also splits a pair (blocks
+  `["\ud800", "\udc00…"]`, cap 5). `tailBlocks` now sums the text-block lengths
+  in its backwards pass and drops the leading orphan only when the window is a
+  proper suffix (`total > joined.length`), which is exactly the string path's
+  rule; inside the cap it returns the whole text untouched. The property that
+  found it stays: `resultTextTail` is asserted independent of the block split.
+- **Also moved into `helpers.ts`** (no behaviour change): `isRecord` (one
+  canonical guard for the package) and `resultText`, which the folding above
+  made shared, plus `nonEmptyLines` for the two line pipelines in
+  `setToolOutput`.
+- **The theme-invalidation test measures its own colour, for all ten.** It only
+  passed for a colour if the *previous* iteration's colour was still in the last
+  fingerprint (that residue forced the rebuild), it silently relied on earlier
+  suites leaving a file row behind (`text` is only used by the files row), and
+  it only ever exercised seven of the ten colours `themeFingerprint` samples —
+  `error`, `warning` and `toolOutput` were never checked. It now seeds one row
+  per colour (a finished tool, an errored tool with output in full mode, a
+  tracked file, an open thinking block for the `warning` dot) and re-warms with
+  the palette cleared between iterations. Dropping any of `text`, `error`,
+  `warning` or `toolOutput` from the fingerprint fails it; before this change
+  all four removals passed.
+- **Properties, not just examples.** Four split-view properties and ten helper
+  properties cover the invariants above (listed under "Tests and coverage").
+  Each was mutation-checked: dropping `${filesVersion}` from the files key
+  fails both memo properties; forcing every panel to rebuild fails the
+  confinement property; appending instead of replacing the stored output fails
+  the streaming property; and rendering the directory instead of `entry.base`
+  fails the files-row property. The first draft of the memo property was
+  worthless — it compared two cold builds — so it now warms the memo before the
+  steps.
+- **Mutation-checked**: dropping `thinking.version` from the thinking memo key
+  fails 7 tests — `streamed thinking and tool results reach the panels`,
+  `streamed thinking is coalesced`, both replay tests, `empty thinking blocks
+  are not retained`, and both band-memo properties; dropping the geometry
+  preset from the dock width fails 6, the remount-preset test among them.
 
 ### Landed — render budget, saved-layout restore, cap count, visibility retry (R4)
 
@@ -274,6 +385,13 @@ passing, so it was mutation-checked per the review note:
 | `thinking.version` dropped from the band cache key | coalescing test fails |
 | `force` ignored when the recorded policy equals the desired one | **survived → new regression added** |
 | "nothing owned" guard dropped (always apply) | survived — behaviourally inert; kept as an optimization that avoids touching user settings |
+
+(The two cache-key rows predate H1, which replaced the single whole-band key.
+Re-run against the current tree, their equivalents both fail: dropping
+`thinking.version` from the thinking panel's memo key fails 6 tests, and
+dropping the geometry preset from the dock width — where the preset now reaches
+a panel, through `allocateWidths` — fails 6 including "a remount after a resize
+drops the band memo of the old preset".)
 
 - The surviving `force` mutation is the `/reload` case: the process-global
   `applied` registry outlives the settings object, so the recorded policy can

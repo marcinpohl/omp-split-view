@@ -8,7 +8,12 @@ import { Settings, settings, type ExtensionAPI, type ExtensionContext } from "@o
 import "@oh-my-pi/pi-coding-agent/session/settings";
 import "@oh-my-pi/pi-coding-agent/modes/settings";
 import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
-import splitView, { retainedEditDiff, retainedThinkingBlocks, retainedToolEntries } from "../split-view.ts";
+import splitView, {
+	panelRenderCounts,
+	retainedEditDiff,
+	retainedThinkingBlocks,
+	retainedToolEntries,
+} from "../split-view.ts";
 import {
 	GEOMETRY_PROFILES,
 	MAX_BAND_HEIGHT,
@@ -22,6 +27,7 @@ import {
 	defaultBandHeight,
 	dockColsFor,
 	maxBandHeight,
+	sanitizeText,
 	type GeometryProfile,
 } from "../helpers.ts";
 import { CONFIG_FILE, loadUiPanelsConfig, normalizeConfig, saveUiPanelsConfig } from "../ui-panels-config.ts";
@@ -216,6 +222,13 @@ const fullLayout = { split: true, thinking: true, tools: true, files: true, diff
 const setToggle = async (command: string, message: RegExp) => {
 	await h.command(command);
 	if (!message.test(h.notifications.at(-1)?.message ?? "")) await h.command(command);
+};
+
+/** `session_tree` rebuilds every buffer from the branch, leaving layout alone;
+ * the default empty branch clears the panels and bumps every version. */
+const resetBuffers = async (branch: unknown[] = []) => {
+	h.setBranch(branch);
+	await h.emit("session_tree");
 };
 
 /** Mount a panel when its header is absent (label-based, for plain toggles). */
@@ -474,7 +487,32 @@ describe("band properties", () => {
 		);
 	});
 
-	test("every theme colour the band uses invalidates the row cache", async () => {
+	test("every theme colour the band samples invalidates every memo", async () => {
+		// One row per sampled colour: a thought (thinkingText), a finished tool
+		// (success, muted), an errored tool with output (error, and `toolOutput`
+		// in full mode), a tracked file (`text` is only used by the files row) and
+		// an open thinking block (the `warning` title dot). An empty band would
+		// leave some of them unrendered, and the loop below would then pass or
+		// fail on leftovers from an earlier suite.
+		await h.emit("message_update", { assistantMessageEvent: { type: "thinking_start" } });
+		await h.emit("message_update", { assistantMessageEvent: { type: "thinking_delta", delta: "theme seed" } });
+		await h.emit("message_update", { assistantMessageEvent: { type: "thinking_end", content: "theme seed" } });
+		await h.emit("tool_execution_start", { toolCallId: "thm", toolName: "bash", args: { command: "true" } });
+		await h.emit("tool_execution_end", { toolCallId: "thm", result: { content: "ok" }, isError: false });
+		await h.emit("tool_execution_start", { toolCallId: "thm-err", toolName: "bash", args: { command: "false" } });
+		await h.emit("tool_execution_end", {
+			toolCallId: "thm-err",
+			result: { content: "detail line" },
+			isError: true,
+		});
+		await h.emit("tool_call", { toolName: "read", input: { path: "/tmp/omp-split-view/split-view.ts" } });
+		// Full mode paints the detail row with `toolOutput`. Nothing is left
+		// running: an active tool would start the one-second ticker and re-render
+		// in the middle of the loop, while an open thinking block only paints the
+		// title dot.
+		await setToggle("split-tools-view", /full/);
+		await h.emit("message_update", { assistantMessageEvent: { type: "thinking_start" } });
+
 		const palette: Record<string, string> = {};
 		const themed = {
 			...flatTheme,
@@ -482,14 +520,37 @@ describe("band properties", () => {
 		};
 		h.setTheme(themed);
 		try {
-			const before = h.widget()!.render(120);
-			for (const color of ["border", "accent", "text", "muted", "dim", "success", "thinkingText"]) {
+			const render = () => h.widget()!.render(120);
+			// Warm with an empty palette; `before` is what a re-warmed render after
+			// each iteration must match.
+			const before = render();
+			const sampled = [
+				"border",
+				"accent",
+				"text",
+				"muted",
+				"dim",
+				"success",
+				"error",
+				"warning",
+				"toolOutput",
+				"thinkingText",
+			];
+			for (const color of sampled) {
 				palette[color] = `\u0001${color}`;
-				expect({ color, changed: h.widget()!.render(120) }).not.toEqual({ color, changed: before });
+				const changed = render();
 				delete palette[color];
+				// Re-warm with the colour removed: without this, the previous
+				// iteration's colour is still in the last fingerprint and forces the
+				// rebuild, so a colour missing from the fingerprint would pass on
+				// somebody else's invalidation.
+				render();
+				expect({ color, changed }).not.toEqual({ color, changed: before });
 			}
 		} finally {
 			h.setTheme(flatTheme);
+			await h.emit("message_update", { assistantMessageEvent: { type: "thinking_end", content: "theme seed" } });
+			await setToggle("split-tools-view", /compact/);
 		}
 	});
 
@@ -622,11 +683,6 @@ describe("complex renderers", () => {
 	/** Toggle-style commands announce the new state; read it, don't guess. */
 	const setToolMode = (full: boolean) => setToggle("split-tools-view", full ? /full/ : /compact/);
 	const setDiff = (on: boolean) => setToggle("split-diff", on ? /\bon$/ : /\boff$/);
-	/** `session_tree` rebuilds every buffer from the branch, leaving layout alone. */
-	const resetBuffers = async (branch: unknown[] = []) => {
-		h.setBranch(branch);
-		await h.emit("session_tree");
-	};
 	/** Rendered rows, or "" when the band is unmounted/hidden. */
 	const visible = () => h.widget()?.render(120).join("\n") ?? "";
 
@@ -819,6 +875,211 @@ describe("complex renderers", () => {
 		}
 	});
 
+	test("property: the reported line count is shape independent and describes the sanitized text", async () => {
+		h.setSize(120, 100);
+		const scenario = fc.record({
+			// One hostile payload per line: CR, C0/C1 controls, OSC/CSI escapes and
+			// lone surrogates all reach sanitizeText, and the count must describe what
+			// survives it. Each line keeps a `Ln:` token, so the count is always a real
+			// number instead of collapsing to 0 for whitespace-only input.
+			parts: fc.array(fc.string({ unit: "binary", maxLength: 30 }), { minLength: 3, maxLength: 14 }),
+			shape: fc.constantFrom("string", "content", "blocks"),
+			other: fc.constantFrom("string", "content", "blocks"),
+			split: fc.nat(),
+			rows: fc.integer({ min: 18, max: 60 }),
+			// Past the character cap only a tail is stored, so the count must come
+			// from the whole text rather than from the retained window.
+			pastCap: fc.boolean(),
+		});
+		// Trimmed non-empty lines of the sanitized text: the contract the marker
+		// number is measured against.
+		const nonEmpty = (text: string) =>
+			sanitizeText(text)
+				.split(/\r?\n/)
+				.map(line => line.trim())
+				.filter(Boolean).length;
+		const payload = (shape: string, text: string, split: number): unknown => {
+			if (shape === "string") return text;
+			if (shape === "content") return { content: text };
+			const cut = split % (text.length + 1);
+			return {
+				content: [
+					{ type: "text", text: text.slice(0, cut) },
+					{ type: "text", text: text.slice(cut) },
+				],
+			};
+		};
+		// Only the first detail row can be the marker (toolDetailLines pushes it
+		// before the newest lines), so arbitrary content that happens to spell
+		// "+N earlier lines" cannot be mistaken for it.
+		const markerOf = (band: string) => {
+			const lines = band.split("\n");
+			const rowOf = lines.findIndex(line => line.includes("bash"));
+			// -1 never equals an oracle value, so a missing tool row fails loudly
+			// instead of reading as "no marker".
+			if (rowOf < 0) return -1;
+			const found = /· \+(\d+) earlier lines/.exec(lines[rowOf + 1] ?? "");
+			return found ? Number(found[1]) : 0;
+		};
+		const emit = async (result: unknown) => {
+			await h.emit("tool_execution_start", { toolCallId: "shape", toolName: "bash", args: { command: "x" } });
+			await h.emit("tool_execution_end", { toolCallId: "shape", result, isError: false });
+			return joined();
+		};
+		try {
+			await fc.assert(
+				fc.asyncProperty(scenario, async ({ parts, shape, other, split, rows, pastCap }) => {
+					await resetBuffers();
+					await h.command("split-height", String(rows));
+					await setToolMode(true);
+					const text = parts.map((part, i) => `L${i}:${part}`).join("\n");
+					const cap = Math.max(2, Math.min(6, Math.floor((rows - 2) / 8)));
+					// Past the character cap only a tail is stored. A dense suffix keeps
+					// the retained window at or above `cap` lines, and `p0` is far enough
+					// ahead of the window that the sanitized text always holds one counted
+					// line the window does not: the oracle stays exact.
+					const head = pastCap ? text.repeat(Math.ceil(66000 / Math.max(1, text.length))) : text;
+					const tail = Array.from({ length: cap }, (_, i) => `z${i}`).join("\n");
+					const body = pastCap ? `p0\n${head}\n${tail}` : head;
+					const band = await emit(payload(shape, body, split));
+					const total = nonEmpty(body);
+					expect(markerOf(band)).toBe(Math.max(0, total - Math.min(cap, total)));
+					// The count must not depend on how the same text was packaged.
+					await resetBuffers();
+					expect(markerOf(await emit(payload(other, body, split)))).toBe(markerOf(band));
+					// Nothing sanitized away may reach a row.
+					expect(band).not.toMatch(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/);
+					await h.command("split-height", "20");
+					await setToolMode(false);
+				}),
+				{ numRuns: 20, seed: 20261101 },
+			);
+		} finally {
+			h.setSize(120, 45);
+			await h.command("split-height", "20");
+			await setToolMode(false);
+		}
+	});
+
+	test("property: the newest full-mode card keeps its row and reports its withheld detail", async () => {
+		h.setSize(120, 100);
+		const card = fc.record({ output: fc.integer({ min: 0, max: 40 }), diff: fc.integer({ min: 0, max: 200 }) });
+		const scenario = fc.record({
+			cards: fc.array(card, { minLength: 1, maxLength: 6 }),
+			rows: fc.integer({ min: 6, max: 40 }),
+		});
+		try {
+			await fc.assert(
+				fc.asyncProperty(scenario, async ({ cards, rows }) => {
+					await resetBuffers();
+					await h.command("split-height", String(rows));
+					await setToolMode(true);
+					for (const [i, spec] of cards.entries()) {
+						await h.emit("tool_execution_start", { toolCallId: `n${i}`, toolName: `tool-${i}`, args: {} });
+						const text = Array.from({ length: spec.output }, (_, k) => `o${i}-${k}`).join("\n");
+						const diff = Array.from({ length: spec.diff }, (_, k) => (k % 2 === 0 ? `-a${k}` : `+b${k}`)).join(
+							"\n",
+						);
+						await h.emit("tool_execution_end", {
+							toolCallId: `n${i}`,
+							result: {
+								...(spec.output > 0 ? { content: text } : {}),
+								...(spec.diff > 0 ? { details: { diff } } : {}),
+							},
+							isError: false,
+						});
+					}
+					const band = h.widget()!.render(120);
+					const bodyRows = rows - 2;
+					const cap = Math.max(2, Math.min(6, Math.floor(bodyRows / 8)));
+					const newest = cards[cards.length - 1];
+					const newestName = `tool-${cards.length - 1}`;
+					// Cards are composed oldest-first, so the newest one is the last card
+					// and owns the whole body budget: everything after its row is its own
+					// detail, which is what the marker arithmetic below describes.
+					const rowOf = band.findIndex(row => row.includes(newestName));
+					expect(rowOf).toBeGreaterThanOrEqual(0);
+					expect(band.length).toBe(rows);
+					assertExactWidth(band, 120);
+					const shown = Math.min(cap, newest.output);
+					const outputRows = shown + (newest.output > shown ? 1 : 0);
+					// `MAX_TOOL_DIFF_LINES` (150) plus its own "more diff lines" row.
+					const cappedDiff = Math.min(newest.diff, 150) + (newest.diff > 150 ? 1 : 0);
+					// The diff block carries a leading blank row, so an empty diff adds none.
+					const diffRows = newest.diff === 0 ? 0 : cappedDiff + 1;
+					const expectedDetail = outputRows + diffRows;
+					const room = bodyRows - 1;
+					const tail = band.slice(rowOf + 1).join("\n");
+					if (expectedDetail > room) {
+						expect(tail).toContain(`+${expectedDetail - Math.max(0, room - 1)} more detail rows`);
+					} else {
+						expect(tail).not.toMatch(/\+\d+ more detail rows/);
+					}
+					await h.command("split-height", "20");
+					await setToolMode(false);
+				}),
+				{ numRuns: 20, seed: 20261101 },
+			);
+		} finally {
+			h.setSize(120, 45);
+			await h.command("split-height", "20");
+			await setToolMode(false);
+		}
+	});
+
+	test("property: compact cards cost one row each and separators only when a row is free", async () => {
+		h.setSize(120, 100);
+		const scenario = fc.record({
+			counts: fc.array(fc.integer({ min: 0, max: 3 }), { maxLength: 10 }),
+			rows: fc.integer({ min: 6, max: 40 }),
+		});
+		try {
+			await fc.assert(
+				fc.asyncProperty(scenario, async ({ counts, rows }) => {
+					await resetBuffers();
+					await h.command("split-height", String(rows));
+					await setToolMode(false);
+					for (const [i, lines] of counts.entries()) {
+						await h.emit("tool_execution_start", { toolCallId: `k${i}`, toolName: `entry-${i}`, args: {} });
+						await h.emit("tool_execution_end", {
+							toolCallId: `k${i}`,
+							result:
+								lines > 0
+									? { content: Array.from({ length: lines }, (_, k) => `e${i}-${k}`).join("\n") }
+									: {},
+							isError: false,
+						});
+					}
+					// Independent model: newest first, one row per entry, one blank row
+					// before an entry only while a row is still free.
+					const maxRows = rows - 2;
+					const visible: string[] = [];
+					let items = 0;
+					for (let i = counts.length - 1; i >= 0 && items < maxRows; i--) {
+						const separator = i > 0 && maxRows - items > 1 ? 1 : 0;
+						if (maxRows - items - separator < 1) break;
+						items += separator + 1;
+						visible.push(`entry-${i}`);
+					}
+					const band = h.widget()!.render(120);
+					const text = band.join("\n");
+					expect(band.length).toBe(rows);
+					assertExactWidth(band, 120);
+					for (const name of visible) expect(text).toContain(name);
+					// No other entry leaked into the band.
+					for (let i = 0; i < counts.length; i++)
+						if (!visible.includes(`entry-${i}`)) expect(text).not.toContain(`entry-${i}`);
+					await h.command("split-height", "20");
+				}),
+				{ numRuns: 25, seed: 20261101 },
+			);
+		} finally {
+			h.setSize(120, 45);
+			await h.command("split-height", "20");
+			await setToolMode(false);
+		}
+	});
+
 	test("an image result renders a one-line fallback, never the base64 payload", async () => {
 		await resetBuffers();
 		await setToolMode(true);
@@ -983,12 +1244,24 @@ describe("complex renderers", () => {
 			await h.emit("message_update", { assistantMessageEvent: { type: "thinking_delta", delta: "live tail" } });
 			expect(joined()).toBe(primed);
 			vi.advanceTimersByTime(100);
-			// The flush bumps the version, which invalidates the band cache.
+			// The flush bumps the version, which invalidates the thinking panel's
+			// memo.
 			expect(joined()).toContain("live tail");
 		} finally {
 			vi.useRealTimers();
 		}
 		await h.emit("message_update", { assistantMessageEvent: { type: "thinking_end", content: "live tail" } });
+	});
+
+	test("a hostile path is sanitized in the files row", async () => {
+		await resetBuffers();
+		await h.emit("tool_call", { toolName: "read", input: { path: "/tmp/omp-split-view/ev\u001b[31mil.ts" } });
+		const band = rows();
+		assertExactWidth(band, 120);
+		const text = band.join("\n");
+		expect(text).toContain("Files (1)");
+		expect(text).toContain("evil.ts");
+		expect(text).not.toMatch(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/);
 	});
 
 	test("the tool panel keeps only the newest entries past its cap", async () => {
@@ -1356,7 +1629,7 @@ describe("geometry presets", () => {
 
 	test("a remount after a resize drops the band memo of the old preset", async () => {
 		// Unmount/remount (panels off then on) keeps the memo but no height
-		// change, so only the preset in the cache key can force a re-layout.
+		// change, so only the preset-derived dock width can force a re-layout.
 		writeConfig({ ...fullLayout, bandHeight: 30 });
 		h.setSize(500, 60); // 8.3 cols/row -> wide
 		await h.emit("session_start");
@@ -1722,6 +1995,65 @@ describe("command arguments and saved layout", () => {
 		expect(h.notifications.at(-1)?.message).toMatch(/^Geometry: wide\b/);
 		rmSync(CONFIG_FILE, { recursive: true, force: true });
 	});
+
+	test("property: off/on restores the whole saved layout for any config", async () => {
+		h.setSize(120, 100);
+		const scenario = fc.record({
+			thinking: fc.boolean(),
+			tools: fc.boolean(),
+			files: fc.boolean(),
+			diff: fc.boolean(),
+			toolMode: fc.constantFrom("compact", "full"),
+			trimResponse: fc.boolean(),
+			bandHeight: fc.integer({ min: 6, max: 40 }),
+			toolsWidthPct: fc.integer({ min: 20, max: 60 }),
+			filesWidth: fc.option(fc.integer({ min: 24, max: 80 }), { nil: null }),
+			geometry: fc.constantFrom("auto", "4k", "wide"),
+		});
+		const emitContent = async () => {
+			await h.emit("message_update", { assistantMessageEvent: { type: "thinking_start" } });
+			await h.emit("message_update", { assistantMessageEvent: { type: "thinking_delta", delta: "saved-layout-thought" } });
+			await h.emit("message_update", {
+				assistantMessageEvent: { type: "thinking_end", content: "saved-layout-thought" },
+			});
+			// No tool_execution_*: a tool row renders a wall-clock duration, and the
+			// two captures are a few commands apart. The files row alone gives the
+			// files column content to compare.
+			await h.emit("tool_call", { toolName: "read", input: { path: "/tmp/restore.ts" } });
+		};
+		try {
+			await fc.assert(
+				fc.asyncProperty(scenario, async cfg => {
+					// A fresh branch: session_start rebuilds the panels from it, so the
+					// captures below cannot inherit content from an earlier case.
+					h.setBranch([]);
+					// At least one panel must be saved: with none the band is unmounted and
+					// there is no layout to compare (a response-only layout restores the
+					// size only, which this oracle cannot see).
+					fc.pre(cfg.thinking || cfg.tools || cfg.files);
+					writeConfig({ split: true, ...cfg });
+					await h.emit("session_start");
+					await emitContent();
+					const initial = h.widget()!.render(120);
+					// Diverge on every size/geometry field the restore owns; the height
+					// is always different, so the divergence is always observable.
+					await h.command("split-height", cfg.bandHeight === 8 ? "9" : "8");
+					await h.command("split-tools-width", cfg.toolsWidthPct === 60 ? "20" : "60");
+					await h.command("split-geometry", cfg.geometry === "wide" ? "4k" : "wide");
+					await setToggle("split-tools-view", cfg.toolMode === "full" ? /compact/ : /full/);
+					const diverged = h.widget()!.render(120);
+					expect(diverged).not.toEqual(initial);
+					await h.command("split"); // off
+					await h.command("split"); // on: the saved layout
+					expect(h.widget()!.render(120)).toEqual(initial);
+				}),
+				{ numRuns: 15, seed: 20261101 },
+			);
+		} finally {
+			h.setSize(120, 45);
+			rmSync(CONFIG_FILE, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("persistence and lifecycle", () => {
@@ -2077,6 +2409,62 @@ describe("persistence and lifecycle", () => {
 		resetConfig();
 	});
 
+	test("property: a failed settings write never outlives the session that hit it", async () => {
+		const scenario = fc.record({
+			thinking: fc.boolean(),
+			tools: fc.boolean(),
+			trimResponse: fc.boolean(),
+			bandHeight: fc.integer({ min: 6, max: 26 }),
+			fail: fc.boolean(),
+		});
+		h.setSize(120, 45);
+		try {
+			await fc.assert(
+				fc.asyncProperty(scenario, async ({ thinking, tools, trimResponse, bandHeight, fail }) => {
+					// Latch the failure the way a broken host build would. Settle to a
+					// known "off" policy first (the latch is clear at this point: the
+					// previous run and the preceding example both end in a
+					// session_start), then ask for "on" behind a settings object whose
+					// every read throws, so the policy change reaches the override call
+					// and latches.
+					if (fail) {
+						await h.command("split-trim-response", "off");
+						h.setSettings(
+							new Proxy(
+								{},
+								{
+									get() {
+										throw new Error("no settings");
+									},
+								},
+							),
+						);
+						try {
+							await h.command("split-trim-response", "on");
+						} finally {
+							h.setSettings(settings);
+						}
+					}
+					writeConfig({ split: true, thinking, tools, trimResponse, bandHeight });
+					await h.emit("session_start");
+					// 45 rows and a band of at most 26 rows keep the band on screen, so
+					// the policy is the plain one.
+					expect(effective("hideThinkingBlock")).toBe(trimResponse || thinking);
+					expect(effective("display.hideToolActivity")).toBe(trimResponse);
+				}),
+				{ numRuns: 12, seed: 20261101 },
+			);
+		} finally {
+			h.setSettings(settings);
+			// Leave a mounted, configured session for the shutdown test that follows.
+			writeConfig({ split: true, thinking: true, tools: true });
+			await h.emit("session_start");
+			h.setSize(120, 45);
+			await h.command("split-height", "20");
+			resetConfig();
+		}
+	});
+
 	test("session_shutdown unmounts the widget and clears timers", async () => {
 		expect(h.widgets.get("split-view")).toBeDefined();
 		await h.emit("session_shutdown");
@@ -2346,6 +2734,249 @@ describe("advisor mode", () => {
 				expect(h.status("split-view.advisor")).toBe(expected);
 			}),
 			{ numRuns: 30, seed: 20261101 },
+		);
+	});
+});
+
+/**
+ * The per-panel memo replaced one whole-band key, so its contracts are
+ * properties over arbitrary state: a memoised band is byte-identical to one
+ * rebuilt from scratch, a change to one panel rebuilds only that panel, and
+ * neither the streaming window nor the ingest-time file fields change what a
+ * settled panel shows.
+ */
+describe("band memo properties", () => {
+	const render = (width = 200) => h.widget()?.render(width) ?? [];
+	/** A known layout: all three panels, compact rows, diff on. */
+	beforeAll(async () => {
+		writeConfig(fullLayout);
+		h.setSize(200, 60);
+		await h.emit("session_start");
+		await setToggle("split-thinking", /Thinking on/);
+		await setToggle("split-tools", /Tools on/);
+		await setToggle("files", /Files panel on/);
+		await setToggle("split-tools-view", /compact/);
+		await setToggle("split-diff", /\bon$/);
+		await h.command("split-height", "40");
+		expect(render().join("\n")).toContain("📂 Files");
+	});
+
+	afterAll(async () => {
+		await resetBuffers();
+		rmSync(CONFIG_FILE, { recursive: true, force: true });
+		h.setSize(120, 45);
+		await h.command("split-height", "20");
+	});
+
+	test("property: a memoised band equals one rebuilt from scratch", async () => {
+		const step = fc.constantFrom("thinking", "tool", "file", "diff", "height", "width", "view");
+		await fc.assert(
+			fc.asyncProperty(
+				fc.array(step, { maxLength: 6 }),
+				fc.integer({ min: 90, max: 220 }),
+				fc.integer({ min: 20, max: 40 }),
+				async (steps, width, height) => {
+					// Room for the band plus the transcript it must not eat into, so
+					// the comparison is never between two hidden bands.
+					h.setSize(width, height + MIN_ROWS_BELOW_BAND);
+					await h.command("split-height", String(height));
+					await resetBuffers();
+					// Warm the memo before the steps, so a step the keys miss leaves a
+					// stale panel behind for the comparison below to catch.
+					render(width);
+					for (const [index, kind] of steps.entries()) {
+						const label = `memo${index}`;
+						if (kind === "thinking") {
+							await h.emit("message_update", { assistantMessageEvent: { type: "thinking_start" } });
+						} else if (kind === "tool") {
+							await h.emit("tool_execution_start", {
+								toolCallId: label,
+								toolName: "bash",
+								args: { command: label },
+							});
+							await h.emit("tool_execution_end", {
+								toolCallId: label,
+								result: { content: label },
+								isError: false,
+							});
+						} else if (kind === "file") {
+							await h.emit("tool_call", {
+								toolName: "read",
+								input: { path: `/tmp/omp-split-view/${label}.ts` },
+							});
+						} else if (kind === "diff") {
+							await h.emit("tool_result", {
+								toolName: "edit",
+								input: { path: `/tmp/omp-split-view/${label}.ts` },
+								details: { diff: `@@ -1 +1 @@\n-${label}\n+${label}!` },
+							});
+						} else if (kind === "height") {
+							await h.command("split-height", String(20 + index));
+						} else if (kind === "width") {
+							h.setSize(90 + index * 10, height + MIN_ROWS_BELOW_BAND);
+						} else {
+							await h.command("split-tools-view");
+						}
+					}
+					const memoised = render(width);
+					expect(memoised.length).toBeGreaterThan(0);
+					assertExactWidth(memoised, width);
+					// A render that changes nothing builds nothing.
+					const settled = panelRenderCounts();
+					expect(render(width)).toEqual(memoised);
+					expect(panelRenderCounts()).toEqual(settled);
+					// Rebuilt from nothing: equal rows mean every key covers its inputs.
+					h.component()!.invalidate();
+					expect(render(width)).toEqual(memoised);
+				},
+			),
+			{ numRuns: 40, seed: 20261101 },
+		);
+	});
+
+	test("property: a change to one panel rebuilds only that panel", async () => {
+		const changed = fc.constantFrom("thinking", "tools", "files");
+		await fc.assert(
+			fc.asyncProperty(
+				changed,
+				fc.integer({ min: 90, max: 220 }),
+				fc.integer({ min: 20, max: 40 }),
+				async (panel, width, height) => {
+					h.setSize(width, height + MIN_ROWS_BELOW_BAND);
+					await h.command("split-height", String(height));
+					await resetBuffers();
+					// Warm every panel: this render is the baseline, not a build wall.
+					expect(render(width).join("\n")).toContain("📂 Files");
+					const before = panelRenderCounts();
+					const expected = { thinking: "a confined thought", tools: "grep", files: "confined.ts" }[panel];
+					if (panel === "thinking") {
+						await h.emit("message_update", { assistantMessageEvent: { type: "thinking_start" } });
+						await h.emit("message_update", {
+							assistantMessageEvent: { type: "thinking_delta", delta: expected },
+						});
+						await h.emit("message_update", {
+							assistantMessageEvent: { type: "thinking_end", content: expected },
+						});
+					} else if (panel === "tools") {
+						await h.emit("tool_execution_start", {
+							toolCallId: "confined",
+							toolName: expected,
+							args: { pattern: "x" },
+						});
+						await h.emit("tool_execution_end", {
+							toolCallId: "confined",
+							result: { content: "hit" },
+							isError: false,
+						});
+					} else {
+						await h.emit("tool_call", {
+							toolName: "read",
+							input: { path: `/tmp/omp-split-view/${expected}` },
+						});
+					}
+					expect(render(width).join("\n")).toContain(expected);
+					expect(panelRenderCounts()).toEqual({
+						thinking: before.thinking + Number(panel === "thinking"),
+						tools: before.tools + Number(panel === "tools"),
+						files: before.files + Number(panel === "files"),
+					});
+				},
+			),
+			{ numRuns: 18, seed: 20261101 },
+		);
+	});
+
+	test("property: a cumulative stream renders what one final result renders", async () => {
+		const line = fc
+			.array(fc.constantFrom("a", "b", "c", "1", "-"), { minLength: 1, maxLength: 10 })
+			.map(chars => chars.join(""));
+		const scenario = fc.record({
+			lines: fc.array(line, { minLength: 1, maxLength: 60 }),
+			updates: fc.integer({ min: 1, max: 12 }),
+		});
+		/** Everything the band shows below the tool's own row. */
+		const detail = (band: readonly string[]): string => {
+			const at = band.findIndex(row => row.includes("bash"));
+			expect(at).toBeGreaterThanOrEqual(0);
+			return band.slice(at + 1).join("\n");
+		};
+		await fc.assert(
+			fc.asyncProperty(scenario, async ({ lines, updates }) => {
+				h.setSize(200, 100);
+				await h.command("split-height", "60");
+				const text = lines.join("\n");
+				/** Rows while the call runs, and rows once it settled. */
+				const deliver = async (streamed: boolean): Promise<{ live: string; settled: string }> => {
+					await resetBuffers();
+					await h.emit("tool_execution_start", {
+						toolCallId: "stream",
+						toolName: "bash",
+						args: { command: "cat data" },
+					});
+					if (streamed) {
+						// Cumulative partials, as the host sends them: `updates` prefixes
+						// of the same output, ending on the whole text.
+						for (let step = 1; step < updates; step++) {
+							const upto = Math.ceil((lines.length * step) / updates);
+							await h.emit("tool_execution_update", {
+								toolCallId: "stream",
+								partialResult: { content: [{ type: "text", text: lines.slice(0, upto).join("\n") }] },
+							});
+						}
+					}
+					// Both paths end on one update carrying the whole text, so the live
+					// rows are comparable: any accumulation instead of replacement, or
+					// any window that is not the newest suffix, shows up here.
+					await h.emit("tool_execution_update", {
+						toolCallId: "stream",
+						partialResult: { content: [{ type: "text", text }] },
+					});
+					const live = detail(render(200));
+					await h.emit("tool_execution_end", {
+						toolCallId: "stream",
+						result: { content: text },
+						isError: false,
+					});
+					const settled = detail(render(200));
+					assertExactWidth(render(200), 200);
+					return { live, settled };
+				};
+				const streamed = await deliver(true);
+				const once = await deliver(false);
+				expect(streamed.live).toBe(once.live);
+				expect(streamed.settled).toBe(once.settled);
+			}),
+			{ numRuns: 15, seed: 20261101 },
+		);
+	});
+
+	test("property: every tracked file shows its ingest-precomputed name under its directory", async () => {
+		const name = fc
+			.array(fc.constantFrom("a", "b", "c", "-", "_"), { minLength: 1, maxLength: 10 })
+			.map(chars => chars.join(""));
+		const scenario = fc.record({
+			names: fc.array(name, { minLength: 1, maxLength: 8 }),
+			nested: fc.boolean(),
+		});
+		await fc.assert(
+			fc.asyncProperty(scenario, async ({ names, nested }) => {
+				h.setSize(200, 60);
+				await h.command("split-height", "40");
+				await resetBuffers();
+				const dir = nested ? "/tmp/omp-split-view/deep" : "/tmp";
+				// The index keeps every name distinct, so each row is its own file.
+				const touched = names.map((stem, index) => `${stem}-${index}.ts`);
+				for (const file of touched)
+					await h.emit("tool_call", { toolName: "read", input: { path: `${dir}/${file}` } });
+				const band = render(200);
+				assertExactWidth(band, 200);
+				const text = band.join("\n");
+				for (const file of touched) expect(text).toContain(file);
+				// A run long enough to group gets one header for its directory.
+				if (touched.length > 3) expect(text).toContain(nested ? "omp-split-view/deep/" : "/tmp/");
+				expect(text).not.toMatch(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/);
+			}),
+			{ numRuns: 15, seed: 20261101 },
 		);
 	});
 });
