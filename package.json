@@ -25,6 +25,10 @@
 		"lint": "eslint .",
 		"lint:fix": "eslint . --fix",
 		"test:coverage": "bun test --coverage --coverage-reporter=text --coverage-reporter=lcov && bun scripts/check-coverage.ts",
+		"ship": "bun scripts/ship.ts",
+		"ship:check": "bun scripts/ship.ts --check",
+		"ship:dry": "bun scripts/ship.ts --dry-run",
+		"release": "bun scripts/release.ts",
 		"check:package": "bun scripts/check-package.ts",
 		"prepack": "bun run check:package",
 		"prepublishOnly": "bun run check:package"

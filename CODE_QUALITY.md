@@ -20,6 +20,8 @@ its row.
 | `bun run lint` | ESLint 10 + typescript-eslint + sonarjs; also the cyclomatic/cognitive/size metrics | 0 errors, 0 warnings |
 | `bun run typecheck` | `tsc --noEmit`, strict | clean |
 | `bun run check:package` | the shipped tarball: `files` coverage and declared deps via the `omp.extensions` import graph (`scripts/check-package.ts`) | `ok` — 3 shipped modules |
+| `bun run ship` | the five gates, then rewrites the measured numbers in README/CODE_QUALITY, commits, repacks and verifies the tarball against `HEAD` | exit 0 only when every step passed; `--check` runs the gates and fails on stale numbers without writing |
+| `bun run release <current\|patch\|minor\|major\|x.y.z>` | registry check → version bump (or no bump) → `ship` → annotated `v<version>` tag; `--push` pushes the branch and tag | exit 0 only if every step passed; `--dry-run` changes nothing, and a failed `ship` restores the version and creates no tag |
 | `omp --no-extensions -e ./split-view.ts --mode rpc < /dev/null` | the real host loader, which resolves `@oh-my-pi/*` differently from Bun (see the advisor-panel row on host-load) | no `Failed to load extension` line; needs a local `omp`, so CI cannot run it |
 | geometry properties (`band properties`, `geometry preset properties`) | 40–300 cols × 6–40 rows with a pinned height, plus 90–420 cols × 24–140 rows for both presets: exact rows/cells, dock offset, no control chars | 0 failures |
 | geometry properties (`geometry profiles`) | both curves at 0–2000 rows/cols against literal shares, aspect threshold at every row count | 0 failures |
@@ -41,9 +43,9 @@ targets control characters.
 
 59,179 assertions, ~3.9 s wall time. Uncovered:
 
-- `split-view.ts:138` — `themeGetter` default that throws if something renders
+- `split-view.ts:141` — `themeGetter` default that throws if something renders
   before `session_start` binds a theme. Deliberate, unreachable.
-- Functions: 192/196 counted (`FNF`/`FNH` in `coverage/lcov.info`, `test/**`
+- Functions: 191/195 counted (`FNF`/`FNH` in `coverage/lcov.info`, `test/**`
   excluded as the gate does). The four misses are the throwing `themeGetter`
   default, `BandHub.dispose` (no-op host hook), and the two no-op default
   exports that exist so omp's extension auto-discovery does not report a load

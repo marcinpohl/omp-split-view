@@ -206,6 +206,27 @@ bun run check:package # verify the published tarball is self-contained
 omp --no-extensions -e ./split-view.ts --mode rpc < /dev/null  # must print no "Failed to load extension"
 ```
 
+`bun run ship` is this loop end to end: it runs the gates, rewrites the
+measured numbers in this README and `CODE_QUALITY.md`, commits every tracked
+change with the snapshot in the message, then repacks and compares the
+tarball with `HEAD` (host-loading the packed entry when `omp` is on `PATH`,
+and skipping that step when the host itself refuses the pinned Bun).
+The prose — feature claims, code comments, the snapshot's "after …" batch
+list — is not generated; the script only owns values a command produced.
+
+```sh
+bun run ship --check   # gates + doc-drift check, no writes (CI-safe)
+bun run ship --dry-run # print the doc refresh, commit/pack nothing
+bun run ship -m "..."  # gates → refresh → commit → repack → verify
+```
+
+`--no-commit` refreshes and repacks without a commit (the tarball is then
+checked against the working tree), `--no-pack` stops after the commit,
+`--allow-untracked` admits new files to the commit, and `--skip-bun-check`
+bypasses the 1.4.3 pin. A dirty tree is expected: the commit is the step that
+captures it, so `ship` is meant to be the last command of a change, not a
+pre-commit hook.
+
 The last line is the host-load check: `bun test` resolves `@oh-my-pi/*`
 imports the way Bun does, but omp's extension loader only answers those
 specifiers for the extension's own files. An import that reaches a host module
@@ -263,11 +284,25 @@ measured on 1.4.3.
 
 `.github/workflows/publish.yml` runs on `v*` tags: it re-runs the gates, fails
 unless the tag equals `v<version>` from `package.json`, then runs
-`bun publish --access public` with the `NPM_TOKEN` repository secret. A release
-is `git tag -a v<version> -m "omp-split-view <version>" && git push origin
-v<version>` once that secret exists; everything before the publish step can be
-checked locally, but the step itself cannot (`bun publish --dry-run` packs the
-tarball and then exits with `missing authentication`).
+`bun publish --access public` with the `NPM_TOKEN` repository secret.
+
+Everything up to the tag is automated:
+
+```sh
+bun run release current               # tag today's 0.1.0 (first publish)
+bun run release patch                 # 0.1.0 → 0.1.1, commit + local tag
+bun run release minor --push          # also push branch + tag → the workflow
+bun run release 0.2.0 --dry-run       # print the plan, change nothing
+```
+
+`release` verifies the target version is free in the npm registry, bumps
+`package.json`, runs `ship` (all gates, doc refresh, commit, pack verification),
+then creates the annotated `v<version>` tag. `--push` pushes the current branch
+and the tag, which starts this workflow; `--skip-registry-check` is for an
+offline or private registry. A failed `ship` restores the version field and
+leaves no tag. The `NPM_TOKEN` secret and its publish rights cannot be checked
+locally, and `bun publish --dry-run` still stops at `missing authentication`
+after packing, so the workflow is the first real publish.
 
 Release prerequisites, in order: add the remote, push `main`, add the
 `NPM_TOKEN` secret to the repository, then push the tag. The registry has no
