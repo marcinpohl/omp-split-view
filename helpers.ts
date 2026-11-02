@@ -280,17 +280,6 @@ export function lastImageBlock(content: unknown): ImageBlock | undefined {
 	return undefined;
 }
 
-/** The first `cap` lines of an already-trimmed output list, plus how many
- * lines were hidden (for the "+N more" marker). `cap <= 0` shows nothing. */
-export function outputPreview(
-	lines: string[],
-	cap: number,
-): { shown: string[]; hidden: number } {
-	if (cap <= 0 || lines.length === 0) return { shown: [], hidden: lines.length };
-	const shown = lines.slice(0, cap);
-	return { shown, hidden: lines.length - shown.length };
-}
-
 /** Which transcript content omp should hide for the current panel layout. */
 export interface TranscriptVisibility {
 	hideThinking: boolean;

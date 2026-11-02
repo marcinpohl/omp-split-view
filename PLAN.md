@@ -6,8 +6,11 @@ checker, and throwaway probe scripts; none are inferred.
 
 `CODE_QUALITY.md` owns the measured snapshot (tests/coverage/lint) and the
 ranked queue; this file owns the behaviour descriptions and acceptance text.
-Status below is reconciled against `CODE_QUALITY.md` as of the G1 geometry
-preset switch (the batch before it: Q1–Q7 structural, B7 CI).
+Status below is reconciled against `CODE_QUALITY.md` as of the tool-preview
+window (R3); before it: R2 mount-once harness/auto height, R1 visibility
+mutation coverage, W6 bash replay, C1 code simplification, T1 test-suite
+simplification, A1 advisor compatibility, G1 geometry presets, Q1–Q7
+structural, B7 CI.
 
 ## Verified baseline (re-check after any change)
 
@@ -16,18 +19,18 @@ its numbers in sync with these commands.
 
 | Command | Expected |
 | --- | --- |
-| `bun test` | 133 pass, 0 fail, 49019 expect() calls |
-| `bun run test:coverage` | gate passes: lines ≥ 99%, functions ≥ 90% (currently 99.92% / 97.20%) |
-| `bun run lint` | 0 errors, 2 warnings (the parked Q8 pair) |
+| `bun test` | 129 pass, 0 fail, 45752 expect() calls |
+| `bun run test:coverage` | gate passes: lines ≥ 99%, functions ≥ 90% (currently 99.93% / 97.55%) |
+| `bun run lint` | 0 errors, 0 warnings |
 | `bun run typecheck` | clean (`tsc --noEmit`, strict) |
 | `bun run check:package` | `check-package: ok — 3 shipped modules (@marcinpohl/omp-split-view@0.1.0)` |
 | geometry sweep (probe below) | 0 failures (40–300 cols × 6–40 rows), rows == height, every row exactly `width` cells, no control chars |
 | geometry preset properties | 0 failures (90–420 cols × 24–140 rows × saved/auto preset; both curves at 0–2000 rows/cols against literal shares) |
 | `bun run demo` | prints frames; section 5 shows 120×45 `4k` 20 │ 56│30│34, 400×100 `4k` 45 │ 195│105│100, 500×60 `wide` 21 │ 221│119│160 |
 
-Files: `split-view.ts` 1643 L, `helpers.ts` 323 L, `ui-panels-config.ts` 165 L,
-`test/split-view.test.ts` 1779 L, `test/properties.test.ts` 533 L,
-`test/helpers.test.ts` 294 L, `test/setup.ts` 7 L, `scripts/check-coverage.ts`
+Files: `split-view.ts` 1854 L, `helpers.ts` 312 L, `ui-panels-config.ts` 176 L,
+`test/split-view.test.ts` 2351 L, `test/properties.test.ts` 458 L,
+`test/helpers.test.ts` 202 L, `test/setup.ts` 7 L, `scripts/check-coverage.ts`
 90 L, `scripts/check-package.ts` 169 L, `.github/workflows/ci.yml` 18 L,
 `.github/workflows/publish.yml` 39 L, `CODE_QUALITY.md`, `eslint.config.js`.
 Git repository with CI (W7/B7 done); no remote, so the workflow is inert until
@@ -106,6 +109,34 @@ same-day probe numbers before → after):
   pre-port `Panel C:`, and the `normalizeConfig` property asserts
   `MIN_BAND_HEIGHT`/`MAX_BAND_HEIGHT` with explicit clamp cases at both ends.
 
+Fixed during the advisor-compatibility pass (A1 in `CODE_QUALITY.md`):
+
+- **Advisor/subagent tool activity (A1).** omp emits `tool_call`/`tool_result`
+  for the advisor's wrapped builtins (`read`/`grep`/…, identity
+  `ctx.agent.kind === "sub"`); the advisor's own `advise` tool is constructed
+  unwrapped and emits nothing. The files/diff panes used to ingest every
+  `tool_call`/`tool_result` regardless of identity, so a review's reads showed
+  as primary work and then disappeared on resume (replay walks the primary
+  branch only). `isMainAgent` gates `tool_call`, `tool_result` and the three
+  `tool_execution_*` hooks; a missing identity is treated as main for older
+  hosts. Acceptance: advisor-attributed events leave `Files (0)` and Last-Edit
+  untouched while main-agent events still populate both.
+- **Advisor tally status line (A1).** Advisor cards are `custom` messages
+  (`customType: "advisor"`, `details.notes`) delivered live on both paths
+  (turn-less recording emits `message_start`/`message_end`; steered batches
+  pass through the same pair when the loop injects them). `message_end` counts
+  severities since the last real user prompt and mirrors them through
+  `ctx.ui.setStatus("split-view.advisor", "Advisor: 1 blocker · 2 concerns")`;
+  `reconstruct` rebuilds the tally from `custom_message` branch entries. It is
+  cleared on the next real prompt, when every panel is off, and at shutdown.
+  A fourth band column was rejected: notes are prose in a fixed-height band and
+  the transcript card already renders them at full width. Acceptance: live
+  text and reset, agent-attributed synthetic user messages do not reset, branch
+  rebuild after `session_tree`, and `/split` off clears while `/split` on
+  restores. Properties (seed `20261101`): advisor-only tool streams leave the
+  band byte-identical, the band equals the main-only subsequence of any
+  interleaving, and the tally matches an independent model live and replayed.
+
 ## Decision before W1 (resolved)
 
 Fresh-install behaviour stays **bare** (`normalizeConfig({})` → `split:false`).
@@ -130,7 +161,7 @@ that order's terms. After every item run `bun test`, `bun run test:coverage`,
 | W3 `capToolText` tiny caps | done | — |
 | W4 files-only blank < 90 cols | done | B1 |
 | W5 diff follows tool name | done | B2 |
-| W6 `reconstruct` bash replay | open (Q3 landed; policy not folded) | Q3 |
+| W6 `reconstruct` bash replay | done (policy a) | W6 |
 | W7 repository hygiene | done | B7 |
 | T1 `/split-trim-response` | done | B4 |
 | T2 theme invalidation | done | — |
@@ -277,7 +308,7 @@ preset), `/split-save` persists it, and a manual `/split-height` or a saved
   else renders identically), `auto|4k|wide` round-tripping through
   `/split-save`, and a remount at a new shape dropping the band memo.
 
-### W6 — `reconstruct` replays every bash token through `fs` (low-med) — **open (Q3 landed without folding it)**
+### W6 — `reconstruct` replays every bash token through `fs` (low-med) — **done (policy a)**
 
 - Where: `replayToolResult`/`record` → `pathsFrom` → `bashPathHits`
   (`split-view.ts`).
@@ -286,9 +317,15 @@ preset), `/split-save` persists it, and a manual `/split-height` or a saved
   filesystem; cost grows with branch length and deleted/moved files disappear.
 - Note: Q3 split `reconstruct` into `replayAssistant`/`replayToolResult` and
   left this policy alone on purpose (the structural batch was not allowed to
-  change behaviour), so the decision is still open and now lives in one
-  function (`replayToolResult` → `record`).
-- Change options (pick one, note the choice):
+  change behaviour), so the decision lived in one function
+  (`replayAssistant` → `record`).
+- Choice taken: **(a) no replay for bash** — `replayAssistant` still rebuilds
+  the tool row but skips `record()` for `bash`, so "seen" entries are live
+  observation only. Rejected (b) as still filesystem-dependent and (c) as
+  accepting non-files into the panel. Regression: "replay never re-derives
+  bash-seen files from the filesystem" (three bash calls naming real files,
+  one read → `Files (1)`; rebuild byte-identical; mutation-checked).
+- Options considered:
   - (a) no replay for bash: only live `tool_call` events populate "seen";
   - (b) cap replay to the last N bash calls in the branch;
   - (c) replay but skip `stat` (accept tokens with a path separator only).
@@ -308,7 +345,7 @@ preset), `/split-save` persists it, and a manual `/split-height` or a saved
 - Note: the repo still has no remote, so the workflow is inert until one is
   added; the same sequence was run locally in order.
 - Acceptance: met locally on the current snapshot — 93 pass / 0 fail, coverage
-  gate exit 0, `0 errors, 2 warnings`, typecheck clean.
+  gate exit 0, `0 errors, 0 warnings`, typecheck clean.
 
 ## Test gaps (open items in CODE_QUALITY queue order)
 
@@ -328,8 +365,10 @@ assertions use the harness `setTheme` hook. `test/setup.ts` redirects
   (dropping `.toLowerCase()` fails the test). `unsupported settings warn and
   do not apply an override` swaps in a `Proxy` whose every read throws, so the
   existing `catch` sets `visibilityUnsupported`: `warning` notify, no override
-  applied, and the test must stay last in the file because that flag is
-  process-global. Missing-ID detection is not simulated — both handles exist,
+  applied. The flag latches for the session only — `session_start` clears it
+  and retries, covered by "session_start retries transcript visibility after a
+  settings failure" — so the test no longer has to stay last in the file.
+  Missing-ID detection is not simulated — both handles exist,
   so a throwing settings object is the only reachable route into that branch.
 - [x] **T2 — Theme invalidation.** Done: "every theme colour the band uses
   invalidates the row cache" uses a mutable theme; covers W1 and exposed the

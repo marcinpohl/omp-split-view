@@ -82,7 +82,6 @@ import {
 	formatDuration,
 	lastImageBlock,
 	maxBandHeight,
-	outputPreview,
 	sanitizeText,
 	transcriptVisibility,
 	truncateInline,
@@ -96,7 +95,9 @@ import {
 	normalizeConfig,
 	saveUiPanelsConfig,
 	type GeometrySetting,
+	type NormalizedUiPanelsConfig,
 	type ToolMode,
+	type UiPanelsConfig,
 } from "./ui-panels-config.ts";
 import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
@@ -148,6 +149,83 @@ let filesWidth: number | null = null;
 let geometrySetting: GeometrySetting = "auto";
 /** Preset in force for this session (resolved from `geometrySetting`). */
 let geometryMode: GeometryMode = "4k";
+
+// ─── advisor status line ─────────────────────────────────────────────────────
+
+// Advisor mode delivers batched notes as `custom` messages (customType
+// "advisor") that omp already renders as a full-width transcript card. The
+// card is the content; this one-line status only keeps the tally visible once
+// the card scrolls away, so it costs no band column and repeats no prose.
+const ADVISOR_STATUS_KEY = "split-view.advisor";
+
+interface AdvisorTally {
+	blocker: number;
+	concern: number;
+	nit: number;
+	note: number;
+}
+
+const advisorTally: AdvisorTally = { blocker: 0, concern: 0, nit: 0, note: 0 };
+
+function resetAdvisorTally(): void {
+	advisorTally.blocker = 0;
+	advisorTally.concern = 0;
+	advisorTally.nit = 0;
+	advisorTally.note = 0;
+}
+
+/** The advisor card carries its notes in `details.notes`; severity is optional. */
+function addAdvisorNotes(details: unknown): void {
+	if (!isRecord(details) || !Array.isArray(details.notes)) return;
+	for (const note of details.notes) {
+		if (!isRecord(note)) continue;
+		const severity = note.severity;
+		if (severity === "blocker" || severity === "concern" || severity === "nit") advisorTally[severity]++;
+		else advisorTally.note++;
+	}
+}
+
+function advisorStatusText(): string | undefined {
+	const parts: string[] = [];
+	const push = (count: number, one: string, many: string): void => {
+		if (count > 0) parts.push(`${count} ${count === 1 ? one : many}`);
+	};
+	push(advisorTally.blocker, "blocker", "blockers");
+	push(advisorTally.concern, "concern", "concerns");
+	push(advisorTally.nit, "nit", "nits");
+	push(advisorTally.note, "note", "notes");
+	return parts.length > 0 ? `Advisor: ${parts.join(" · ")}` : undefined;
+}
+
+/** Details of a delivered advisor card, or undefined for any other message. */
+function advisorNoteDetails(message: unknown): { details: unknown } | undefined {
+	if (!isRecord(message) || message.role !== "custom" || message.customType !== "advisor") return undefined;
+	return { details: message.details };
+}
+
+/** A prompt the user typed: not a synthetic continuation, not advisor steering.
+ * Shared by live delivery and branch replay so both read the same turn boundary. */
+function isUserPrompt(message: unknown): boolean {
+	if (!isRecord(message) || message.role !== "user") return false;
+	return message.synthetic !== true && message.attribution !== "agent";
+}
+
+function syncAdvisorStatus(ctx: ExtensionContext): void {
+	if (ctx.mode !== "tui") return;
+	// The tally belongs to the band: with every panel off the extension is
+	// hidden, so leaving its status line up would be stale chrome.
+	const visible = thinkingOn || toolsOn || filesOn;
+	try {
+		ctx.ui.setStatus(ADVISOR_STATUS_KEY, visible ? advisorStatusText() : undefined);
+	} catch {
+		/* the status line is decorative: never break an event handler */
+	}
+}
+
+/** Advisor tool calls reach extension `tool_call`/`tool_result` hooks with a
+ * `sub` identity; the band renders the session the user watches, so only the
+ * top-level agent may feed it. Missing identity (older host) is treated as main. */
+const isMainAgent = (ctx: ExtensionContext): boolean => ctx.agent?.kind !== "sub";
 
 // ─── thinking buffer ─────────────────────────────────────────────────────────
 
@@ -302,6 +380,9 @@ interface ToolEntry {
 	 * base64 payload is not retained (an 8 MB result used to live in the
 	 * entry for the whole session while only this label was ever shown). */
 	imageLabel?: string;
+	/** Full non-empty line count seen for the output; the display keeps only
+	 * a tail window, so this is what the "+N earlier" marker reports. */
+	outputLineCount?: number;
 	diff?: string;
 	startedAt?: number;
 	endedAt?: number;
@@ -361,18 +442,22 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
 }
 
+/** Text a tool reported, unsanitized and uncapped. Sanitization and the
+ * character cap both live in `setToolOutput`, so a streaming update pays for
+ * one pass over the cumulative partial instead of two, and the cap applies to
+ * what is stored — never to what is counted. */
 function resultText(result: unknown): string {
-	if (typeof result === "string") return capToolText(result);
+	if (typeof result === "string") return result;
 	if (!isRecord(result)) return "";
 	const content = result.content;
-	if (typeof content === "string") return capToolText(sanitizeText(content));
+	if (typeof content === "string") return content;
 	if (!Array.isArray(content)) return "";
 	const text: string[] = [];
 	for (const block of content) {
 		if (!isRecord(block) || block.type !== "text" || typeof block.text !== "string") continue;
 		text.push(block.text);
 	}
-	return capToolText(sanitizeText(text.join("")));
+	return text.join("");
 }
 
 function argsJson(args: unknown): string {
@@ -383,8 +468,30 @@ function argsJson(args: unknown): string {
 	}
 }
 
-function setToolOutput(entry: ToolEntry, text: string): void {
-	const lines = capToolText(sanitizeText(text)).split(/\r?\n/);
+/** Replace the stored output window with `text`'s sanitized tail and raise the
+ * reported line count. `countAll` counts every non-empty line of the full text
+ * (final results); a streaming update counts only the retained window. Both
+ * paths sanitize the whole text once — one linear pass over the cumulative
+ * partial, unavoidable if the stored tail is to be free of control characters.
+ * Beyond that pass, a streaming update is O(retained) (cap, count, tail); the
+ * final-result count is linear in the full text, paid once per tool call. */
+function setToolOutput(entry: ToolEntry, text: string, countAll = false): void {
+	const sanitized = sanitizeText(text);
+	const lines = capToolText(sanitized)
+		.split(/\r?\n/)
+		.map(line => line.trim())
+		.filter(Boolean);
+	// A whitespace-only final result carries no content: keep whatever the
+	// stream already reported instead of blanking the panel.
+	if (lines.length === 0) return;
+	const total = countAll
+		? sanitized
+				.split(/\r?\n/)
+				.map(line => line.trim())
+				.filter(Boolean).length
+		: lines.length;
+	// Updates are cumulative; the max survives a shorter final result.
+	entry.outputLineCount = Math.max(entry.outputLineCount ?? 0, total);
 	entry.output = lines.slice(-MAX_TOOL_OUTPUT_LINES).join("\n");
 }
 
@@ -422,7 +529,7 @@ function ingestToolResult(id: string, result: unknown, isError: boolean, endedAt
 	if (!entry) return;
 	if (endedAt !== undefined && entry.startedAt !== undefined) entry.endedAt = endedAt;
 	const text = resultText(result);
-	if (text) setToolOutput(entry, text);
+	if (text) setToolOutput(entry, text, true);
 	const fields = isRecord(result) ? result : {};
 	// Computed at ingest: the base64 payload is never retained.
 	entry.imageLabel = imageLabel(lastImageBlock(fields.content));
@@ -472,38 +579,71 @@ function toolPrefix(theme: Theme, entry: ToolEntry, textWidth: number): string {
 	const prefix = `${mark} ${name}${duration}`;
 	const room = textWidth - visibleWidth(prefix) - 1;
 	const args = entry.args && room >= 8 ? theme.fg("muted", ` ${truncateInline(entry.args, room)}`) : "";
-	return prefix + args;
+	// A long tool name must never wrap: a card's row count has to be knowable
+	// before it is budgeted.
+	return truncateToWidth(prefix + args, textWidth);
 }
 
-/** Full-mode detail rows: output preview (+hidden count) and image fallback. */
+/** Full-mode detail rows: the newest output lines (+earlier count) and image
+ * fallback. The stored window is a tail, so the preview shows its newest
+ * `previewCap` lines and reports everything older. */
 function toolDetailLines(theme: Theme, entry: ToolEntry, textWidth: number, previewCap: number): string[] {
 	const out: string[] = [];
-	const content = (entry.output || "")
-		.split(/\r?\n/)
-		.map(line => line.trim())
-		.filter(Boolean);
+	const content = (entry.output || "").split(/\r?\n/).filter(Boolean);
 	if (content.length === 0) {
 		if (entry.active) out.push(theme.fg("dim", "  · …"));
 	} else {
-		const { shown, hidden } = outputPreview(content, previewCap);
+		const total = Math.max(entry.outputLineCount ?? content.length, content.length);
+		const shown = content.slice(-previewCap);
+		const hidden = total - shown.length;
+		if (hidden > 0) out.push(theme.fg("dim", `  · +${hidden} earlier lines`));
 		for (const line of shown) out.push(theme.fg("toolOutput", `  · ${truncateInline(line, textWidth - 4)}`));
-		if (hidden > 0) out.push(theme.fg("dim", `  · +${hidden} more`));
 	}
 	if (entry.imageLabel) out.push(theme.fg("toolOutput", `  · ${entry.imageLabel}`));
 	return out;
 }
 
-/** Full-mode diff block under a tool row; empty when the result had no diff. */
-function toolDiffLines(theme: Theme, diff: string | undefined): string[] {
+/** Full-mode diff block under a tool row; empty when the result had no diff.
+ * Every row is truncated to the column so it occupies exactly one row. */
+function toolDiffLines(theme: Theme, diff: string | undefined, textWidth: number): string[] {
 	if (!diff) return [];
 	const out = [""];
-	for (const line of renderDiff(diff, { theme }).split(/\r?\n/)) out.push(`    ${line}`);
+	for (const line of renderDiff(diff, { theme }).split(/\r?\n/))
+		out.push(truncateToWidth(`    ${line}`, textWidth));
 	return out;
 }
 
-/** Panel rows for the tools view, styled, oldest first. Only the newest entries
- * that can fill `maxRows` are built: `newestRows` stops once `maxRows` wrapped
- * rows exist and every item renders at least one row. */
+/** One full-mode card to fit: which entry, how wide, how deep, how many rows
+ * the band has left for it. */
+interface ToolCardOptions {
+	theme: Theme;
+	entry: ToolEntry;
+	textWidth: number;
+	previewCap: number;
+	budget: number;
+}
+
+/** Body rows of one full-mode card, fitted to `budget` rows (its own row is
+ * already counted by the caller). Detail that does not fit is summarized,
+ * never dropped silently. */
+function toolCardBody({ theme, entry, textWidth, previewCap, budget }: ToolCardOptions): string[] {
+	const detail = [
+		...toolDetailLines(theme, entry, textWidth, previewCap),
+		...toolDiffLines(theme, entry.diff, textWidth),
+	];
+	const room = budget - 1;
+	if (detail.length === 0 || room <= 0) return [];
+	if (detail.length <= room) return detail;
+	// One of the remaining rows reports the omission.
+	const keep = room - 1;
+	const kept = keep > 0 ? detail.slice(0, keep) : [];
+	return [...kept, theme.fg("dim", `  · +${detail.length - keep} more detail rows`)];
+}
+
+/** Panel rows for the tools view, styled, oldest first. Cards are built
+ * newest-first and each one is budgeted against the rows left: the card's own
+ * row always survives, and detail that does not fit is reported instead of
+ * pushing the row out of the band. */
 function toolLines(theme: Theme, width: number, previewCap: number, maxRows: number): string[] {
 	const full = toolMode === "full";
 	const textWidth = Math.max(8, width - 3);
@@ -512,16 +652,15 @@ function toolLines(theme: Theme, width: number, previewCap: number, maxRows: num
 	for (let i = toolOrder.length - 1; i >= 0 && items < maxRows; i--) {
 		const entry = toolsBy.get(toolOrder[i]);
 		if (!entry) continue;
-		const rows = [toolPrefix(theme, entry, textWidth)];
-		if (full) {
-			rows.push(...toolDetailLines(theme, entry, textWidth, previewCap));
-			rows.push(...toolDiffLines(theme, entry.diff));
-		}
 		// Compact mode puts one blank row before every entry except the oldest;
 		// this reproduces the current `out.length > 1` splice exactly.
-		const block = !full && i > 0 ? ["", ...rows] : rows;
-		blocks.push(block);
-		items += block.length;
+		const separator = !full && i > 0 && maxRows - items > 1 ? [""] : [];
+		const budget = maxRows - items - separator.length;
+		if (budget < 1) break;
+		const rows = [toolPrefix(theme, entry, textWidth)];
+		if (full) rows.push(...toolCardBody({ theme, entry, textWidth, previewCap, budget }));
+		blocks.push([...separator, ...rows]);
+		items += separator.length + rows.length;
 	}
 	return blocks.reverse().flat();
 }
@@ -545,11 +684,11 @@ interface PathHit {
 
 /** Every tool whose input names its single target under a fixed key, with the
  * op letter recorded for it; the file need not exist (the tool acted on it). */
-const EXACT_PATH_TOOLS: Record<string, { keys: string[]; op: string } | undefined> = {
-	read: { keys: ["path"], op: "r" },
-	write: { keys: ["path"], op: "w" },
-	edit: { keys: ["path"], op: "w" },
-	ast_edit: { keys: ["path"], op: "w" },
+const EXACT_PATH_TOOLS: Record<string, { key: string; op: string } | undefined> = {
+	read: { key: "path", op: "r" },
+	write: { key: "path", op: "w" },
+	edit: { key: "path", op: "w" },
+	ast_edit: { key: "path", op: "w" },
 };
 /** Single-value keys of a tool with no fixed contract: the file must exist. */
 const GENERIC_PATH_KEYS = ["path", "filePath", "file_path", "imagePath"];
@@ -578,12 +717,7 @@ function bashPathHits(command: string): PathHit[] {
 		// eslint-disable-next-line sonarjs/super-linear-regex
 		const token = raw.replace(/^[("'`]+/, "").replace(/[)"'`;:,]+$/, "");
 		if (!token || token.startsWith("-") || /[|&><`$*?]/.test(token)) continue;
-		try {
-			const abs = path.resolve(sessionCwd, token);
-			if (existsSync(abs) && statSync(abs).isFile()) out.push({ abs, op: "s" });
-		} catch {
-			/* skip unreadable tokens */
-		}
+		addPathHit(out, token, "s", false);
 	}
 	return out;
 }
@@ -595,7 +729,7 @@ function pathsFrom(toolName: string, input: Record<string, unknown>): PathHit[] 
 	const out: PathHit[] = [];
 	const exact = EXACT_PATH_TOOLS[toolName];
 	if (exact) {
-		for (const key of exact.keys) addPathHit(out, input[key], exact.op, true);
+		addPathHit(out, input[exact.key], exact.op, true);
 		return out;
 	}
 	for (const key of GENERIC_PATH_KEYS) addPathHit(out, input[key], "r", false);
@@ -763,12 +897,8 @@ function renderPanel(options: PanelOptions): string[] {
 		return `${theme.fg("border", "│")} ${clipped}${" ".repeat(Math.max(0, textWidth - visibleWidth(clipped)))}${theme.fg("border", "│")}`;
 	};
 	const out = [top];
-	if (visible.length === 0) {
-		out.push(bodyRow(theme.fg("dim", def.empty)));
-	} else {
-		for (let i = 0; i < bodyRows; i++) out.push(bodyRow(visible[i] ?? ""));
-	}
-	while (out.length < bodyRows + 1) out.push(bodyRow(""));
+	for (let i = 0; i < bodyRows; i++)
+		out.push(bodyRow(visible[i] ?? (i === 0 ? theme.fg("dim", def.empty) : "")));
 	out.push(bottom);
 	return out;
 }
@@ -829,19 +959,20 @@ function composeColumns(theme: Theme, ids: PanelId[], widths: Map<PanelId, numbe
 	return parts[0].map((line, index) => line + parts.slice(1).map(part => part[index] ?? "").join(""));
 }
 
+/** Files dock width for a band of `cols`: the preset's auto share or the
+ * manual width, clamped so the frame plus a little transcript still fits.
+ * `/split-geometry` reports this same number, so the message cannot drift. */
+function clampedDockCols(cols: number): number {
+	return Math.max(MIN_DOCK_COLS, Math.min(dockColsFor(cols, filesWidth, GEOMETRY_PROFILES[geometryMode]), cols - 40));
+}
+
 /** Enabled panel ids for this width, plus the files dock width (0 = no dock). */
 function panelLayout(width: number): { ids: PanelId[]; filesWidthCols: number } {
 	const ids: PanelId[] = [];
 	if (thinkingOn) ids.push("thinking");
 	if (toolsOn) ids.push("tools");
 	// A files column needs room for its frame plus something beside it.
-	const filesWidthCols =
-		filesOn && width >= MIN_TERM_WIDTH
-			? Math.max(
-					MIN_DOCK_COLS,
-					Math.min(dockColsFor(width, filesWidth, GEOMETRY_PROFILES[geometryMode]), width - 40),
-				)
-			: 0;
+	const filesWidthCols = filesOn && width >= MIN_TERM_WIDTH ? clampedDockCols(width) : 0;
 	if (filesWidthCols > 0) ids.push("files");
 	return { ids, filesWidthCols };
 }
@@ -1109,7 +1240,39 @@ function unmountWidget(ctx: ExtensionContext): void {
 function reconcile(ctx: ExtensionContext): void {
 	if (thinkingOn || toolsOn || filesOn) mountWidget(ctx);
 	else unmountWidget(ctx);
+	syncAdvisorStatus(ctx);
 	requestRender();
+}
+
+/** Apply a panel/geometry change: reconcile the widget and mirror the layout
+ * onto omp's transcript switches. */
+function applyLayout(ctx: ExtensionContext): void {
+	reconcile(ctx);
+	syncTranscriptVisibility();
+}
+
+/** Adopt the saved size and geometry fields. Panel visibility stays
+ * caller-owned: `/split` decides it from the same config, and `--no-split`
+ * overrides it. */
+function applySavedMetrics(raw: UiPanelsConfig, cfg: NormalizedUiPanelsConfig): void {
+	toolMode = cfg.toolMode;
+	bandHeight = cfg.bandHeight;
+	const rawHeight: unknown = isRecord(raw) ? raw.bandHeight : undefined;
+	bandHeightAuto = typeof rawHeight !== "number";
+	geometrySetting = cfg.geometry;
+	// The widget is mounted once, so its factory does not run again on a
+	// session switch: resolve here as well, or an ultrawide pane would drop
+	// back to the 4k curve until the next mount.
+	geometryMode = resolveGeometryMode();
+	// An auto height belongs to the terminal, not the session: adopt it again
+	// even when the host does not remount the widget (the factory is the only
+	// other place that can). A pinned height keeps winning.
+	if (bandHeightAuto && tuiRef) {
+		bandHeight = defaultBandHeight(tuiRef.terminal.rows, GEOMETRY_PROFILES[geometryMode]);
+	}
+	toolsWidthPct = cfg.toolsWidthPct;
+	filesWidth = cfg.filesWidth;
+	bandCacheKey = "";
 }
 
 // ─── transcript visibility (native omp display switches) ────────────────────
@@ -1145,18 +1308,28 @@ function sameVisibility(left: TranscriptVisibility, right: TranscriptVisibility)
 }
 
 /**
+ * Policy that still needs applying, or null when the transcript already
+ * matches. `force` re-applies an equal policy (fresh session, new generation).
+ * Nothing owned yet and nothing to hide leaves the user's settings alone.
+ */
+function pendingVisibilityPolicy(force: boolean): TranscriptVisibility | null {
+	if (!api || visibilityUnsupported) return null;
+	const applied = visibilityRegistry.applied;
+	const policy = desiredVisibility();
+	if (!force && applied && sameVisibility(applied, policy)) return null;
+	if (!policy.hideThinking && !policy.hideTools && applied === null) return null;
+	return policy;
+}
+
+/**
  * Mirror the panel layout onto omp's transcript switches: a visible thinking
  * panel hides thinking blocks, response-only hides thinking and tool activity.
  * Overrides are runtime-only; turning a switch off clears the override so the
  * user's own configured value applies again.
  */
 function syncTranscriptVisibility(force = false): void {
-	if (!api || visibilityUnsupported) return;
-	const applied = visibilityRegistry.applied;
-	const policy = desiredVisibility();
-	if (applied && sameVisibility(applied, policy) && !force) return;
-	// Nothing owned yet and nothing to hide: leave the user's settings alone.
-	if (!policy.hideThinking && !policy.hideTools && applied === null) return;
+	const policy = pendingVisibilityPolicy(force);
+	if (!policy || !api) return;
 
 	const hideThinking = lookup(HIDE_THINKING_ID);
 	const hideTools = lookup(HIDE_TOOLS_ID);
@@ -1181,11 +1354,7 @@ function syncTranscriptVisibility(force = false): void {
  * inside render) so a settings change cannot re-enter the frame being built.
  */
 function scheduleVisibilitySync(): void {
-	if (visibilitySyncPending || visibilityUnsupported || !api) return;
-	const applied = visibilityRegistry.applied;
-	const policy = desiredVisibility();
-	if (applied && sameVisibility(applied, policy)) return;
-	if (!policy.hideThinking && !policy.hideTools && applied === null) return;
+	if (visibilitySyncPending || !pendingVisibilityPolicy(false)) return;
 	visibilitySyncPending = true;
 	setTimeout(() => {
 		visibilitySyncPending = false;
@@ -1212,7 +1381,11 @@ function replayAssistant(msg: AssistantBranchMessage, thoughts: string[]): void 
 		try {
 			// Rebuild through the same ingest path live events use.
 			ingestToolCall(block.id, block.name, block.arguments);
-			record(block.name, block.arguments ?? {});
+			// W6(a): bash "seen" files are a live observation. Replaying a bash
+			// command re-probes every word token against today's filesystem
+			// (cost grows with the branch, results drift as files move), so
+			// replay lists only the paths a tool named directly.
+			if (block.name !== "bash") record(block.name, block.arguments ?? {});
 		} catch {
 			/* skip malformed call */
 		}
@@ -1231,6 +1404,22 @@ function replayToolResult(msg: ToolResultBranchMessage): void {
 	}
 }
 
+/** Replay branch entries: advisor cards feed the tally, assistant/tool results
+ * rebuild the panels, and a real user prompt is the turn boundary. */
+function replayBranch(ctx: ExtensionContext, thoughts: string[]): void {
+	for (const entry of ctx.sessionManager.getBranch()) {
+		if (entry.type === "custom_message") {
+			if (entry.customType === "advisor") addAdvisorNotes(entry.details);
+			continue;
+		}
+		if (entry.type !== "message") continue;
+		const msg = entry.message;
+		if (isUserPrompt(msg)) resetAdvisorTally();
+		if (msg.role === "assistant") replayAssistant(msg, thoughts);
+		else if (msg.role === "toolResult") replayToolResult(msg);
+	}
+}
+
 /** Rebuild panel state from the session branch (resume, tree switch, session
  * switch), replaying it through the same ingest path live events use. */
 function reconstruct(ctx: ExtensionContext): void {
@@ -1241,15 +1430,11 @@ function reconstruct(ctx: ExtensionContext): void {
 	files.clear();
 	filesVersion++;
 	clearEditDiff();
+	resetAdvisorTally();
 	sessionCwd = ctx.cwd || process.cwd();
 
 	const thoughts: string[] = [];
-	for (const entry of ctx.sessionManager.getBranch()) {
-		if (entry.type !== "message") continue;
-		const msg = entry.message;
-		if (msg.role === "assistant") replayAssistant(msg, thoughts);
-		else if (msg.role === "toolResult") replayToolResult(msg);
-	}
+	replayBranch(ctx, thoughts);
 	if (thoughts.length) {
 		for (const text of thoughts) thinking.blocks.push({ lines: text.split(/\r?\n/), tail: "" });
 		thinking.trim();
@@ -1288,6 +1473,9 @@ function registerEvents(pi: ExtensionAPI): void {
 	pi.on("session_start", (_event, ctx) => {
 		notifyFn = (message, level) => ctx.ui.notify(message, level);
 		themeGetter = () => ctx.ui.theme;
+		// A settings failure latched the last session; a new one may run against
+		// a different settings object, so let the transcript switches be retried.
+		visibilityUnsupported = false;
 
 		const raw = loadUiPanelsConfig();
 		let cfg = normalizeConfig(raw);
@@ -1296,17 +1484,7 @@ function registerEvents(pi: ExtensionAPI): void {
 		}
 		thinkingOn = cfg.thinking;
 		toolsOn = cfg.tools;
-		toolMode = cfg.toolMode;
-		bandHeight = cfg.bandHeight;
-		const rawHeight: unknown = isRecord(raw) ? (raw as { bandHeight?: unknown }).bandHeight : undefined;
-		bandHeightAuto = typeof rawHeight !== "number";
-		geometrySetting = cfg.geometry;
-		// The widget is mounted once, so its factory does not run again on a
-		// session switch: resolve here as well, or an ultrawide pane would drop
-		// back to the 4k curve until the next mount.
-		geometryMode = resolveGeometryMode();
-		toolsWidthPct = cfg.toolsWidthPct;
-		filesWidth = cfg.filesWidth;
+		applySavedMetrics(raw, cfg);
 		filesOn = cfg.files;
 		showDiff = cfg.diff;
 		trimResponse = cfg.trimResponse;
@@ -1317,20 +1495,24 @@ function registerEvents(pi: ExtensionAPI): void {
 			// Forced: a fresh session must not trust a previous generation's
 			// recorded override state.
 			syncTranscriptVisibility(true);
+			syncAdvisorStatus(ctx);
 			requestRender();
 		}
 	});
 
 	pi.on("session_tree", (_event, ctx) => {
 		reconstruct(ctx);
+		syncAdvisorStatus(ctx);
 		requestRender();
 	});
 	pi.on("session_switch", (_event, ctx) => {
 		reconstruct(ctx);
+		syncAdvisorStatus(ctx);
 		requestRender();
 	});
 
-	pi.on("message_update", event => {
+	pi.on("message_update", (event, ctx) => {
+		if (!isMainAgent(ctx)) return;
 		const delta = event.assistantMessageEvent;
 		if (delta) {
 			if (delta.type === "thinking_start") thinking.start();
@@ -1340,23 +1522,71 @@ function registerEvents(pi: ExtensionAPI): void {
 		if (thinkingOn) requestRender();
 	});
 
-	pi.on("tool_execution_start", event => {
+	// Advisor batches arrive as `custom` messages, live on both delivery paths
+	// (cards recorded without a turn and steered batches both pass through the
+	// agent's message_start/message_end pair). Reset on a real user prompt so
+	// the tally describes the turn in progress.
+	pi.on("message_end", (event, ctx) => {
+		const advisor = advisorNoteDetails(event.message);
+		if (advisor) {
+			addAdvisorNotes(advisor.details);
+			syncAdvisorStatus(ctx);
+			return;
+		}
+		if (isUserPrompt(event.message)) {
+			resetAdvisorTally();
+			syncAdvisorStatus(ctx);
+		}
+	});
+
+	registerToolEvents(pi);
+
+	pi.on("session_shutdown", (_event, ctx) => {
+		stopToolTicker();
+		if (thinkFlushTimer) {
+			clearTimeout(thinkFlushTimer);
+			thinkFlushTimer = null;
+		}
+		if (toolsFlushTimer) {
+			clearTimeout(toolsFlushTimer);
+			toolsFlushTimer = null;
+		}
+		try {
+			if (ctx.mode === "tui") ctx.ui.setStatus(ADVISOR_STATUS_KEY, undefined);
+		} catch {
+			/* status is decorative */
+		}
+		resetAdvisorTally();
+		unmountWidget(ctx);
+		notifyFn = null;
+	});
+}
+
+/** Tool activity feeds the band: execution streams rows, tool_call fills the
+ * files column, tool_result applies any reported diff. Only the top-level
+ * agent may contribute — advisor tools arrive through the same hooks. */
+function registerToolEvents(pi: ExtensionAPI): void {
+	pi.on("tool_execution_start", (event, ctx) => {
+		if (!isMainAgent(ctx)) return;
 		ingestToolCall(event.toolCallId, event.toolName, event.args, Date.now());
 		if (toolsOn) requestRender();
 	});
-	pi.on("tool_execution_update", event => {
+	pi.on("tool_execution_update", (event, ctx) => {
+		if (!isMainAgent(ctx)) return;
 		const entry = toolsBy.get(event.toolCallId);
 		if (entry) {
 			setToolOutput(entry, resultText(event.partialResult));
 			markToolsDirty();
 		}
 	});
-	pi.on("tool_execution_end", event => {
+	pi.on("tool_execution_end", (event, ctx) => {
+		if (!isMainAgent(ctx)) return;
 		ingestToolResult(event.toolCallId, event.result, event.isError, Date.now());
 		if (toolsOn) requestRender();
 	});
 
-	pi.on("tool_call", event => {
+	pi.on("tool_call", (event, ctx) => {
+		if (!isMainAgent(ctx)) return;
 		try {
 			record(event.toolName, (event.input ?? {}) as Record<string, unknown>);
 		} catch {
@@ -1365,7 +1595,8 @@ function registerEvents(pi: ExtensionAPI): void {
 		if (filesOn) requestRender();
 	});
 
-	pi.on("tool_result", event => {
+	pi.on("tool_result", (event, ctx) => {
+		if (!isMainAgent(ctx)) return;
 		// Any tool may report a diff; key off the payload, not the discriminant.
 		if (!isRecord(event.details)) return;
 		const { details } = event;
@@ -1378,20 +1609,6 @@ function registerEvents(pi: ExtensionAPI): void {
 		if (!filePath) return; // no resolvable path: keep the tool row's own diff
 		setEditDiff(filePath, diff);
 		requestRender();
-	});
-
-	pi.on("session_shutdown", (_event, ctx) => {
-		stopToolTicker();
-		if (thinkFlushTimer) {
-			clearTimeout(thinkFlushTimer);
-			thinkFlushTimer = null;
-		}
-		if (toolsFlushTimer) {
-			clearTimeout(toolsFlushTimer);
-			toolsFlushTimer = null;
-		}
-		unmountWidget(ctx);
-		notifyFn = null;
 	});
 }
 
@@ -1422,19 +1639,21 @@ function registerPanelToggles(pi: ExtensionAPI): void {
 				notify("Split view off (all panels) · /split-save saves defaults");
 				return;
 			}
-			const cfg = normalizeConfig(loadUiPanelsConfig());
+			const raw = loadUiPanelsConfig();
+			const cfg = normalizeConfig(raw);
 			if (!cfg.thinking && !cfg.tools && !cfg.files && !cfg.trimResponse) {
 				thinkingOn = true;
 				toolsOn = true;
 			} else {
+				// ON means the saved layout, size and geometry included.
+				applySavedMetrics(raw, cfg);
 				thinkingOn = cfg.thinking;
 				toolsOn = cfg.tools;
 				filesOn = cfg.files;
 				showDiff = cfg.diff;
 				trimResponse = cfg.trimResponse;
 			}
-			reconcile(ctx);
-			syncTranscriptVisibility();
+			applyLayout(ctx);
 			notify("Split view on (saved layout) · /split-save saves defaults");
 		},
 	});
@@ -1444,8 +1663,7 @@ function registerPanelToggles(pi: ExtensionAPI): void {
 		handler: async (_args, ctx) => {
 			if (!requireTui(ctx)) return;
 			thinkingOn = !thinkingOn;
-			reconcile(ctx);
-			syncTranscriptVisibility();
+			applyLayout(ctx);
 			const thinkingState = thinkingOn ? "on (transcript hidden)" : "off (transcript shown)";
 			notify(thinkingOn || toolsOn ? `Thinking ${thinkingState}` : "Band off (no panels)");
 		},
@@ -1507,11 +1725,8 @@ function applyGeometry(ctx: ExtensionContext): void {
 	if (bandHeightAuto && rows > 0)
 		bandHeight = defaultBandHeight(rows, GEOMETRY_PROFILES[geometryMode]);
 	bandCacheKey = "";
-	reconcile(ctx);
-	syncTranscriptVisibility();
-	const profile = GEOMETRY_PROFILES[geometryMode];
-	// Same clamp panelLayout applies, so the message names the dock you get.
-	const dock = Math.max(MIN_DOCK_COLS, Math.min(dockColsFor(cols, filesWidth, profile), cols - 40));
+	applyLayout(ctx);
+	const dock = clampedDockCols(cols);
 	const label = geometrySetting === "auto" ? `auto (${geometryMode})` : geometryMode;
 	notify(
 		bandHeightAuto
@@ -1558,18 +1773,17 @@ function registerBandSettings(pi: ExtensionAPI): void {
 		description: "Set the band height in rows (6-80, clamped to fit)",
 		handler: async (args, ctx) => {
 			if (!requireTui(ctx)) return;
+			const limit =
+				tuiRef?.terminal.rows === undefined ? MAX_BAND_HEIGHT : maxBandHeight(tuiRef.terminal.rows);
 			const height = Number.parseInt(String(args ?? "").trim(), 10);
 			if (Number.isNaN(height)) {
-				const limit = tuiRef?.terminal.rows === undefined ? MAX_BAND_HEIGHT : maxBandHeight(tuiRef.terminal.rows);
 				notify(`Band height: ${bandHeight} rows (usage: /split-height ${MIN_BAND_HEIGHT}-${limit})`);
 				return;
 			}
-			const limit = tuiRef?.terminal.rows === undefined ? MAX_BAND_HEIGHT : maxBandHeight(tuiRef.terminal.rows);
 			bandHeight = Math.max(MIN_BAND_HEIGHT, Math.min(limit, height));
 			bandHeightAuto = false;
 			bandCacheKey = "";
-			reconcile(ctx);
-			syncTranscriptVisibility();
+			applyLayout(ctx);
 			notify(`Band height: ${bandHeight} rows`);
 		},
 	});
@@ -1626,7 +1840,9 @@ function registerBandSettings(pi: ExtensionAPI): void {
 				files: filesOn,
 				toolMode,
 				trimResponse,
-				bandHeight,
+				// An auto height belongs to the terminal; pinning today's derived
+				// number would hide the band on a shorter screen at next startup.
+				...(bandHeightAuto ? {} : { bandHeight }),
 				toolsWidthPct,
 				geometry: geometrySetting,
 				...(filesWidth === null ? {} : { filesWidth }),

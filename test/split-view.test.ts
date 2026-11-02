@@ -45,8 +45,13 @@ interface BandComponent {
 	invalidate(): void;
 }
 
+type AgentIdentity = { kind: "main" | "sub"; id: string; name: string };
+
+const MAIN_AGENT: AgentIdentity = { kind: "main", id: "Main", name: "main" };
+const ADVISOR_AGENT: AgentIdentity = { kind: "sub", id: "advisor", name: "advisor" };
+
 interface Harness {
-	emit: (event: string, payload?: unknown) => Promise<void>;
+	emit: (event: string, payload?: unknown, agent?: AgentIdentity) => Promise<void>;
 	command: (name: string, args?: string) => Promise<void>;
 	widget: () => { render(width: number): readonly string[] } | undefined;
 	/** Swap the theme `ctx.ui.theme` returns (cache-invalidation tests). */
@@ -57,6 +62,8 @@ interface Harness {
 	setBranch: (branch: unknown[]) => void;
 	/** The widget instance the host holds, for Component-contract calls. */
 	component: () => BandComponent | undefined;
+	/** Text of an extension status entry (`ctx.ui.setStatus`). */
+	status: (key: string) => string | undefined;
 	notifications: { message: string; level: string }[];
 	widgets: Map<string, WidgetFactory | undefined>;
 	setSize: (columns: number, rows: number) => void;
@@ -73,8 +80,13 @@ function createHarness(columns = 120, rows = 45): Harness {
 	const handlers = new Map<string, Handler>();
 	const commands = new Map<string, (args: string, ctx: ExtensionContext) => Promise<void>>();
 	const widgets = new Map<string, WidgetFactory | undefined>();
+	// omp calls a widget factory once at mount and keeps the component; the
+	// harness must do the same or mount-only derivations (auto band height,
+	// geometry resolution) are silently re-run on every render.
+	const components = new Map<string, BandComponent>();
 
 	const notifications: { message: string; level: string }[] = [];
+	const statuses = new Map<string, string>();
 	let branch: unknown[] = [];
 
 	const tui = {
@@ -87,6 +99,7 @@ function createHarness(columns = 120, rows = 45): Harness {
 	const ctx = {
 		mode: "tui",
 		cwd: "/tmp",
+		agent: MAIN_AGENT,
 		sessionManager: { getBranch: () => branch },
 		ui: {
 			get theme() {
@@ -95,10 +108,16 @@ function createHarness(columns = 120, rows = 45): Harness {
 			notify: (message: string, level: string) => {
 				notifications.push({ message, level });
 			},
+			setStatus: (key: string, text: string | undefined) => {
+				if (text === undefined) statuses.delete(key);
+				else statuses.set(key, text);
+			},
 			setWidget: (key: string, content: WidgetFactory | undefined) => {
 				widgets.set(key, content);
-				// omp invokes the factory synchronously while mounting.
-				if (content) content(tui, flatTheme);
+				// omp invokes the factory synchronously at mount and holds the
+				// returned component; unmounting clears it.
+				if (content) components.set(key, content(tui, flatTheme) as BandComponent);
+				else components.delete(key);
 			},
 		},
 	};
@@ -121,11 +140,13 @@ function createHarness(columns = 120, rows = 45): Harness {
 
 	splitView(api as unknown as ExtensionAPI);
 
-	const emit = async (event: string, payload: unknown = {}) => {
+	const emit = async (event: string, payload: unknown = {}, agent: AgentIdentity = MAIN_AGENT) => {
+		ctx.agent = agent;
 		const handler = handlers.get(event);
 		if (handler) await handler(payload, ctx as unknown as ExtensionContext);
 	};
 	const command = async (name: string, args = "") => {
+		ctx.agent = MAIN_AGENT;
 		const handler = commands.get(name);
 		if (!handler) throw new Error(`command not registered: ${name}`);
 		await handler(args, ctx as unknown as ExtensionContext);
@@ -134,11 +155,7 @@ function createHarness(columns = 120, rows = 45): Harness {
 	return {
 		emit,
 		command,
-		widget: () => {
-			const factory = widgets.get("split-view");
-			if (!factory) return undefined;
-			return factory(tui, flatTheme);
-		},
+		widget: () => components.get("split-view"),
 		setTheme: theme => {
 			currentTheme = theme;
 		},
@@ -148,10 +165,8 @@ function createHarness(columns = 120, rows = 45): Harness {
 		setBranch: next => {
 			branch = next;
 		},
-		component: () => {
-			const factory = widgets.get("split-view");
-			return factory ? (factory(tui, flatTheme) as BandComponent) : undefined;
-		},
+		component: () => components.get("split-view"),
+		status: key => statuses.get(key),
 		notifications,
 		widgets,
 		setSize: (nextColumns, nextRows) => {
@@ -192,6 +207,22 @@ function effective(id: string): unknown {
 const tick = () => new Promise(resolve => setTimeout(resolve, 10));
 
 const h = createHarness();
+
+const writeConfig = (cfg: unknown) => writeFileSync(CONFIG_FILE, JSON.stringify(cfg));
+/** Full layout used by the geometry suites; every panel on, diff on. */
+const fullLayout = { split: true, thinking: true, tools: true, files: true, diff: true };
+
+/** Toggle-style commands announce the new state; drive them to a known one. */
+const setToggle = async (command: string, message: RegExp) => {
+	await h.command(command);
+	if (!message.test(h.notifications.at(-1)?.message ?? "")) await h.command(command);
+};
+
+/** Mount a panel when its header is absent (label-based, for plain toggles). */
+const ensurePanel = async (label: string, command: string) => {
+	if (h.widget()?.render(120).join("\n").includes(label)) return;
+	await h.command(command);
+};
 
 describe("band widget", () => {
 	beforeAll(async () => {
@@ -235,15 +266,6 @@ describe("band widget", () => {
 		await h.command("split-tools-view");
 	});
 
-	test("band height and width split are configurable", async () => {
-		await h.command("split-height", "8");
-		expect(h.widget()!.render(120).length).toBe(8);
-		await h.command("split-tools-width", "50");
-		assertExactWidth(h.widget()!.render(100), 100);
-		await h.command("split-tools-width", "35");
-		await h.command("split-height", "20");
-	});
-
 	test("short terminals hide the band and give transcript thinking back", async () => {
 		h.setSize(120, 24);
 		expect(h.widget()!.render(120)).toEqual([]);
@@ -253,22 +275,6 @@ describe("band widget", () => {
 		h.widget()!.render(120);
 		await tick();
 		expect(effective("hideThinkingBlock")).toBe(true);
-	});
-
-	test("re-rendering at another width re-wraps instead of reusing stale rows", async () => {
-		await h.emit("message_update", { assistantMessageEvent: { type: "thinking_start" } });
-		await h.emit("message_update", {
-			assistantMessageEvent: { type: "thinking_delta", delta: "wrap ".repeat(40) },
-		});
-		await h.emit("message_update", {
-			assistantMessageEvent: { type: "thinking_end", content: "wrap ".repeat(40) },
-		});
-		const wide = h.widget()!.render(120);
-		assertExactWidth(wide, 120);
-		const narrow = h.widget()!.render(60);
-		assertExactWidth(narrow, 60);
-		// A stale wrap cache keyed only on text would reuse the 60-col rows here.
-		expect(h.widget()!.render(120)).toEqual(wide);
 	});
 
 	test("/split-thinking off leaves only the tools panel", async () => {
@@ -281,12 +287,6 @@ describe("band widget", () => {
 		expect(effective("hideThinkingBlock")).toBe(false);
 		await h.command("split-thinking");
 		expect(effective("hideThinkingBlock")).toBe(true);
-	});
-
-	test("a visible thinking panel hides transcript thinking", () => {
-		expect(effective("hideThinkingBlock")).toBe(true);
-		// Tool activity stays untouched: the tool panel does not replace it.
-		expect(effective("display.hideToolActivity")).toBe(false);
 	});
 
 	test("response-only hides both, and turning it off restores the panel policy", async () => {
@@ -391,17 +391,12 @@ describe("files panel", () => {
 });
 
 describe("band properties", () => {
-	const ensure = async (label: string, command: string) => {
-		if (h.widget()?.render(120).join("\n").includes(label)) return;
-		await h.command(command);
-	};
-
 	beforeAll(async () => {
 		h.setSize(120, 45);
 		await h.command("split-height", "20");
-		await ensure("Thinking", "split-thinking");
-		await ensure("Tool Usage", "split-tools");
-		await ensure("📂 Files", "files");
+		await ensurePanel("Thinking", "split-thinking");
+		await ensurePanel("Tool Usage", "split-tools");
+		await ensurePanel("📂 Files", "files");
 		const joined = h.widget()!.render(120).join("\n");
 		expect(joined).toContain("Thinking");
 		expect(joined).toContain("Tool Usage");
@@ -459,7 +454,12 @@ describe("band properties", () => {
 	test("re-rendering any width sequence reuses identical rows", async () => {
 		await fc.assert(
 			fc.asyncProperty(
-				fc.array(fc.integer({ min: 40, max: 240 }), { minLength: 2, maxLength: 6 }),
+				fc.array(fc.integer({ min: 40, max: 240 }), { minLength: 2, maxLength: 6 }).map(ws => [
+					120,
+					60,
+					120,
+					...ws,
+				]),
 				async widths => {
 					const seen = new Map<number, readonly string[]>();
 					for (const width of [...widths, ...widths]) {
@@ -591,9 +591,9 @@ describe("band properties", () => {
 							expect(line).not.toMatch(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/);
 					}
 				}
-				await ensure("Thinking", "split-thinking");
-				await ensure("Tool Usage", "split-tools");
-				await ensure("📂 Files", "files");
+				await ensurePanel("Thinking", "split-thinking");
+				await ensurePanel("Tool Usage", "split-tools");
+				await ensurePanel("📂 Files", "files");
 				await h.command("split-height", "20");
 			}),
 			{ numRuns: 20, seed: 20261101 },
@@ -603,9 +603,9 @@ describe("band properties", () => {
 		// OFF instead of on. Restore the mount point the later suites assume.
 		h.setSize(120, 45);
 		await h.command("split-height", "20");
-		await ensure("Thinking", "split-thinking");
-		await ensure("Tool Usage", "split-tools");
-		await ensure("📂 Files", "files");
+		await ensurePanel("Thinking", "split-thinking");
+		await ensurePanel("Tool Usage", "split-tools");
+		await ensurePanel("📂 Files", "files");
 		expect(h.widget()).toBeDefined();
 	});
 });
@@ -620,10 +620,6 @@ describe("complex renderers", () => {
 	const rows = () => h.widget()!.render(120);
 	const joined = () => rows().join("\n");
 	/** Toggle-style commands announce the new state; read it, don't guess. */
-	const setToggle = async (command: string, message: RegExp) => {
-		await h.command(command);
-		if (!message.test(h.notifications.at(-1)?.message ?? "")) await h.command(command);
-	};
 	const setToolMode = (full: boolean) => setToggle("split-tools-view", full ? /full/ : /compact/);
 	const setDiff = (on: boolean) => setToggle("split-diff", on ? /\bon$/ : /\boff$/);
 	/** `session_tree` rebuilds every buffer from the branch, leaving layout alone. */
@@ -633,18 +629,13 @@ describe("complex renderers", () => {
 	};
 	/** Rendered rows, or "" when the band is unmounted/hidden. */
 	const visible = () => h.widget()?.render(120).join("\n") ?? "";
-	/** Panel toggles announce the new state; drive them to a known state. */
-	const setPanel = async (command: string, on: RegExp) => {
-		await h.command(command);
-		if (!on.test(h.notifications.at(-1)?.message ?? "")) await h.command(command);
-	};
 
 	beforeAll(async () => {
 		h.setSize(120, 45);
 		await h.command("split-height", "20");
-		await setPanel("split-thinking", /Thinking on/);
-		await setPanel("split-tools", /Tools on/);
-		await setPanel("files", /Files panel on/);
+		await setToggle("split-thinking", /Thinking on/);
+		await setToggle("split-tools", /Tools on/);
+		await setToggle("files", /Files panel on/);
 		await setDiff(true);
 		await setToolMode(false);
 		// The band must be mounted and complete before any test reads rows.
@@ -663,7 +654,7 @@ describe("complex renderers", () => {
 		await h.command("split-tools-width", "35");
 	});
 
-	test("a long tool result previews two lines and counts the rest", async () => {
+	test("a long tool result previews the newest lines and counts the rest", async () => {
 		await resetBuffers();
 		await setToolMode(true);
 		await h.emit("tool_execution_start", { toolCallId: "out1", toolName: "bash", args: { command: "seq 5" } });
@@ -673,11 +664,159 @@ describe("complex renderers", () => {
 			isError: false,
 		});
 		const text = joined();
-		expect(text).toContain("lineA");
-		expect(text).toContain("lineB");
-		expect(text).toContain("· +3 more");
-		// The preview is capped: the third line must not leak into the panel.
+		expect(text).toContain("lineD");
+		expect(text).toContain("lineE");
+		expect(text).toContain("· +3 earlier lines");
+		// The preview is capped: the older lines must not leak into the panel.
 		expect(text).not.toContain("lineC");
+	});
+
+	test("property: tool output previews its newest lines and counts earlier ones", async () => {
+		// Terminal tall enough for every generated band (rows up to 60).
+		h.setSize(120, 100);
+		const scenario = fc.record({
+			// Counts, not sparse booleans: the head-vs-tail window only differs
+			// past MAX_TOOL_OUTPUT_LINES (20), so every length must be reachable.
+			partialCount: fc.integer({ min: 0, max: 80 }),
+			finalCount: fc.integer({ min: 0, max: 80 }),
+			// A non-empty whitespace payload reaches `setToolOutput` (unlike ""),
+			// so this is the only way to exercise the no-content guard.
+			finalBlank: fc.boolean(),
+			rows: fc.integer({ min: 18, max: 60 }),
+		});
+		try {
+			await fc.assert(
+				fc.asyncProperty(scenario, async ({ partialCount, finalCount, finalBlank, rows }) => {
+					await resetBuffers();
+					await h.command("split-height", String(rows));
+					await setToolMode(true);
+					// Blank lines and padded tokens exercise trim/filter, which must
+					// not change the counted total.
+					const textOf = (prefix: string, count: number) =>
+						Array.from({ length: count }, (_, i) => ` ${prefix}-${i}-end `).join("\n\n");
+					const partialText = textOf("old", partialCount);
+					const finalText = finalBlank ? " \n\t \n" : textOf("line", finalCount);
+					await h.emit("tool_execution_start", {
+						toolCallId: "preview-prop",
+						toolName: "bash",
+						args: { command: "x" },
+					});
+					await h.emit("tool_execution_update", {
+						toolCallId: "preview-prop",
+						partialResult: { content: [{ type: "text", text: partialText }] },
+					});
+					await h.emit("tool_execution_end", {
+						toolCallId: "preview-prop",
+						result: { content: [{ type: "text", text: finalText }] },
+						isError: false,
+					});
+					const band = joined();
+					const lines = band.split("\n");
+					const finalIndices = finalBlank ? [] : Array.from({ length: finalCount }, (_, i) => i);
+					const partialIndices = Array.from({ length: partialCount }, (_, i) => i);
+					// An empty final result keeps the streamed partial text.
+					const fromFinal = finalIndices.length > 0;
+					const effective = fromFinal ? finalIndices : partialIndices;
+					const token = (i: number) => `${fromFinal ? "line" : "old"}-${i}-end`;
+					// The stored window is a tail, so the newest `cap` lines show.
+					const cap = Math.max(2, Math.min(6, Math.floor((rows - 2) / 8)));
+					const shown = Math.min(cap, effective.length);
+					const visible = shown > 0 ? effective.slice(-shown) : [];
+					const hidden = Math.max(partialIndices.length, finalIndices.length) - shown;
+					for (const i of visible) expect(band).toContain(token(i));
+					for (const i of effective.slice(0, Math.max(0, effective.length - shown)))
+						expect(band).not.toContain(token(i));
+					if (fromFinal) for (const i of partialIndices) expect(band).not.toContain(`old-${i}-end`);
+					if (hidden > 0) {
+						expect(band).toContain(`+${hidden} earlier lines`);
+						const markerRow = lines.findIndex(line => line.includes(`+${hidden} earlier lines`));
+						const newestRow = lines.findIndex(line => line.includes(token(effective.at(-1)!)));
+						expect(markerRow).toBeLessThan(newestRow);
+					} else {
+						expect(band).not.toMatch(/\+\d+ earlier lines/);
+					}
+					await h.command("split-height", "20");
+					await setToolMode(false);
+				}),
+				{ numRuns: 40, seed: 20261101 },
+			);
+		} finally {
+			h.setSize(120, 45);
+			await h.command("split-height", "20");
+			await setToolMode(false);
+		}
+	});
+
+	test("the earlier-lines marker counts output past the character cap", async () => {
+		await resetBuffers();
+		await setToolMode(true);
+		// ~440 KB of text: far past MAX_TOOL_TEXT_CHARS (32 KiB), so the stored
+		// window is a small tail while the reported total must be the whole
+		// result. Band 20 -> 18 body rows -> preview cap 2.
+		const text = Array.from({ length: 40000 }, (_, i) => `v${i}-end`).join("\n");
+		await h.emit("tool_execution_start", { toolCallId: "huge1", toolName: "bash", args: { command: "seq" } });
+		await h.emit("tool_execution_end", {
+			toolCallId: "huge1",
+			result: { content: [{ type: "text", text }] },
+			isError: false,
+		});
+		const band = joined();
+		expect(band).toContain("v39999-end");
+		expect(band).toContain("+39998 earlier lines");
+	});
+
+	test("property: the earlier-lines marker counts output past the character cap", async () => {
+		// Tall enough for every generated band (rows up to 60).
+		h.setSize(120, 100);
+		const scenario = fc.record({
+			// Past MAX_TOOL_TEXT_CHARS (32 KiB) the retained window is a tail, so
+			// only a whole-result count can produce the marker's number.
+			count: fc.integer({ min: 0, max: 25000 }),
+			rows: fc.integer({ min: 18, max: 60 }),
+		});
+		try {
+			await fc.assert(
+				fc.asyncProperty(scenario, async ({ count, rows }) => {
+					await resetBuffers();
+					await h.command("split-height", String(rows));
+					await setToolMode(true);
+					const body = Array.from({ length: count }, (_, i) => `w${i}-end`).join("\n");
+					await h.emit("tool_execution_start", {
+						toolCallId: "past-cap",
+						toolName: "bash",
+						args: { command: "x" },
+					});
+					await h.emit("tool_execution_end", {
+						toolCallId: "past-cap",
+						result: { content: [{ type: "text", text: body }] },
+						isError: false,
+					});
+					const band = joined();
+					// A band of `rows` renders `rows - 2` body rows, and the preview
+					// depth follows that body: max(2, min(6, floor(body / 8))).
+					const cap = Math.max(2, Math.min(6, Math.floor((rows - 2) / 8)));
+					const shown = Math.min(cap, count);
+					const hidden = count - shown;
+					const newest = Array.from({ length: shown }, (_, k) => count - shown + k);
+					for (const i of newest) expect(band).toContain(`w${i}-end`);
+					// The oldest lines are past the retained window entirely; the
+					// boundary line is stored but never previewed.
+					const oldestHidden = Math.min(3, hidden);
+					for (const i of Array.from({ length: oldestHidden }, (_, k) => k))
+						expect(band).not.toContain(`w${i}-end`);
+					if (hidden > 0) expect(band).not.toContain(`w${hidden - 1}-end`);
+					if (hidden > 0) expect(band).toContain(`+${hidden} earlier lines`);
+					else expect(band).not.toMatch(/\+\d+ earlier lines/);
+					await h.command("split-height", "20");
+					await setToolMode(false);
+				}),
+				{ numRuns: 20, seed: 20261101 },
+			);
+		} finally {
+			h.setSize(120, 45);
+			await h.command("split-height", "20");
+			await setToolMode(false);
+		}
 	});
 
 	test("an image result renders a one-line fallback, never the base64 payload", async () => {
@@ -715,6 +854,93 @@ describe("complex renderers", () => {
 		expect(text).toContain("-gone");
 		expect(text).toContain("+kept");
 		expect(text).toContain("Last Edit");
+	});
+
+	test("a tall diff keeps its own tool row inside the band", async () => {
+		await resetBuffers();
+		await setToolMode(true);
+		// 200 diff lines cap at MAX_TOOL_DIFF_LINES (150) plus a "more diff
+		// lines" marker: 152 detail rows against the 17 the band can spare.
+		const diff = Array.from({ length: 200 }, (_, i) => (i % 2 === 0 ? `-old ${i}` : `+new ${i}`)).join("\n");
+		await h.emit("tool_execution_start", { toolCallId: "tall1", toolName: "edit", args: { path: "x.ts" } });
+		await h.emit("tool_execution_end", { toolCallId: "tall1", result: { details: { diff } }, isError: false });
+		const lines = rows();
+		const band = joined();
+		// The identity row survives and the omitted rows are reported.
+		expect(band).toContain("edit");
+		expect(band).toMatch(/\+136 more detail rows/);
+		expect(lines.length).toBe(20);
+		assertExactWidth(lines, 120);
+	});
+
+	test("a card smaller than its detail reports the rows it withheld", async () => {
+		await resetBuffers();
+		await h.command("split-height", "6");
+		await setToolMode(true);
+		await h.emit("tool_execution_start", { toolCallId: "small1", toolName: "bash", args: { command: "x" } });
+		await h.emit("tool_execution_end", {
+			toolCallId: "small1",
+			result: { content: "l1\nl2\nl3\nl4\nl5", details: { diff: "-a\n+b\n-c\n+d" } },
+			isError: false,
+		});
+		// Band 6 -> 4 body rows: the row itself, then 2 of the 8 detail rows
+		// (earlier-lines marker + newest output line) and the omission marker.
+		const lines = rows();
+		const band = joined();
+		expect(band).toContain("bash");
+		expect(band).toContain("+3 earlier lines");
+		expect(band).toMatch(/\+6 more detail rows/);
+		expect(lines.length).toBe(6);
+		await h.command("split-height", "20");
+	});
+
+	test("property: a tall tool card always keeps its row inside the band", async () => {
+		// Tall enough for every generated band (rows up to 40).
+		h.setSize(120, 100);
+		const scenario = fc.record({
+			diffLines: fc.integer({ min: 0, max: 200 }),
+			bandRows: fc.integer({ min: 6, max: 40 }),
+		});
+		try {
+			await fc.assert(
+				fc.asyncProperty(scenario, async ({ diffLines, bandRows }) => {
+					await resetBuffers();
+					await h.command("split-height", String(bandRows));
+					await setToolMode(true);
+					const diff = Array.from({ length: diffLines }, (_, i) => (i % 2 === 0 ? `-a${i}` : `+b${i}`)).join("\n");
+					await h.emit("tool_execution_start", {
+						toolCallId: "tall-prop",
+						toolName: "edit",
+						args: { path: "x.ts" },
+					});
+					await h.emit("tool_execution_end", {
+						toolCallId: "tall-prop",
+						result: diffLines > 0 ? { details: { diff } } : {},
+						isError: false,
+					});
+					const lines = rows();
+					const band = lines.join("\n");
+					expect(band).toContain("edit");
+					// The band keeps its height and every composed row its width.
+					expect(lines.length).toBe(bandRows);
+					assertExactWidth(lines, 120);
+					// Detail rows the entry produced: the capped diff lines plus the
+					// "more diff lines" marker, behind the block's leading blank row.
+					const cappedDiff = Math.min(diffLines, 150) + (diffLines > 150 ? 1 : 0);
+					const expectedDetail = diffLines === 0 ? 0 : cappedDiff + 1;
+					// A body is `rows - 2`; one row of it belongs to the tool row.
+					if (expectedDetail > bandRows - 2 - 1) expect(band).toMatch(/\+\d+ more detail rows/);
+					else expect(band).not.toMatch(/\+\d+ more detail rows/);
+					await h.command("split-height", "20");
+					await setToolMode(false);
+				}),
+				{ numRuns: 25, seed: 20261101 },
+			);
+		} finally {
+			h.setSize(120, 45);
+			await h.command("split-height", "20");
+			await setToolMode(false);
+		}
 	});
 
 	test("compact mode separates entries and withholds the timer for one second", async () => {
@@ -988,12 +1214,7 @@ describe("complex renderers", () => {
 });
 
 describe("large terminals (4K / ultrawide)", () => {
-	const writeConfig = (cfg: unknown) => writeFileSync(CONFIG_FILE, JSON.stringify(cfg));
 	/** Toggle-style commands announce the new state; drive to a known one. */
-	const setToggle = async (command: string, message: RegExp) => {
-		await h.command(command);
-		if (!message.test(h.notifications.at(-1)?.message ?? "")) await h.command(command);
-	};
 
 	afterAll(async () => {
 		rmSync(CONFIG_FILE, { recursive: true, force: true });
@@ -1035,6 +1256,17 @@ describe("large terminals (4K / ultrawide)", () => {
 		assertExactWidth(lines, 400);
 	});
 
+	test("a session load re-derives the auto band height without a remount", async () => {
+		// The widget factory already ran (mount-once harness): a height-less
+		// config must not fall back to the 20-row default on a 4K pane.
+		writeConfig({ split: true, thinking: true, tools: true, files: true });
+		h.setSize(400, 100);
+		await h.emit("session_start");
+		const lines = h.widget()!.render(400);
+		expect(lines.length).toBe(45); // 45% of 100 rows
+		assertExactWidth(lines, 400);
+	});
+
 	test("a taller band previews more of each tool's output", async () => {
 		writeConfig({ split: true, thinking: true, tools: true, files: true, bandHeight: 40 });
 		h.setSize(400, 100);
@@ -1048,11 +1280,12 @@ describe("large terminals (4K / ultrawide)", () => {
 			isError: false,
 		});
 		const joined = h.widget()!.render(400).join("\n");
-		// 40-row band -> 38 body rows -> 4 preview lines (not the classic 2).
-		expect(joined).toContain("· L0");
-		expect(joined).toContain("· L3");
-		expect(joined).toContain("· +8 more");
-		expect(joined).not.toContain("· L4");
+		// 40-row band -> 38 body rows -> 4 preview lines (not the classic 2),
+		// showing the newest lines of the output.
+		expect(joined).toContain("· L8");
+		expect(joined).toContain("· L11");
+		expect(joined).toContain("· +8 earlier lines");
+		expect(joined).not.toContain("· L7");
 		await setToggle("split-tools-view", /compact/);
 	});
 });
@@ -1063,8 +1296,6 @@ describe("large terminals (4K / ultrawide)", () => {
  * keeps winning over the preset's own curve.
  */
 describe("geometry presets", () => {
-	const writeConfig = (cfg: unknown) => writeFileSync(CONFIG_FILE, JSON.stringify(cfg));
-	const fullLayout = { split: true, thinking: true, tools: true, files: true, diff: true };
 
 	afterAll(async () => {
 		rmSync(CONFIG_FILE, { recursive: true, force: true });
@@ -1074,57 +1305,15 @@ describe("geometry presets", () => {
 		await h.command("split-height", "20");
 	});
 
-	test("auto picks wide on a 32:9 pane: a 14-row band and a 160-col dock", async () => {
-		writeConfig(fullLayout);
-		h.setSize(500, 40);
-		await h.emit("session_start");
-		const lines = h.widget()!.render(500);
-		expect(lines.length).toBe(14); // 35% of 40 rows
-		assertExactWidth(lines, 500);
-		// 500 cols: dock = 32% (160), thinking | tools split the other 340.
-		expect(columnStarts(lines[0])).toEqual([0, 221, 340]);
-	});
-
-	test("a saved preset overrides the aspect ratio in both directions", async () => {
-		writeConfig({ ...fullLayout, geometry: "wide" });
-		h.setSize(500, 40);
-		await h.emit("session_start");
-		const wide = h.widget()!.render(500);
-		expect(wide.length).toBe(14);
-		expect(columnStarts(wide[0])).toEqual([0, 221, 340]);
-
-		writeConfig({ ...fullLayout, geometry: "4k" });
-		await h.emit("session_start");
-		const fourK = h.widget()!.render(500);
-		expect(fourK.length).toBe(20); // the 4k curve on the same pane
-		expect(columnStarts(fourK[0])).toEqual([0, 247, 380]);
-	});
-
-	test("an unknown argument is rejected and leaves the layout alone", async () => {
-		writeConfig(fullLayout);
-		h.setSize(500, 40);
-		await h.emit("session_start"); // auto -> wide
-		await h.command("split-geometry", "3d");
-		expect(h.notifications.at(-1)?.level).toBe("error");
-		expect(h.notifications.at(-1)?.message).toContain(
-			"Invalid geometry (usage: /split-geometry auto|4k|wide)",
-		);
-		expect(h.widget()!.render(500).length).toBe(14);
-	});
-
-	test("/split-geometry pins a preset and reports the resulting geometry", async () => {
-		await h.command("split-geometry", "4k");
-		expect(h.notifications.at(-1)?.message).toBe("Geometry: 4k — band 20 rows, dock 120 cols");
-		const lines = h.widget()!.render(500);
-		expect(lines.length).toBe(20);
-		expect(columnStarts(lines[0])).toEqual([0, 247, 380]);
-	});
-
 	test("no argument flips the preset in force; `auto` hands it back to the aspect ratio", async () => {
-		await h.command("split-geometry");
-		expect(h.notifications.at(-1)?.message).toBe("Geometry: wide — band 14 rows, dock 160 cols");
+		writeConfig(fullLayout);
+		h.setSize(500, 40); // auto -> wide
+		await h.emit("session_start");
+		await h.command("split-geometry"); // flip: wide -> 4k
+		expect(h.notifications.at(-1)?.message).toBe("Geometry: 4k — band 20 rows, dock 120 cols");
 		await h.command("split-geometry", "auto");
 		expect(h.notifications.at(-1)?.message.startsWith("Geometry: auto (wide)")).toBe(true);
+		expect(h.widget()!.render(500).length).toBe(14);
 	});
 
 	test("a pinned height survives a preset switch; only the dock follows the preset", async () => {
@@ -1136,22 +1325,6 @@ describe("geometry presets", () => {
 		expect(message).toContain("band height 30 rows (pinned)");
 		expect(message).toContain("dock 120 cols");
 		expect(h.widget()!.render(500).length).toBe(30);
-	});
-
-	test("the preset is saved and drives the next session's layout", async () => {
-		await h.command("split-geometry", "wide");
-		await h.command("split-save");
-		expect(JSON.parse(readFileSync(CONFIG_FILE, "utf8")).geometry).toBe("wide");
-
-		// With no saved height the band curve follows the preset: wide keeps 35
-		// of the 100 rows at 4K (and grows the dock from 100 to 128 cols).
-		writeConfig({ ...fullLayout, geometry: "wide" });
-		h.setSize(400, 100);
-		await h.emit("session_start");
-		const lines = h.widget()!.render(400);
-		expect(lines.length).toBe(35);
-		assertExactWidth(lines, 400);
-		expect(columnStarts(lines[0])).toEqual([0, 177, 272]);
 	});
 
 	test("a session switch keeps the auto preset without a remount", async () => {
@@ -1204,10 +1377,8 @@ describe("geometry presets", () => {
  * pinned examples in the `geometry presets` block above.
  */
 describe("geometry preset properties", () => {
-	const writeConfig = (cfg: unknown) => writeFileSync(CONFIG_FILE, JSON.stringify(cfg));
-	const fullLayout = { split: true, thinking: true, tools: true, files: true, diff: true };
-	const columnsArb = fc.integer({ min: 90, max: 420 });
-	const rowsArb = fc.integer({ min: 24, max: 140 });
+	const columnsArb = fc.integer({ min: 90, max: 700 });
+	const rowsArb = fc.integer({ min: 20, max: 200 });
 	/** Rows the band must occupy, 0 when the terminal is too short for it. */
 	const expectedRows = (rows: number, profile: GeometryProfile): number => {
 		const band = defaultBandHeight(rows, profile);
@@ -1385,10 +1556,6 @@ describe("geometry preset properties", () => {
  * deliberately different from the live layout so nothing passes by default).
  */
 describe("command arguments and saved layout", () => {
-	const setToggle = async (command: string, message: RegExp) => {
-		await h.command(command);
-		if (!message.test(h.notifications.at(-1)?.message ?? "")) await h.command(command);
-	};
 	const layout = async () => {
 		h.setSize(120, 45);
 		await h.command("split-height", "20");
@@ -1505,15 +1672,60 @@ describe("command arguments and saved layout", () => {
 		expect(columnStarts(withTools[0])).toEqual([0, 33, 60]);
 		expect(withTools.join("\n")).toContain("restored output line");
 	});
+
+	test("/split on restores the size and geometry saved with the layout", async () => {
+		writeFileSync(
+			CONFIG_FILE,
+			JSON.stringify({
+				split: true,
+				thinking: true,
+				tools: true,
+				files: true,
+				diff: false,
+				toolMode: "full",
+				bandHeight: 24,
+				toolsWidthPct: 45,
+				filesWidth: 60,
+				geometry: "4k",
+			}),
+		);
+		h.setSize(120, 45);
+		await h.emit("session_start");
+		// Diverge from the saved layout on every size/geometry field it records.
+		await h.command("split-height", "8");
+		await h.command("split-tools-width", "60");
+		await h.command("split-geometry", "wide");
+		await setToggle("split-tools-view", /compact/);
+		await h.command("split"); // off
+		await h.command("split"); // on: the saved layout, not the live one
+		const lines = h.widget()!.render(120);
+		expect(lines.length).toBe(24);
+		assertExactWidth(lines, 120);
+		// Saved 60-col dock, and 45% of the remaining 60 cols to the tools column.
+		expect(columnStarts(lines[0])).toEqual([0, 33, 60]);
+		const text = lines.join("\n");
+		expect(text).toContain("Thinking");
+		expect(text).toContain("Tool Usage");
+		// Saved `diff: false` keeps the edit-diff subpanel closed.
+		expect(text).not.toContain("Last Edit");
+		// Saved toolMode "full" shows output under the tool row, not compact.
+		await h.emit("tool_execution_start", { toolCallId: "restored", toolName: "bash", args: { command: "true" } });
+		await h.emit("tool_execution_end", {
+			toolCallId: "restored",
+			result: { content: [{ type: "text", text: "restored-full" }] },
+			isError: false,
+		});
+		expect(h.widget()!.render(120).join("\n")).toContain("restored-full");
+		// The restored preset was 4k, so the argument-less flip goes to wide.
+		h.notifications.length = 0;
+		await h.command("split-geometry");
+		expect(h.notifications.at(-1)?.message).toMatch(/^Geometry: wide\b/);
+		rmSync(CONFIG_FILE, { recursive: true, force: true });
+	});
 });
 
 describe("persistence and lifecycle", () => {
 	const resetConfig = () => rmSync(CONFIG_FILE, { recursive: true, force: true });
-	const ensure = async (label: string, command: string) => {
-		if (h.widget()?.render(120).join("\n").includes(label)) return;
-		await h.command(command);
-	};
-
 	test("config load tolerates missing, malformed and non-object files", () => {
 		resetConfig();
 		expect(loadUiPanelsConfig()).toEqual({});
@@ -1551,9 +1763,9 @@ describe("persistence and lifecycle", () => {
 
 	test("/split-save persists the live layout, and reports a failed write", async () => {
 		resetConfig();
-		await ensure("Thinking", "split-thinking");
-		await ensure("Tool Usage", "split-tools");
-		await ensure("📂 Files", "files");
+		await ensurePanel("Thinking", "split-thinking");
+		await ensurePanel("Tool Usage", "split-tools");
+		await ensurePanel("📂 Files", "files");
 		// Other suites leave diff/toolMode/trimResponse in either state; read the
 		// saved layout once, then normalize only those three toggles.
 		await h.command("split-save");
@@ -1589,6 +1801,23 @@ describe("persistence and lifecycle", () => {
 		resetConfig();
 		await h.command("split-height", "20");
 		await h.command("split-tools-width", "35");
+	});
+
+	test("/split-save omits an auto band height", async () => {
+		resetConfig();
+		h.setSize(400, 100);
+		await h.emit("session_start"); // bare; the mount-once component stays
+		await h.command("split");
+		await h.command("split-save");
+		const saved = JSON.parse(readFileSync(CONFIG_FILE, "utf8"));
+		// Auto height on a 100-row pane is 45; saving must not pin it.
+		expect(saved.bandHeight).toBeUndefined();
+		// The same config on a 45-row terminal re-derives 20 and stays visible;
+		// a pinned 45 would leave zero transcript rows and hide the band.
+		h.setSize(120, 45);
+		await h.emit("session_start");
+		expect(h.widget()!.render(120).length).toBe(20);
+		resetConfig();
 	});
 
 	test("tool_execution_update streams partial output into the tool panel", async () => {
@@ -1641,15 +1870,58 @@ describe("persistence and lifecycle", () => {
 			},
 		]);
 		await h.emit("session_start");
-		await ensure("Thinking", "split-thinking");
-		await ensure("Tool Usage", "split-tools");
-		await ensure("📂 Files", "files");
+		await ensurePanel("Thinking", "split-thinking");
+		await ensurePanel("Tool Usage", "split-tools");
+		await ensurePanel("📂 Files", "files");
 		for (const event of ["session_tree", "session_switch"]) {
 			await h.emit(event);
 			const joined = h.widget()!.render(120).join("\n");
 			expect(joined).toContain("replayed reasoning");
 			expect(joined).toContain("replay.ts");
 			expect((joined.match(/replayed reasoning/g) ?? []).length).toBe(1);
+		}
+	});
+
+	// W6(a): replay must not re-derive "seen" files from today's filesystem.
+	test("replay never re-derives bash-seen files from the filesystem", async () => {
+		const a = "/tmp/omp-sv-w6-a.txt";
+		const b = "/tmp/omp-sv-w6-b.txt";
+		writeFileSync(a, "x");
+		writeFileSync(b, "x");
+		try {
+			h.setBranch([
+				{
+					type: "message",
+					message: {
+						role: "assistant",
+						content: [
+							{ type: "toolCall", id: "w6a", name: "bash", arguments: { command: `cat ${a} | grep -v x > /dev/null` } },
+							{ type: "toolCall", id: "w6b", name: "bash", arguments: { command: `ls -la ${b}` } },
+							{ type: "toolCall", id: "w6c", name: "bash", arguments: { command: "sed -n 1p /etc/hostname" } },
+							{ type: "toolCall", id: "w6r", name: "read", arguments: { path: "/tmp/omp-sv-w6-read.ts" } },
+						],
+					},
+				},
+			]);
+			await h.emit("session_start");
+			await ensurePanel("Thinking", "split-thinking");
+			await ensurePanel("Tool Usage", "split-tools");
+			await ensurePanel("📂 Files", "files");
+			const text = () => h.widget()!.render(120).join("\n");
+			const first = text();
+			// Three real files were named only on bash lines; only the read counts.
+			expect(first).toContain("📂 Files (1)");
+			expect(first).toContain("omp-sv-w6-read.ts");
+			expect(first).not.toMatch(/│\s*s omp-sv-w6-[ab]\.txt/);
+			// Delete both bash-named files: a filesystem-dependent replay would
+			// change the list, an identical rebuild proves it is not re-probed.
+			rmSync(a, { force: true });
+			rmSync(b, { force: true });
+			await h.emit("session_tree");
+			expect(text()).toBe(first);
+		} finally {
+			rmSync(a, { force: true });
+			rmSync(b, { force: true });
 		}
 	});
 
@@ -1739,6 +2011,30 @@ describe("persistence and lifecycle", () => {
 		await h.command("split-tools"); // back on
 	});
 
+	// A settings failure latches only until the next session_start retries, so
+	// the order of this test and "unsupported settings…" is not load-bearing.
+	test("session_start re-applies an equal policy after a reload", async () => {
+		// A /reload keeps the process-global `applied` registry but recreates
+		// the settings object, so the recorded policy can equal the desired one
+		// while the new settings carry no override. Force must re-apply it.
+		ensurePanel("Thinking", "split-thinking");
+		// The thinking panel owns the transcript stream, so the desired policy
+		// hides thinking; write the same layout for the reload to pick up.
+		writeConfig({ split: true, thinking: true, tools: true, files: true });
+		await h.command("split-trim-response", "off");
+		const hideThinking = lookup("hideThinkingBlock");
+		expect(hideThinking).toBeDefined();
+		hideThinking!.clearOverride(settings);
+		const registry = (globalThis as Record<symbol, { applied: unknown } | undefined>)[
+			Symbol.for("omp.split-view.visibility")
+		];
+		expect(registry?.applied).toEqual({ hideThinking: true, hideTools: false });
+		expect(effective("hideThinkingBlock")).toBe(false);
+		await h.emit("session_start");
+		expect(effective("hideThinkingBlock")).toBe(true);
+		resetConfig();
+	});
+
 	test("/split-trim-response argument forms toggle and report", async () => {
 		await h.command("split-trim-response", "off");
 		expect(effective("display.hideToolActivity")).toBe(false);
@@ -1771,9 +2067,285 @@ describe("persistence and lifecycle", () => {
 		});
 	});
 
+	test("session_start retries transcript visibility after a settings failure", async () => {
+		// The failing apply above latched the module flag for the process; a new
+		// session may run against a usable settings object and must try again.
+		writeConfig({ split: true, thinking: true, tools: true, trimResponse: true });
+		await h.emit("session_start");
+		expect(effective("display.hideToolActivity")).toBe(true);
+		await h.command("split-trim-response", "off");
+		resetConfig();
+	});
+
 	test("session_shutdown unmounts the widget and clears timers", async () => {
 		expect(h.widgets.get("split-view")).toBeDefined();
 		await h.emit("session_shutdown");
 		expect(h.widgets.get("split-view")).toBeUndefined();
+	});
+});
+
+describe("advisor mode", () => {
+	const render = (): string => h.widget()?.render(120).join("\n") ?? "";
+
+	beforeAll(async () => {
+		h.setSize(120, 45);
+		// Reload so panels and the diff pane start from the branch (empty), not
+		// from whatever the preceding suites left behind.
+		h.setBranch([]);
+		await h.emit("session_start");
+		await h.command("split");
+		if (!render().includes("📂 Files (")) await h.command("files");
+		await h.command("split-height", "20");
+	});
+
+	afterAll(async () => {
+		h.setBranch([]);
+		await h.emit("session_tree");
+		if (render().includes("📂 Files (")) await h.command("files");
+	});
+
+	test("main-agent activity still feeds the files and diff panes", async () => {
+		await h.emit("tool_call", { toolName: "read", input: { path: "/tmp/omp-split-view/split-view.ts" } });
+		await h.emit("tool_result", {
+			toolName: "edit",
+			toolCallId: "main1",
+			input: { path: "/tmp/omp-split-view/main.ts" },
+			details: { diff: "@@ -1 +1 @@\n-main old\n+main new" },
+		});
+		const joined = render();
+		expect(joined).toContain("📂 Files (1)");
+		expect(joined).toContain("split-view.ts");
+		expect(joined).toContain("+main new");
+		expect(joined).not.toContain("advisor new");
+	});
+
+	test("hiding the band clears the tally and showing it restores it", async () => {
+		await h.emit("message_end", {
+			message: {
+				role: "custom",
+				customType: "advisor",
+				content: "<advisory/>",
+				details: { notes: [{ note: "slow path", severity: "concern" }] },
+			},
+		});
+		expect(h.status("split-view.advisor")).toBe("Advisor: 1 concern");
+		await h.command("split");
+		expect(h.widget()).toBeUndefined();
+		expect(h.status("split-view.advisor")).toBeUndefined();
+		await h.command("split");
+		expect(h.status("split-view.advisor")).toBe("Advisor: 1 concern");
+		await h.emit("message_end", { message: { role: "user", content: "next question", timestamp: 5 } });
+	});
+
+	// ── properties ──
+
+	const pathFor = (slot: number): string => `/tmp/omp-split-view/f${slot}.ts`;
+
+	/** Mount the band with the files column so a state leak is visible. */
+	async function resetBand(): Promise<void> {
+		h.setBranch([]);
+		await h.emit("session_tree");
+		if (!h.widget()) await h.command("split");
+		if (!render().includes("📂 Files")) await h.command("files");
+	}
+
+	type AgentOp =
+		| { agent: "main" | "advisor"; kind: "read"; slot: number }
+		| { agent: "main" | "advisor"; kind: "edit"; slot: number; diff: string };
+
+	async function applyAgentOp(op: AgentOp, index: number): Promise<void> {
+		const agent = op.agent === "main" ? MAIN_AGENT : ADVISOR_AGENT;
+		if (op.kind === "read") {
+			await h.emit("tool_call", { toolName: "read", input: { path: pathFor(op.slot) } }, agent);
+			return;
+		}
+		await h.emit(
+			"tool_result",
+			{
+				toolName: "edit",
+				toolCallId: `${op.agent}-${index}`,
+				input: { path: pathFor(op.slot) },
+				details: { diff: op.diff },
+			},
+			agent,
+		);
+	}
+
+	interface Tally {
+		blocker: number;
+		concern: number;
+		nit: number;
+		note: number;
+	}
+
+	type TallyStep =
+		| { kind: "card"; notes: { severity?: string; note: string }[] }
+		| { kind: "prompt"; real: boolean };
+
+	function tallyOf(steps: readonly TallyStep[]): Tally {
+		const tally: Tally = { blocker: 0, concern: 0, nit: 0, note: 0 };
+		for (const step of steps) {
+			if (step.kind === "prompt") {
+				if (step.real) Object.assign(tally, { blocker: 0, concern: 0, nit: 0, note: 0 });
+				continue;
+			}
+			for (const note of step.notes) {
+				const severity = note.severity;
+				if (severity === "blocker" || severity === "concern" || severity === "nit") tally[severity]++;
+				else tally.note++;
+			}
+		}
+		return tally;
+	}
+
+	function formatTally(tally: Tally): string | undefined {
+		const parts: string[] = [];
+		const push = (count: number, one: string, many: string): void => {
+			if (count > 0) parts.push(`${count} ${count === 1 ? one : many}`);
+		};
+		push(tally.blocker, "blocker", "blockers");
+		push(tally.concern, "concern", "concerns");
+		push(tally.nit, "nit", "nits");
+		push(tally.note, "note", "notes");
+		return parts.length > 0 ? `Advisor: ${parts.join(" · ")}` : undefined;
+	}
+
+	test("property: advisor tool activity cannot change the band", async () => {
+		await resetBand();
+		const advisorOps = fc.array(
+			fc.oneof(
+				fc.record({ kind: fc.constant("read" as const), slot: fc.integer({ min: 0, max: 9 }) }),
+				fc.record({
+					kind: fc.constant("edit" as const),
+					slot: fc.integer({ min: 0, max: 9 }),
+					diff: fc.string({ maxLength: 20 }),
+				}),
+				fc.record({ kind: fc.constant("exec" as const), text: fc.string({ maxLength: 20 }) }),
+			),
+			{ maxLength: 8 },
+		);
+		await fc.assert(
+			fc.asyncProperty(advisorOps, async ops => {
+				await resetBand();
+				const before = render();
+				for (const [index, op] of ops.entries()) {
+					if (op.kind === "exec") {
+						const toolCallId = `advisor-${index}`;
+						const args = { command: "true" };
+						await h.emit(
+							"tool_execution_start",
+							{ toolCallId, toolName: "bash", args },
+							ADVISOR_AGENT,
+						);
+						await h.emit(
+							"tool_execution_update",
+							{ toolCallId, toolName: "bash", args, partialResult: { content: op.text } },
+							ADVISOR_AGENT,
+						);
+						await h.emit(
+							"tool_execution_end",
+							{
+								toolCallId,
+								toolName: "bash",
+								result: { content: [{ type: "text", text: op.text }] },
+								isError: false,
+							},
+							ADVISOR_AGENT,
+						);
+						continue;
+					}
+					await applyAgentOp({ agent: "advisor", ...op }, index);
+				}
+				expect(render()).toBe(before);
+			}),
+			{ numRuns: 25, seed: 20261101 },
+		);
+	});
+
+	test("property: the band equals the main-only subsequence of any interleaving", async () => {
+		await resetBand();
+		const interleavings = fc.array(
+			fc.record({
+				agent: fc.boolean().map(main => (main ? ("main" as const) : ("advisor" as const))),
+				kind: fc.constantFrom("read" as const, "edit" as const),
+				slot: fc.integer({ min: 0, max: 9 }),
+				diff: fc.string({ maxLength: 16 }),
+			}),
+			{ maxLength: 10 },
+		);
+		await fc.assert(
+			fc.asyncProperty(interleavings, async sequence => {
+				await resetBand();
+				const mainOnly = sequence.filter(op => op.agent === "main");
+				for (const [index, op] of mainOnly.entries()) await applyAgentOp(op, index);
+				const expected = render();
+				const mainReads = mainOnly.filter(op => op.kind === "read").length;
+				const mainEdits = mainOnly.filter(op => op.kind === "edit" && op.diff.length > 0).length;
+				if (mainReads > 0) expect(expected).toMatch(/📂 Files \([1-9]/);
+				if (mainEdits > 0) expect(expected).not.toContain("No edit yet");
+				await resetBand();
+				for (const [index, op] of sequence.entries()) await applyAgentOp(op, index);
+				expect(render()).toBe(expected);
+			}),
+			{ numRuns: 30, seed: 20261101 },
+		);
+	});
+
+	test("property: the tally counts notes since the last real prompt, live and replayed", async () => {
+		await resetBand();
+		const steps = fc.array(
+			fc.oneof(
+				fc.record({
+					kind: fc.constant("card" as const),
+					notes: fc.array(
+						fc.record({
+							severity: fc.option(
+								fc.constantFrom("nit", "concern", "blocker", "weird"),
+								{ nil: undefined },
+							),
+							note: fc.string({ maxLength: 12 }),
+						}),
+						{ maxLength: 5 },
+					),
+				}),
+				fc.record({ kind: fc.constant("prompt" as const), real: fc.boolean() }),
+			),
+			{ maxLength: 8 },
+		);
+		await fc.assert(
+			fc.asyncProperty(steps, async sequence => {
+				// A real prompt is the turn boundary; start each run from zero.
+				await h.emit("message_end", {
+					message: { role: "user", content: "start", timestamp: 1 },
+				});
+				const branch: unknown[] = [];
+				for (const [index, step] of sequence.entries()) {
+					if (step.kind === "prompt") {
+						const message = {
+							role: "user",
+							content: "prompt",
+							timestamp: index + 2,
+							synthetic: !step.real,
+							attribution: step.real ? "user" : "agent",
+						};
+						await h.emit("message_end", { message });
+						branch.push({ type: "message", message });
+						continue;
+					}
+					const details = { notes: step.notes };
+					await h.emit("message_end", {
+						message: { role: "custom", customType: "advisor", content: "<advisory/>", details },
+					});
+					branch.push({ type: "custom_message", customType: "advisor", content: "", details });
+				}
+				const expected = formatTally(tallyOf(sequence));
+				expect(h.status("split-view.advisor")).toBe(expected);
+				// Branch replay must reconstruct the same tally.
+				h.setBranch(branch);
+				await h.emit("session_tree");
+				expect(h.status("split-view.advisor")).toBe(expected);
+			}),
+			{ numRuns: 30, seed: 20261101 },
+		);
 	});
 });

@@ -62,8 +62,29 @@ function boolOr(value: unknown, fallback: boolean): boolean {
 	return typeof value === "boolean" ? value : fallback;
 }
 
-/** Normalize raw config with defaults (never throws). */
-export function normalizeConfig(raw: UiPanelsConfig): Required<{
+/** Optional integer read: a real finite number truncates, anything else
+ * (including `null`, which `Number()` would turn into 0) yields null. */
+function intOrNull(value: unknown): number | null {
+	return typeof value === "number" && Number.isFinite(value) ? Math.trunc(value) : null;
+}
+
+/** Tolerate any shape: a null root, an array or a primitive reads as an empty
+ * config instead of throwing on property access. */
+function plainConfig(raw: unknown): UiPanelsConfig {
+	return typeof raw === "object" && raw !== null && !Array.isArray(raw) ? (raw as UiPanelsConfig) : {};
+}
+
+/** Strict literals: anything else falls back to the documented default. */
+function toolModeOf(value: unknown): ToolMode {
+	return value === "full" ? "full" : "compact";
+}
+
+function geometryOf(value: unknown): GeometrySetting {
+	return value === "4k" || value === "wide" ? value : "auto";
+}
+
+/** Every field resolved to its documented default. */
+export type NormalizedUiPanelsConfig = Required<{
 	split: boolean;
 	thinking: boolean;
 	tools: boolean;
@@ -75,44 +96,32 @@ export function normalizeConfig(raw: UiPanelsConfig): Required<{
 	toolsWidthPct: number;
 	filesWidth: number | null;
 	geometry: GeometrySetting;
-}> {
-	// Tolerate any shape — a null root, an array or a primitive reads as an
-	// empty config instead of throwing on property access.
-	const root: UiPanelsConfig =
-		typeof raw === "object" && raw !== null && !Array.isArray(raw) ? raw : {};
+}>;
+
+/** Normalize raw config with defaults (never throws). */
+export function normalizeConfig(raw: UiPanelsConfig): NormalizedUiPanelsConfig {
+	const root = plainConfig(raw);
 	const split = boolOr(root.split, false);
-	const tm: ToolMode = root.toolMode === "full" ? "full" : "compact";
-	// geometry — strict literal match; absent or garbage (including a config
-	// written before the key existed) means "auto".
-	const geometry: GeometrySetting =
-		root.geometry === "4k" || root.geometry === "wide" ? root.geometry : "auto";
-	// Only a real finite number is usable; Number(null) === 0 would otherwise
-	// clamp to 6. Non-numeric/unusable values use the default.
-	const rawHeight: unknown = root.bandHeight;
-	const usableHeight =
-		typeof rawHeight === "number" && Number.isFinite(rawHeight)
-			? Math.trunc(rawHeight)
-			: 20;
-	const bandHeight = Math.max(MIN_BAND_HEIGHT, Math.min(MAX_BAND_HEIGHT, usableHeight));
-	// toolsWidthPct — same strict typing as bandHeight (real finite number,
-	// default 35 on garbage), clamped to 20–60.
-	const rawPct: unknown = root.toolsWidthPct;
-	const usablePct =
-		typeof rawPct === "number" && Number.isFinite(rawPct) ? Math.trunc(rawPct) : 35;
-	const toolsWidthPct = Math.max(20, Math.min(60, usablePct));
+	// Absent or garbage geometry (including a config written before the key
+	// existed) means "auto".
+	const geometry = geometryOf(root.geometry);
+	// Unusable heights/percentages use the documented defaults; usable ones
+	// clamp to their bounds. `Number(null) === 0` must not read as "minimum".
+	const bandHeight = Math.max(
+		MIN_BAND_HEIGHT,
+		Math.min(MAX_BAND_HEIGHT, intOrNull(root.bandHeight) ?? 20),
+	);
+	const toolsWidthPct = Math.max(20, Math.min(60, intOrNull(root.toolsWidthPct) ?? 35));
 	// filesWidth: a real finite number ≥ 24 cols (capped at 200), else auto.
-	const rawFw: unknown = root.filesWidth;
-	const filesWidth =
-		typeof rawFw === "number" && Number.isFinite(rawFw) && rawFw >= 24
-			? Math.min(200, Math.trunc(rawFw))
-			: null;
+	const rawFw = intOrNull(root.filesWidth);
+	const filesWidth = rawFw !== null && rawFw >= 24 ? Math.min(200, rawFw) : null;
 	return {
 		split,
 		thinking: split && boolOr(root.thinking, true),
 		tools: split && boolOr(root.tools, true),
 		files: boolOr(root.files, false),
 		diff: boolOr(root.diff, true),
-		toolMode: tm,
+		toolMode: toolModeOf(root.toolMode),
 		trimResponse: boolOr(root.trimResponse, false),
 		bandHeight,
 		toolsWidthPct,

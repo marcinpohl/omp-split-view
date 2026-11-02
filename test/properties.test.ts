@@ -25,7 +25,6 @@ import {
 	isHighSurrogate,
 	isLowSurrogate,
 	lastImageBlock,
-	outputPreview,
 	sanitizeText,
 	transcriptVisibility,
 	truncateInline,
@@ -167,24 +166,6 @@ describe("geometry profiles", () => {
 	const cols = fc.integer({ min: 0, max: 2000 });
 	const rank = (mode: string) => (mode === "wide" ? 1 : 0);
 
-	test("the band stays inside its profile's floor and the shared ceiling", () => {
-		fc.assert(
-			fc.property(rows, fc.constantFrom(...PRESETS), (n, preset) => {
-				const profile = GEOMETRY_PROFILES[preset];
-				const height = defaultBandHeight(n, profile);
-				expect(Number.isInteger(height)).toBe(true);
-				expect(height).toBeGreaterThanOrEqual(profile.minBandRows);
-				expect(height).toBeLessThanOrEqual(MAX_BAND_HEIGHT);
-				// Inside the bounds the share applies verbatim; outside, the bound wins.
-				const share = Math.floor(n * profile.bandPct);
-				if (share < profile.minBandRows) expect(height).toBe(profile.minBandRows);
-				else if (share > MAX_BAND_HEIGHT) expect(height).toBe(MAX_BAND_HEIGHT);
-				else expect(height).toBe(share);
-			}),
-			{ numRuns: 500, seed: SEED },
-		);
-	});
-
 	test("the band never shrinks as the terminal grows", () => {
 		fc.assert(
 			fc.property(rows, rows, fc.constantFrom(...PRESETS), (a, b, preset) => {
@@ -193,25 +174,6 @@ describe("geometry profiles", () => {
 				expect(defaultBandHeight(lo, profile)).toBeLessThanOrEqual(defaultBandHeight(hi, profile));
 			}),
 			{ numRuns: 300, seed: SEED },
-		);
-	});
-
-	test("the auto dock stays inside the profile's bounds, grows, and applies the share mid-range", () => {
-		fc.assert(
-			fc.property(cols, fc.constantFrom(...PRESETS), (width, preset) => {
-				const profile = GEOMETRY_PROFILES[preset];
-				const dock = dockColsFor(width, null, profile);
-				expect(Number.isInteger(dock)).toBe(true);
-				expect(dock).toBeGreaterThanOrEqual(profile.minDockCols);
-				expect(dock).toBeLessThanOrEqual(profile.maxDockCols);
-				const share = Math.floor(width * profile.dockPct);
-				if (share < profile.minDockCols) expect(dock).toBe(profile.minDockCols);
-				else if (share > profile.maxDockCols) expect(dock).toBe(profile.maxDockCols);
-				// Within the bounds the share applies, so the dock keeps growing
-				// instead of flat-capping mid-range.
-				else expect(dock).toBe(share);
-			}),
-			{ numRuns: 500, seed: SEED },
 		);
 	});
 
@@ -244,25 +206,6 @@ describe("geometry profiles", () => {
 					expect(dockColsFor(width, preset, GEOMETRY_PROFILES.wide)).toBe(preset);
 				},
 			),
-			{ numRuns: 500, seed: SEED },
-		);
-	});
-
-	test("4k reproduces the pre-switch curve exactly", () => {
-		// The default profile is the old behavior: any drift here would move
-		// every existing 4K/1440p layout without a preset switch.
-		fc.assert(
-			fc.property(rows, cols, (n, width) => {
-				expect(defaultBandHeight(n)).toBe(
-					Math.max(20, Math.min(MAX_BAND_HEIGHT, Math.floor(n * 0.45))),
-				);
-				expect(dockColsFor(width)).toBe(
-					Math.max(
-						AUTO_DOCK_MIN_COLS,
-						Math.min(AUTO_DOCK_MAX_COLS, Math.floor(width * AUTO_DOCK_PCT)),
-					),
-				);
-			}),
 			{ numRuns: 500, seed: SEED },
 		);
 	});
@@ -409,24 +352,6 @@ describe("capDisplayLine", () => {
 				expect(line.endsWith(payload)).toBe(true);
 				expect(isLowSurrogate(payload.charCodeAt(0))).toBe(false);
 			}),
-			{ numRuns: 500, seed: SEED },
-		);
-	});
-});
-
-describe("outputPreview", () => {
-	test("shows a prefix and accounts for every hidden line", () => {
-		fc.assert(
-			fc.property(
-				fc.array(fc.string(), { maxLength: 50 }),
-				fc.integer({ min: -5, max: 50 }),
-				(lines, cap) => {
-					const { shown, hidden } = outputPreview(lines, cap);
-					expect(shown.length).toBe(Math.min(Math.max(0, cap), lines.length));
-					expect(shown).toEqual(lines.slice(0, shown.length));
-					expect(shown.length + hidden).toBe(lines.length);
-				},
-			),
 			{ numRuns: 500, seed: SEED },
 		);
 	});

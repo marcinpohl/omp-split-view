@@ -1,18 +1,21 @@
 # Code quality — measurements and work queue
 
-Snapshot: 2026-11-01, after the Q1–Q7 structural batch, B7 CI, the split-view
-improvement pass and the geometry preset switch (G1) (base commit `b80a002`;
-these batches are uncommitted). This file is the dispatcher:
-metrics live here, the ordered queue below is what to work on next, and every
-landed item updates the snapshot and ticks its row.
+Snapshot: 2026-11-02, after the Q1–Q7 structural batch, B7 CI, the split-view
+improvement pass, the geometry preset switch (G1), advisor compatibility
+(A1), test-suite simplification (T1), code simplification (C1), W6 bash
+replay, the R1 review pass, R2 mount-once/auto-height fixes, the R3
+tool-preview window and the R4 render-budget/saved-layout batch (all landed).
+This file is the dispatcher: metrics live here, the ordered queue below is
+what to work on next, and every landed item updates the snapshot and ticks
+its row.
 
 ## Commands (what gates what)
 
 | Command | Measures | Gate |
 | --- | --- | --- |
-| `bun test` | behaviour + property tests | 133 tests, 0 failures |
+| `bun test` | behaviour + property tests | 129 tests, 0 failures |
 | `bun run test:coverage` | line/function coverage from Bun's lcov | lines ≥ 99%, functions ≥ 90% (`scripts/check-coverage.ts`) |
-| `bun run lint` | ESLint 10 + typescript-eslint + sonarjs; also the cyclomatic/cognitive/size metrics | 0 errors (warnings are the metric report) |
+| `bun run lint` | ESLint 10 + typescript-eslint + sonarjs; also the cyclomatic/cognitive/size metrics | 0 errors, 0 warnings |
 | `bun run typecheck` | `tsc --noEmit`, strict | clean |
 | `bun run check:package` | the shipped tarball: `files` coverage and declared deps via the `omp.extensions` import graph (`scripts/check-package.ts`) | `ok` — 3 shipped modules |
 | geometry properties (`band properties`, `geometry preset properties`) | 40–300 cols × 6–40 rows with a pinned height, plus 90–420 cols × 24–140 rows for both presets: exact rows/cells, dock offset, no control chars | 0 failures |
@@ -28,20 +31,20 @@ targets control characters.
 
 | File | Lines | Funcs | Test file | Tests |
 | --- | --- | --- | --- | --- |
-| `split-view.ts` | 99.91% | 98.32% | `test/split-view.test.ts` | 76 |
-| `helpers.ts` | 100.00% | 94.74% | `test/helpers.test.ts` | 28 |
-| `ui-panels-config.ts` | 100.00% | 80.00% | `test/properties.test.ts` | 29 |
-| **overall** | **99.92%** | **97.20%** | | **133** |
+| `split-view.ts` | 99.91% | 98.53% | `test/split-view.test.ts` | 85 |
+| `helpers.ts` | 100.00% | 94.44% | `test/helpers.test.ts` | 19 |
+| `ui-panels-config.ts` | 100.00% | 88.89% | `test/properties.test.ts` | 25 |
+| **overall** | **99.93%** | **97.55%** | | **129** |
 
-49,019 assertions, ~3.8 s wall time. Uncovered:
+45,752 assertions, ~3.9 s wall time. Uncovered:
 
-- `split-view.ts:127` — `themeGetter` default that throws if something renders
+- `split-view.ts:128` — `themeGetter` default that throws if something renders
   before `session_start` binds a theme. Deliberate, unreachable.
-- Functions: 139/143 counted (`FNF`/`FNH` in `coverage/lcov.info`, `test/**`
+- Functions: 160/164 counted (`FNF`/`FNH` in `coverage/lcov.info`, `test/**`
   excluded as the gate does). The four misses are the throwing `themeGetter`
   default, `BandHub.dispose` (no-op host hook), and the two no-op default
   exports that exist so omp's extension auto-discovery does not report a load
-  error (`helpers.ts:321`, `ui-panels-config.ts:163`). Bun 1.4's lcov omits the
+  error (`helpers.ts:310`, `ui-panels-config.ts:171`). Bun 1.4's lcov omits the
   per-function `FN`/`FNDA` records, so those identities come from reading the
   four sites; only the totals come from the report. Every helper extracted by
   Q1–Q7 plus the split-view batch (`capDiffText`, `imageLabel`,
@@ -50,7 +53,8 @@ targets control characters.
 Property coverage is behavioural, not line-based: helpers (truncation, caps,
 config normalization, visibility), band geometry for arbitrary terminal sizes,
 cache idempotence, theme invalidation, escape stripping, arbitrary event
-streams. Fixed fast-check seeds (`20261101`) keep failures reproducible.
+streams, advisor/main interleavings, and tally replay. Fixed fast-check seeds
+(`20261101`) keep failures reproducible.
 
 `geometry profiles` and `geometry preset properties` cover the preset switch
 end to end: both curves against literal shares and bounds at any size, the
@@ -72,7 +76,7 @@ offsets) and the disk → live direction of the config: one `session_start` with
 a saved layout that differs on every field.
 
 The `complex renderers` suite targets the five highest-`cc` functions branch by
-branch: tool output preview cap and `+N more`, image fallback vs base64, a
+branch: tool output preview tail and `+N earlier lines`, image fallback vs base64, a
 tool-row diff block, compact entry separators, the sub-one-second timer gate,
 directory grouping and its indented children, list truncation counts, the
 `×N` badge and merged op letters, `~`/absolute path shortening, the empty and
@@ -89,21 +93,14 @@ from an earlier test, so delta coalescing is now asserted directly.
 
 ### Lint and complexity (radon `cc` / `raw` equivalents)
 
-2 warnings, 0 errors. Limits: cyclomatic 12, cognitive 15, depth 4, params 4,
+0 warnings, 0 errors. Limits: cyclomatic 12, cognitive 15, depth 4, params 4,
 function length 100 lines.
 
-| Function | cc | cognitive | other | Location |
-| --- | --- | --- | --- | --- |
-| `syncTranscriptVisibility` | 15 | — | — | `split-view.ts:1153` |
-| `normalizeConfig` | 16 | — | — | `ui-panels-config.ts:64` |
-
-Both are the deliberately parked Q8 pair (just over the limit, untouched). G1
-moved `normalizeConfig` from 14 to 16: the geometry read is a strict
-two-literal match (`"4k" || "wide"` → the value, else `"auto"`), which costs
-two decisions. It stays under the arms-length rule — Q8 is only touched when
-another change already rewrites the function, and this one added a field
-rather than restructuring — but the next change to it should extract the field
-readers. The structural batch cleared the other thirteen warnings and
+The parked Q8 pair is gone: C1 extracted `pendingVisibilityPolicy` from
+`syncTranscriptVisibility` and the field/shape readers from
+`normalizeConfig`, taking both under the cyclomatic limit without changing
+their behaviour (same tests, demo and package gate). The structural batch
+cleared the other thirteen warnings and
 introduced none: two helpers needed one extra split each while landing
 (`fileRows` → `fileEntryRow` + `fileRunRows`, `renderBand` → `panelLayout` +
 `narrowFilesNotice`, then `splitView` → `registerEvents` + `registerCommands`
@@ -121,10 +118,10 @@ caller that does not pass one gets the pre-switch behavior.
 `notice?` and passes the padded content width to the helpers instead of a
 closure, so no fifth parameter (and no options object) was needed.
 
-File sizes: `split-view.ts` 1643 L, `helpers.ts` 323 L,
-`ui-panels-config.ts` 165 L, `scripts/check-coverage.ts` 90 L,
-`scripts/check-package.ts` 169 L, tests 2613 L (`split-view` 1779,
-`properties` 533, `helpers` 294, `setup` 7).
+File sizes: `split-view.ts` 1854 L, `helpers.ts` 312 L,
+`ui-panels-config.ts` 176 L, `scripts/check-coverage.ts` 90 L,
+`scripts/check-package.ts` 169 L, tests 3018 L (`split-view` 2351,
+`properties` 458, `helpers` 202, `setup` 7).
 
 CI: `.github/workflows/ci.yml` runs the five gates plus `bun install
 --frozen-lockfile` on Bun 1.4.3 for every push and pull request;
@@ -147,12 +144,275 @@ when its acceptance metric is met and the snapshot above is updated.
 
 | ID | Evidence | Work | Acceptance |
 | --- | --- | --- | --- |
-| Q8 | `syncTranscriptVisibility` cc 15, `normalizeConfig` cc 16 (was 14; G1 added the geometry read) | `syncTranscriptVisibility` is untouched; `normalizeConfig` already changed for G1, so the next touch should extract its field readers instead of letting cc climb. Rule: no new warnings. | 0 warnings, or the two functions under the limit |
+| Q8 | ~~`syncTranscriptVisibility` cc 15, `normalizeConfig` cc 16~~ — **done (C1)** | Extracted `pendingVisibilityPolicy` and the config field readers. | 0 warnings |
 
-Nothing else is queued. The remaining open item is behavioural, not
-structural: PLAN W6 (bash replay in `reconstruct`) — Q3 extracted the replay
-without folding a policy choice, so its three options are still open in
-`PLAN.md`.
+Nothing else is queued: W6 landed with policy (a) and the queue is empty.
+
+### Landed — render budget, saved-layout restore, cap count, visibility retry (R4)
+
+Delta: 122 → 129 tests (85 in `split-view.test.ts`, +3 examples and +2
+properties there, +1 each for the saved layout and the visibility retry),
+assertions 44,883 → 45,752. Coverage 99.93% lines / 97.55% functions (gate
+99/90); lint 0/0; typecheck and package gate unchanged.
+`split-view.ts` 1796 → 1854 L, `ui-panels-config.ts` 173 → 176 L,
+`test/split-view.test.ts` 2134 → 2351 L.
+
+- **The tool row survives its own detail.** `toolLines` built every card's
+  rows and then let `newestRows` keep the newest `maxRows` wrapped rows, so a
+  long diff pushed the card's identity row off the top (band 20, 200-line
+  diff: no `edit` row at all). Cards are now budgeted newest-first against the
+  rows left (`toolCardBody`), the row is always taken from the budget, and
+  detail that does not fit closes with `+N more detail rows`. `toolPrefix` and
+  `toolDiffLines` truncate to the column, which is what makes a card's row
+  count knowable before it is placed.
+- **`+N earlier lines` counts the whole result.** `resultText` returned
+  `capToolText(...)`, so the count described the retained 32 KiB window: a
+  40,000-line result reported `+4675`. It now returns the reported text
+  unsanitized and uncapped, and `setToolOutput(entry, text, countAll)`
+  sanitizes it once and takes the full line count at ingest; a streaming
+  update still counts only the retained window. Per streaming update, only the
+  cap, the window count and the tail are O(retained): the sanitize pass stays
+  linear in the cumulative partial (one pass, as before R4 — sanitizing in both
+  `resultText` and `setToolOutput` would have made it two, and capping first is
+  not an option because a cut escape sequence would survive the sanitizer). The
+  final result's full-text count is linear in the result, paid once per call.
+- **`/split` ON restores the saved size and geometry.** Only panel booleans
+  were applied, so a layout saved at 30 rows / 45 % / 60 cols / `wide` came
+  back at 8 rows / 60 %. `applySavedMetrics` (shared with `session_start`)
+  adopts `toolMode`, `bandHeight` (and whether it is auto), `geometry`,
+  `toolsWidthPct` and `filesWidth`; the fallback branch — nothing saved —
+  still keeps the live size and enables thinking + tools.
+- **A settings failure no longer disables transcript hiding forever.**
+  `visibilityUnsupported` latched for the process, so one throwing settings
+  object stopped every later session from hiding thinking/tool activity.
+  `session_start` clears it and the forced sync retries; the in-session latch
+  (which is what stops repeated throwing) is unchanged.
+- **Property** (`property: a tall tool card always keeps its row inside the
+  band`): 0–200 diff lines × band heights 6–40, asserting the `edit` row
+  renders, the band keeps its height, every row its width, and the omission
+  marker appears exactly when the expected detail exceeds the body rows left.
+  **Properties** (`property: the earlier-lines marker counts output past the
+  character cap`): 0–25,000 lines × band heights 18–60, asserting exactly the
+  newest `min(cap, total)` lines render, the oldest (and the boundary) do not,
+  and the marker equals `total − shown`.
+- **Mutation-checked** (each reverted after the run): restoring `capToolText`
+  in `resultText` fails both cap-count tests (`+3386` for 3388 lines); the
+  unbudgeted `rows.push(...detail)` fails the three card tests (the band starts
+  mid-diff, no `edit` row); dropping `applySavedMetrics` from the `/split` ON
+  branch fails the restore test (8 rows, not 24); dropping the
+  `visibilityUnsupported` reset fails the retry test.
+
+### Landed — tool output preview window (R3)
+
+Delta: 122 tests unchanged — one preview property added, one property for the
+now-dead `outputPreview` helper removed; assertions 44,530 → 44,883; overall
+functions 97.52% → 97.50% (the deleted helper was covered); lines 99.93% and
+lint 0/0 unchanged. `split-view.ts` 1785 → 1796 L, `helpers.ts` 323 → 312 L,
+`test/split-view.test.ts` 2057 → 2134 L, `test/properties.test.ts` 477 → 458 L.
+
+- **Wrong slice, wrong count.** Retention was already a tail (`capToolText`
+  keeps the newest chars, `setToolOutput` the last 20 lines), but the renderer
+  took the *first* `previewCap` lines of that window: a 25-line result showed
+  `L5, L6` and claimed `+18 more`. It now shows the newest `previewCap` lines,
+  with `+N earlier lines` above them, where N counts every non-empty line seen
+  (`outputLineCount`, a max across cumulative updates).
+- **Whitespace-only finals no longer blank the panel.** A final result of
+  `"\n"` used to overwrite streamed output with nothing; `setToolOutput` now
+  ignores inputs with no non-empty lines, matching the empty-string path.
+- **Property** (`property: tool output previews its newest lines and counts
+  earlier ones`): arbitrary partial/final counts 0–80, band heights 18–60 (so
+  the cap is 2–6), blank lines and padded tokens between every line, and a
+  cumulative partial followed by a final. Oracles: exactly the newest
+  `min(cap, total)` lines render, older lines do not, the marker equals
+  `max(partial, final) − shown`, and the marker row precedes the newest line.
+  Mutation-checked: retaining the head instead of the tail, slicing the head of
+  the window, counting only the retained window, and letting a whitespace final
+  wipe the output each fail it.
+- **Dead helper removed.** With the preview slicing directly, `outputPreview`
+  had no product caller; the helper and its property test were deleted rather
+  than left exported for tests only.
+
+### Landed — mount-once harness + auto height lifecycle (R2)
+
+Delta: 120 → 122 tests, assertions 44,482 → 44,530; coverage (99.93% /
+97.52%) and lint (0/0) unchanged. `split-view.ts` 1775 → 1785 L,
+`test/split-view.test.ts` 2026 → 2057 L.
+
+- **Harness mount contract.** `createHarness` re-invoked the widget factory on
+  every `widget()` call, while omp calls it once at mount and keeps the
+  component. That silently re-ran auto-height derivation and geometry
+  resolution in tests, which is why the defect below was invisible. The
+  harness now caches the component from `setWidget` and clears it on unmount;
+  the full suite passed unchanged once the factory was no longer re-entered.
+- **Auto height on session load.** `session_start` assigned the config height
+  (20 by default) and left an already-mounted widget at it: on a 400×100 pane
+  the band collapsed 45 → 20 rows on the second session. It now re-derives
+  `defaultBandHeight(tuiRef.terminal.rows, profile)` whenever `bandHeightAuto`
+  is set; a pinned height still wins. Regression: mount once at 400×100,
+  reload a height-less config, expect 45 rows (mutation-checked).
+- **`/split-save` no longer pins an auto height.** It persisted the live
+  derived number, so a layout saved on a tall pane hid the band at next
+  startup on a shorter one (`rows - bandHeight < 18`). A saved payload omits
+  `bandHeight` while the height is auto, matching the existing `filesWidth:
+  null` omission. Regression: save at 400×100 (auto 45), load at 120×45,
+  expect a 20-row band rather than `[]` (mutation-checked).
+
+### Landed — review pass: visibility mutation coverage (R1)
+
+Delta: 119 → 120 tests, assertions 44,476 → 44,482; coverage (99.93% / 97.52%)
+and lint (0/0) unchanged. `test/split-view.test.ts` 2004 → 2026 L. No product
+code changed.
+
+The C1 refactor of the visibility policy had only been validated by the suite
+passing, so it was mutation-checked per the review note:
+
+| Mutation | Result |
+| --- | --- |
+| thinking panel no longer hides transcript thinking | 4 tests fail |
+| render-time self-heal (`scheduleVisibilitySync`) disabled | 8 tests fail |
+| `geometryMode` dropped from the band cache key | remount-preset test fails |
+| `thinking.version` dropped from the band cache key | coalescing test fails |
+| `force` ignored when the recorded policy equals the desired one | **survived → new regression added** |
+| "nothing owned" guard dropped (always apply) | survived — behaviourally inert; kept as an optimization that avoids touching user settings |
+
+- The surviving `force` mutation is the `/reload` case: the process-global
+  `applied` registry outlives the settings object, so the recorded policy can
+  equal the desired one while the new settings carry no override. New test
+  "session_start re-applies an equal policy after a reload" clears the
+  override behind the registry's back and asserts `session_start` re-applies
+  it; the mutation now fails. Ordering against the unsupported-settings test
+  is no longer load-bearing: R4 clears the `visibilityUnsupported` latch on
+  every `session_start`, so a latched flag only silences the rest of that
+  session.
+- The second survivor is not covered by design: `clearOverride` on a settings
+  object with no override is a no-op, so the guard changes no observable
+  behaviour — it only avoids redundant writes. The guard is documented above
+  and stays.
+
+### Landed — W6 bash replay (behaviour batch)
+
+Delta: 118 → 119 tests, assertions 44,472 → 44,476, overall coverage and lint
+unchanged (99.93% / 97.52%, 0 warnings). `split-view.ts` 1771 → 1775 L, tests
+1961 → 2004 L.
+
+- **W6 → policy (a): no bash "seen" replay.** `replayAssistant` still rebuilds
+  the bash tool row, but no longer calls `record()` for it, so a resume does
+  not re-probe every command token against today's filesystem. History cost is
+  constant instead of growing with the branch, and the files list no longer
+  drifts as files are moved or deleted. `s` entries remain a live observation;
+  `read`/`write`/`edit`/`ast_edit` and generic path keys still replay.
+- Test: a branch with three bash calls (two naming real files, one with flags
+  and redirection) plus one read renders `Files (1)` containing only the read,
+  and a `session_tree` rebuild is byte-identical. Mutation: restoring the
+  unconditional `record()` fails it.
+
+### Landed — code simplification (C1)
+
+Delta: 118 tests unchanged, overall lines unchanged at 99.93%, functions
+97.40% → 97.52% (seven extracted helpers, all reached), lint 2 warnings → **0**
+(Q8 closed); no product behaviour changed — the same suite, `bun run demo`
+and `check-package` pass.
+
+- **Visibility gating has one owner.** `pendingVisibilityPolicy(force)` answers
+  "is there anything to apply" for both `syncTranscriptVisibility` and the
+  render-time scheduler, so the two copies of the same guard (and their policy
+  computation) cannot drift; `syncTranscriptVisibility` is now under the
+  cyclomatic limit.
+- **One dock-width formula.** `clampedDockCols(cols)` is shared by
+  `panelLayout` and the `/split-geometry` message, so the reported dock cannot
+  disagree with the rendered one.
+- **One layout entry point.** `applyLayout(ctx)` replaces six
+  `reconcile(ctx) + syncTranscriptVisibility()` pairs.
+- **Config normalization extracted.** `plainConfig`, `intOrNull`,
+  `toolModeOf` and `geometryOf` replace the repeated shape/type guards;
+  `normalizeConfig` drops from 16 to under the cyclomatic limit and the
+  `Number(null) === 0` hazard is named once.
+- **Smaller duplications.** `bashPathHits` resolves tokens through
+  `addPathHit` (same existence check, no second copy); `EXACT_PATH_TOOLS`
+  stores one key per tool; `renderPanel` fills its body in a single loop;
+  `/split-height` computes its clamp once.
+
+### Landed — test-suite simplification (T1)
+
+Delta: 141 → 118 tests, test sources 2984 → 2647 L (−11%), assertions 49,151 →
+44,472; coverage unchanged at 99.93% / 97.40%, lint unchanged at 2 parked
+warnings, 0 errors. No product code changed.
+
+- **Subsumed helper examples removed.** `capDisplayLine`, `outputPreview`,
+  `transcriptVisibility`, the `geometry presets` examples and the
+  `defaultBandHeight` example were pinned instances of properties that already
+  specify the same function (including the aspect boundary, the documented
+  curves and the negative/zero caps). `lastImageBlock` kept only its non-array
+  rejection cases; the property owns the array semantics.
+- **Advisor examples replaced by their properties.** The inertness, live-tally
+  and branch-replay examples duplicated the three properties; the
+  main-agent-feeds test stayed as the positive control that guards against an
+  always-empty band.
+- **Geometry preset examples removed after widening the property ranges.**
+  `columnsArb`/`rowsArb` now cover 90–700 × 20–200, so the 4K (400×100) and
+  32:9 (500×40) panes the deleted examples pinned are exercised by "the
+  resolved preset sizes the band and the dock for any terminal". The
+  self-contained flip test keeps the exact command message and the
+  `auto` hand-back.
+- **Near-duplicate geometry properties removed.** Two properties re-derived the
+  band/dock formulas from the same profile constants as "each preset matches
+  its documented curve" (which uses literals, so drift is still caught);
+  "4k reproduces the pre-switch curve" was the same formula with the module's
+  own constants.
+- **Width cache test folded.** "re-rendering at another width re-wraps instead
+  of reusing stale rows" became a fixed `120 → 60 → 120` prefix inside the
+  width-sequence property, which already asserts repeat renders are identical.
+- **Equivalence property is no longer vacuous.** `band equals the main-only
+  subsequence` now asserts the positive direction too: main reads must produce
+  a non-zero Files count and a non-empty main diff must replace "No edit yet"
+  (mutation-checked by making `isMainAgent` always false).
+- **Examples kept where the property cannot replace them**: the
+  `capToolText` marker format, `capDiffText` (no property exists), the
+  `bandToolsColsFor` both-minimums fallback, `dockColsFor`'s manual-above-auto
+  ceiling, `appendStreamTail`'s overflow policy, `normalizeConfig`'s defaults
+  and clamps, and `sanitizeText`'s exact stripping.
+- **Shared harness helpers.** `writeConfig`, `fullLayout`, `setToggle` and
+  `ensurePanel` were defined 2–4 times across suites; they are now defined once
+  next to the singleton harness.
+
+### Landed — advisor compatibility (A1)
+
+Delta: 133 → 141 tests, overall lines 99.92% → 99.93%, functions 97.20% →
+97.40% (FNF 143 → 155, twelve new function records, all reached; the four
+misses are unchanged), lint
+unchanged at 2 warnings / 0 errors. No band geometry moved: no new panel, row
+or column.
+
+- **A1 → top-level-agent guard.** omp delivers advisor (and subagent) tool
+  calls to extension `tool_call`/`tool_result` hooks with
+  `ctx.agent.kind === "sub"`; the advisor's builtins are wrapped in
+  `ExtensionToolWrapper`, while its `advise` tool is constructed directly and
+  emits nothing. The files/diff panes ingested every call, so a review's
+  `read`/`grep` showed up as primary activity and then vanished on resume
+  (replay reads only the primary branch). `isMainAgent` now gates
+  `tool_call`, `tool_result` and the three `tool_execution_*` hooks; a missing
+  identity (older host) still counts as main.
+- **A1 → advisor tally status line.** Advisor cards arrive as `custom`
+  messages (`customType: "advisor"`, `details.notes`) on both delivery paths —
+  turn-less recording emits `message_start`/`message_end` directly, and a
+  steered batch passes through the same pair when the loop injects it. The
+  `message_end` handler counts severities delivered since the last real user
+  prompt (`synthetic` / agent-attributed user messages are not a boundary) and
+  mirrors them via `ctx.ui.setStatus("split-view.advisor", …)`;
+  `reconstruct`/`session_tree` rebuild the tally from `custom_message` branch
+  entries. A fourth band column was rejected: notes are prose in a fixed-height
+  band and the transcript card already renders them at full width. The status
+  is cleared on turn reset, when every panel is toggled off (`/split` off
+  unmounts the band, so its status chrome goes too), and on `session_shutdown`.
+- Tests: advisor-attributed `tool_call`/`tool_execution_*`/`tool_result` leave
+  Files and Last-Edit untouched while main-agent events still populate them;
+  live tally text and its user-prompt reset; branch rebuild after
+  `session_tree`. Properties (fixed seed `20261101`): advisor-only tool streams
+  leave the band byte-identical; the band equals the main-only subsequence of
+  any main/advisor interleaving; the tally equals an independent count of
+  notes since the last real prompt, both live and replayed from the branch.
+  Mutations checked: dropping the guard fails both band properties; dropping
+  the live or the replay reset fails the tally property.
 
 ### Landed — Q1–Q7 + B7 (structural batch)
 
@@ -274,9 +534,10 @@ pre-batch capture after normalising tool-duration cells.
 
 Delta: 102 → 133 tests, overall functions 97.08% → 97.20% (five new functions,
 all reached), overall lines unchanged at 99.92%, lint unchanged at 2 warnings /
-0 errors. Two permanent-example blocks (`geometry presets` in both files) plus
-a property suite (`geometry profiles` here, `geometry preset properties` in
-`test/split-view.test.ts`).
+0 errors. Two example blocks (`geometry presets` in both files) plus a
+property suite (`geometry profiles` here, `geometry preset properties` in
+`test/split-view.test.ts`); T1 later removed the examples whose properties
+subsumed them.
 
 - **G1 → `4k` / `wide` presets.** The single auto curve assumed a 4K cell grid;
   on a 21:9-or-wider pane it spent 45 % of the rows on the band and left the
@@ -288,7 +549,7 @@ a property suite (`geometry profiles` here, `geometry preset properties` in
 - **Preset resolution is centralized.** `resolveGeometryMode()` is the only
   place that turns `geometrySetting` into a mode, and it runs at mount, on
   session load and from `/split-geometry`. Testing the first draft found two
-  defects that the permanent-example tests alone had missed: (a) the mount
+  defects that the example tests alone had missed: (a) the mount
   factory resolved the mode only for `auto` while `session_start` reset it to
   `4k`, so a *saved* preset was overwritten and never armed; (b) resolution
   lived only in the factory, which the host calls on *first* mount, so a
@@ -312,27 +573,24 @@ a property suite (`geometry profiles` here, `geometry preset properties` in
   `bandPct` — expectation and behavior move together. The pure suite therefore
   also checks both curves against literal shares (0.45/20 + 0.25/34–120,
   0.35/14 + 0.32/40–200) and `autoGeometryMode` against a literal 8, and the
-  pinned-example tests use absolute sizes (320/319, 500×40, 400×100).
+  integration examples pin absolute panes (500×40 in the flip test, 400×100 in
+  the large-terminal test, 500×60/90 in the pinned/remount regressions).
 - **Mutation-checked** (each reverted after the run): `wide.bandPct` 0.35 →
   0.42 fails the documented-curve property; `AUTO_WIDE_ASPECT` 8 → 7 fails the
-  threshold property *and* the 320/319 example; dropping `geometryMode` from
-  the band cache key fails the remount test (the memo outlives an unmount, and
-  a pinned height leaves nothing else in the key to change); letting the manual
-  dock path honour `profile.maxDockCols` fails the manual-width property; a
-  wrong dock in the `/split-geometry` message fails the pinned-height property,
-  which compares the message against the rendered column offsets; forcing the
-  resolver to `4k` fails eight tests; reverting the session-load resolution
-  fails the session-switch test.
+  threshold property (it asserts both sides of `8·rows`); dropping
+  `geometryMode` from the band cache key fails the remount test (the memo
+  outlives an unmount, and a pinned height leaves nothing else in the key to
+  change); letting the manual dock path honour `profile.maxDockCols` fails the
+  manual-width property; a wrong dock in the `/split-geometry` message fails
+  the pinned-height property, which compares the message against the rendered
+  column offsets; forcing the resolver to `4k` fails the preset-facing tests;
+  reverting the session-load resolution fails the session-switch test.
 
 ## Next up
 
-1. **W6** — the only open item (bash replay in `reconstruct`); pick one of the
-   three policies in `PLAN.md` before touching the replay path again.
-2. **Q8** — parked by design: `syncTranscriptVisibility` cc 15 and
-   `normalizeConfig` cc 16 against a limit of 12, and the rule is to touch them
-   only when another change touches them.
-3. Nothing structural is left: keep all five gates green and update this
-   snapshot in the same commit as any future change.
+1. Nothing is queued: W6 (bash replay) landed; Q8 closed with C1.
+2. Keep all five gates green and update this snapshot in the same commit as
+   any future change.
 
 ## Keeping this file honest
 

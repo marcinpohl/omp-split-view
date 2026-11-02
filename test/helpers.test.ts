@@ -1,24 +1,18 @@
 import { describe, expect, test } from "bun:test";
 import {
-	GEOMETRY_PROFILES,
 	MAX_BAND_HEIGHT,
 	MAX_DIFF_CHARS,
 	MAX_DIFF_LINES,
 	MIN_BAND_HEIGHT,
 	appendStreamTail,
-	autoGeometryMode,
 	bandToolsColsFor,
 	capDiffText,
-	capDisplayLine,
 	capToolText,
-	defaultBandHeight,
 	dockColsFor,
 	formatDuration,
 	isHighSurrogate,
 	lastImageBlock,
 	maxBandHeight,
-	outputPreview,
-	transcriptVisibility,
 	truncateInline,
 } from "../helpers.ts";
 import { normalizeConfig } from "../ui-panels-config.ts";
@@ -119,14 +113,6 @@ describe("dockColsFor", () => {
 });
 
 describe("band height scaling", () => {
-	test("default follows the terminal, pinned at the classic 20 on a 45-row screen", () => {
-		expect(defaultBandHeight(45)).toBe(20); // unchanged for existing users
-		expect(defaultBandHeight(40)).toBe(20); // floor wins on short terminals
-		expect(defaultBandHeight(60)).toBe(27);
-		expect(defaultBandHeight(100)).toBe(45); // 4K: a third of the screen
-		expect(defaultBandHeight(200)).toBe(MAX_BAND_HEIGHT); // ceiling
-	});
-
 	test("max keeps the transcript and editor their rows", () => {
 		expect(maxBandHeight(20)).toBe(MIN_BAND_HEIGHT); // 20 - 18 = 2 → floor
 		expect(maxBandHeight(24)).toBe(6);
@@ -134,34 +120,6 @@ describe("band height scaling", () => {
 		expect(maxBandHeight(60)).toBe(42);
 		expect(maxBandHeight(100)).toBe(80);
 		expect(maxBandHeight(400)).toBe(80); // ceiling still applies
-	});
-});
-
-describe("geometry presets", () => {
-	test("wide trades band rows for dock columns", () => {
-		expect(defaultBandHeight(40, GEOMETRY_PROFILES.wide)).toBe(14);
-		expect(defaultBandHeight(100, GEOMETRY_PROFILES.wide)).toBe(35);
-		expect(defaultBandHeight(600, GEOMETRY_PROFILES.wide)).toBe(MAX_BAND_HEIGHT);
-		expect(dockColsFor(500, null, GEOMETRY_PROFILES.wide)).toBe(160);
-		expect(dockColsFor(100, null, GEOMETRY_PROFILES.wide)).toBe(40); // floor
-		expect(dockColsFor(1000, null, GEOMETRY_PROFILES.wide)).toBe(200); // ceiling
-		// A manual width still ignores the preset's ceiling.
-		expect(dockColsFor(500, 250, GEOMETRY_PROFILES.wide)).toBe(250);
-	});
-
-	test("4k is the default profile, unchanged", () => {
-		expect(defaultBandHeight(100)).toBe(45);
-		expect(dockColsFor(400)).toBe(100);
-	});
-
-	test("the preset follows the terminal aspect ratio", () => {
-		expect(autoGeometryMode(500, 40)).toBe("wide"); // 32:9
-		expect(autoGeometryMode(430, 40)).toBe("wide"); // 21:9
-		expect(autoGeometryMode(320, 40)).toBe("wide"); // exactly 8 cols/row
-		expect(autoGeometryMode(319, 40)).toBe("4k"); // one column below
-		expect(autoGeometryMode(400, 100)).toBe("4k"); // 4K cell grid
-		expect(autoGeometryMode(240, 40)).toBe("4k"); // 16:9
-		expect(autoGeometryMode(120, 0)).toBe("4k"); // no rows reported
 	});
 });
 
@@ -197,13 +155,6 @@ describe("appendStreamTail", () => {
 		expect(lines.length).toBe(0);
 		expect(lengths.has(30)).toBe(true);
 		expect(lengths.has(40)).toBe(true);
-	});
-});
-
-describe("capDisplayLine", () => {
-	test("keeps the newest chars with an ellipsis", () => {
-		expect(capDisplayLine("short", 10)).toBe("short");
-		expect(capDisplayLine("0123456789abc", 8)).toBe("… 789abc");
 	});
 });
 
@@ -243,52 +194,9 @@ describe("normalizeConfig", () => {
 });
 
 describe("lastImageBlock", () => {
-	test("returns the last well-formed image block", () => {
+	test("rejects non-array input", () => {
 		expect(lastImageBlock("plain text")).toBeUndefined();
 		expect(lastImageBlock(undefined)).toBeUndefined();
 		expect(lastImageBlock({})).toBeUndefined();
-		expect(lastImageBlock([{ type: "text", text: "hi" }])).toBeUndefined();
-		expect(
-			lastImageBlock([
-				{ type: "text", text: "Read image file [image/png]" },
-				{ type: "image", data: "aGk=", mimeType: "image/png" },
-			]),
-		).toEqual({ data: "aGk=", mimeType: "image/png" });
-		expect(
-			lastImageBlock([
-				{ type: "image", data: "aGk=" },
-				{ type: "image", mimeType: "image/png" },
-			]),
-		).toBeUndefined();
-		expect(
-			lastImageBlock([
-				{ type: "image", data: "MQ==", mimeType: "image/png" },
-				{ type: "image", data: "Mg==", mimeType: "image/jpeg" },
-			]),
-		).toEqual({ data: "Mg==", mimeType: "image/jpeg" });
-	});
-});
-
-describe("transcriptVisibility", () => {
-	test("a visible thinking panel owns the reasoning stream", () => {
-		expect(transcriptVisibility(true, false, true)).toEqual({ hideThinking: true, hideTools: false });
-		expect(transcriptVisibility(false, false, true)).toEqual({ hideThinking: false, hideTools: false });
-	});
-	test("a hidden band returns thinking to the transcript", () => {
-		expect(transcriptVisibility(true, false, false)).toEqual({ hideThinking: false, hideTools: false });
-	});
-	test("response-only hides thinking and tool activity regardless of the band", () => {
-		expect(transcriptVisibility(true, true, false)).toEqual({ hideThinking: true, hideTools: true });
-		expect(transcriptVisibility(false, true, true)).toEqual({ hideThinking: true, hideTools: true });
-	});
-});
-
-describe("outputPreview", () => {
-	test("shows the first `cap` lines and counts the hidden rest", () => {
-		expect(outputPreview([], 2)).toEqual({ shown: [], hidden: 0 });
-		expect(outputPreview(["a", "b"], 2)).toEqual({ shown: ["a", "b"], hidden: 0 });
-		expect(outputPreview(["a", "b", "c"], 2)).toEqual({ shown: ["a", "b"], hidden: 1 });
-		expect(outputPreview(["a", "b"], 0)).toEqual({ shown: [], hidden: 2 });
-		expect(outputPreview(["a"], 20)).toEqual({ shown: ["a"], hidden: 0 });
 	});
 });

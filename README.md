@@ -65,7 +65,7 @@ default. Start bare regardless of saved defaults with `--no-split`.
 
 | Command | Effect |
 | --- | --- |
-| `/split` | Full toggle pair: OFF = all panels off, ON = the layout saved by `/split-save` (falls back to thinking + tools when nothing was saved) |
+| `/split` | Full toggle pair: OFF = all panels off; ON = the layout saved by `/split-save`, size and geometry preset included (falls back to thinking + tools at the live size when nothing was saved) |
 | `/split-thinking` | Toggle the thinking panel within the band (on = transcript thinking hidden) |
 | `/split-tools` | Toggle the tool panel within the band |
 | `/files` | Toggle the files panel within the band |
@@ -94,14 +94,21 @@ interrupted write cannot leave truncated JSON that would load as defaults.
   that), so enable the panel at startup (`/split-save`) to keep it clean from
   the first paint.
 - **Tool Usage panel** — every tool call with status, duration (live elapsed
-  counter while running), compact or full detail, and its output preview.
+  counter while running), compact or full detail, and its output preview
+  (the newest lines, with a `+N earlier lines` count above them). Both counts
+  describe the whole result, not just the retained window. Full-mode detail is
+  budgeted to the band: the card keeps its own row and closes with
+  `+N more detail rows` instead of pushing that row off the top.
   History is rebuilt from the session branch on resume/branch switch. Image
   results (e.g. `read` on a PNG) render as a one-line text fallback in the
   band; omp's transcript still renders them inline.
 - **Files panel** — read/written/seen files newest-first, grouped by
   directory, with a live edit-diff subpanel (`/split-diff` hides the diff and
   keeps the list). File tracking comes from tool calls: `read`, `write`,
-  `edit`, `ast_edit`, plus paths mentioned on a `bash` command line. The diff
+  `edit`, `ast_edit`, plus paths mentioned on a `bash` command line. `s`
+  (seen) entries are live observations: a resume or branch switch replays only
+  the direct path tools and never re-probes a bash command line against the
+  current filesystem. The diff
   subpanel follows any tool result that reports `details.diff` plus a path —
   built-in `edit` as well as custom tools that emit the same payload. The
   stored diff is bounded to its first 400 lines (at most 64 KiB) with a
@@ -110,6 +117,16 @@ interrupted write cannot leave truncated JSON that would load as defaults.
   `display.hideToolActivity` switches as runtime overrides, so the transcript
   shows user + assistant text only. Turning it off clears the overrides and
   restores whatever the user configured.
+- **Advisor mode** — advisor notes keep their native transcript card
+  (severity tally, ctrl+o expansion). The band adds no advisor column; it
+  mirrors only a one-line count in omp's status area — `Advisor: 1 blocker ·
+  2 concerns` — for notes delivered since the last user prompt, rebuilt from
+  the session branch on resume. Advisor and subagent tool calls never reach
+  the thinking, tools, files or diff panes: those hooks accept only the
+  top-level agent, so a review's `read`/`grep` cannot contaminate the band.
+  Response-only leaves advisor cards and omp's collapsed synthetic steering
+  blocks visible — the advice is the feature, and omp's two display switches
+  only cover thinking and tool activity.
 - **Untrusted text** — escape sequences and other C0/C1 control characters in
   model or tool text are stripped at ingestion and on branch replay, so a tool
   result, thinking delta or resumed session cannot drive the terminal.
@@ -133,7 +150,9 @@ interrupted write cannot leave truncated JSON that would load as defaults.
   of the rows (45 % or 35 %, floors 20/14, ceiling 80) when no height is
   saved, and the files dock takes its share of the columns (25 % clamped to
   34–120, or 32 % clamped to 40–200). A `/split-height` or a saved `bandHeight`
-  always wins over the preset's own curve, and a saved `filesWidth` overrides
+  always wins over the preset's own curve; `/split-save` records a height only
+  when `/split-height` pinned one, so an auto height follows each session's
+  terminal instead of freezing today's number. A saved `filesWidth` overrides
   the dock share. `/split-height` clamps to leave 18 rows for the transcript
   and editor, the band hides itself entirely on terminals too short for it,
   the files column drops out below 90 columns (a files-only layout keeps its
@@ -257,7 +276,7 @@ Bun instruments TypeScript directly (no istanbul/nyc/`--experimental` flags)
 and writes an lcov report; `scripts/check-coverage.ts` parses it and fails the
 command below `lines = 99%` / `functions = 90%` (override with
 `COVERAGE_LINES` / `COVERAGE_FUNCTIONS`). Test fixtures are excluded from the
-totals. Current: 99.92% lines / 97.20% functions — the only uncovered line is
+totals. Current: 99.93% lines / 97.55% functions — the only uncovered line is
 the `themeGetter` default that throws before `session_start` binds a theme; the
 uncovered functions are no-op extension exports.
 
@@ -273,17 +292,19 @@ are ESLint plugins and rules:
 | `radon raw` / size | `max-lines-per-function`, `max-depth`, `max-params` | `bun run lint` |
 | `radon mi` / Halstead | no maintained TS implementation; treated as out of scope | — |
 
-The baseline is 0 errors and 2 warnings, both parked by design
-(`syncTranscriptVisibility` cc 15, `normalizeConfig` cc 14): they sit one step
-over the cyclomatic limit and are only touched when another change touches
-them. The Q1–Q7 structural batch cleared the previous hotspots
+The baseline is 0 errors and 0 warnings: C1 extracted
+`pendingVisibilityPolicy` from `syncTranscriptVisibility` and the field
+readers from `normalizeConfig`, taking both under the cyclomatic limit. The
+Q1–Q7 structural batch cleared the previous hotspots
 (`filesPanelLines`, `toolLines`, `reconstruct`, `renderBand`, `pathsFrom`,
 `splitView`, and the `newestRows`/`renderPanel` parameter counts). Tests are
 exempt from the size/complexity rules. Tests assert behaviour, not lint
 cleanliness.
 
 Tests drive the extension through its registered handlers, commands, and the
-widget factory omp calls, asserting panel content and exact row widths. The
+widget the host mounts once (the harness caches the factory result, like omp,
+so mount-only derivations are not re-run on every render), asserting panel
+content and exact row widths. The
 config path is redirected to a temp directory by `test/setup.ts` (bun
 preload), so tests never touch the real agent directory.
 
