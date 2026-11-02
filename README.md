@@ -68,11 +68,11 @@ default. Start bare regardless of saved defaults with `--no-split`.
 | `/split` | Full toggle pair: OFF = all panels off; ON = the layout saved by `/split-save`, size and geometry preset included (falls back to thinking + tools at the live size when nothing was saved) |
 | `/split-thinking` | Toggle the thinking panel within the band (on = transcript thinking hidden) |
 | `/split-tools` | Toggle the tool panel within the band |
-| `/files` | Toggle the files panel within the band |
+| `/split-files` | Toggle the files panel within the band |
 | `/split-tools-view` | Compact ↔ full tool detail (full shows output previews) |
 | `/split-tools-width <pct>` | Tools panel width as % of the band (20–60, default 35) |
 | `/split-height <n>` | Band height in rows (6–80; clamped to leave 18 rows for the transcript, default the geometry preset's share of the terminal height) |
-| `/split-geometry [auto\|4k\|wide]` | Geometry preset: `4k` = taller band, narrower dock; `wide` = shorter band, wider dock; no argument flips to the other preset; `auto` (default) derives it from the terminal aspect ratio |
+| `/split-geometry [auto\|4k\|wide]` | Geometry preset: `4k` = taller band, narrower dock, thinking → tools → files; `wide` = shorter band, wider dock, files on the left of thinking and tools; no argument flips to the other preset; `auto` (default) derives it from the terminal aspect ratio |
 | `/split-diff` | Toggle the files panel's edit-diff subpanel |
 | `/split-trim-response [on\|off]` | Full transcript ↔ response-only |
 | `/split-save` | Persist the current layout as startup defaults for new windows |
@@ -86,13 +86,14 @@ interrupted write cannot leave truncated JSON that would load as defaults.
 ## Features
 
 - **Thinking panel** — live reasoning stream, coalesced flushes (≤20/s),
-  newest-window view. While the panel is visible, thinking blocks are hidden
-  from the transcript (omp's `hideThinkingBlock` switch), so reasoning is
-  never shown twice. Removing the panel — or a terminal too short for the band
-  — restores them. Only live/future transcript output is affected: rows
-  already committed to scrollback are not rewritten (omp exposes no hook for
-  that), so enable the panel at startup (`/split-save`) to keep it clean from
-  the first paint.
+  newest-window view. While the panel is visible, the transcript shows no
+  reasoning at all: finished blocks are hidden through omp's
+  `hideThinkingBlock` switch, and the panel also suppresses the live
+  `Thinking…` head the transcript would otherwise stream. Removing the panel
+  — or a terminal too short for the band — restores both. Only live/future
+  transcript output is affected: rows already committed to scrollback are not
+  rewritten (omp exposes no hook for that), so enable the panel at startup
+  (`/split-save`) to keep it clean from the first paint.
 - **Tool Usage panel** — every tool call with status, duration (live elapsed
   counter while running), compact or full detail, and its output preview
   (the newest lines, with a `+N earlier lines` count above them). The
@@ -118,12 +119,21 @@ interrupted write cannot leave truncated JSON that would load as defaults.
   `display.hideToolActivity` switches as runtime overrides, so the transcript
   shows user + assistant text only. Turning it off clears the overrides and
   restores whatever the user configured.
-- **Advisor mode** — advisor notes keep their native transcript card
-  (severity tally, ctrl+o expansion). The band adds no advisor column; it
-  mirrors only a one-line count in omp's status area — `Advisor: 1 blocker ·
-  2 concerns` — for notes delivered since the last user prompt, rebuilt from
-  the session branch on resume. Advisor and subagent tool calls never reach
-  the thinking, tools, files or diff panes: those hooks accept only the
+- **Advisor panel** — the panel appears on its own while advisor mode is on
+  (`/advisor on`, session-local) and disappears with it; nothing is written to
+  `advisor.enabled`. Advisor mode emits no extension event, so the band polls
+  the live session's `isAdvisorEnabled()` (400 ms, one boolean) and falls back
+  to the `advisor.enabled` setting when no live session matches. The title
+  carries the running tally — `Advisor · 1 blocker · 2 concerns` — and the body
+  shows the newest notes of the current turn. Notes and tally reset on a real
+  user prompt and rebuild from the session branch on resume. When the thinking
+  panel is on, the advisor stacks above it inside that column; otherwise it is
+  a full-width strip above whatever columns remain. With no other panel on, it
+  takes the whole band. `--no-split` still starts bare, and `/split` off hides
+  the band even when the advisor is its only panel; a new advisor activation
+  re-opens it. The native transcript card is untouched: the panel is a window
+  on the newest notes, not a replacement. Advisor and subagent tool calls never
+  reach the thinking, tools, files or diff panes: those hooks accept only the
   top-level agent, so a review's `read`/`grep` cannot contaminate the band.
   Response-only leaves advisor cards and omp's collapsed synthetic steering
   blocks visible — the advice is the feature, and omp's two display switches
@@ -134,18 +144,25 @@ interrupted write cannot leave truncated JSON that would load as defaults.
 - **Geometry** — scales with the window instead of clamping at laptop sizes,
   and picks a preset from the terminal shape: `4k` (the taller, narrower
   curve) unless the pane is at least 8 columns per row, i.e. 21:9 or wider,
-  where `wide` trades band rows for dock columns. `/split-geometry` pins
+  where `wide` trades band rows for dock columns and also moves the files
+  panel to the left of the thinking and tool boxes (the files panel is the
+  main panel of that layout; omp 18.x only places widgets full-width, so the
+  transcript itself cannot be narrowed beside them). `/split-geometry` pins
   either preset and `auto` gives the choice back to the aspect ratio. Each
   tool's output preview grows from 2 to 6 lines as the band gets taller.
 
-  | terminal | preset | band rows | thinking │ tools │ files |
+  | terminal | preset | band rows | files │ thinking │ tools |
   | --- | --- | --- | --- |
-  | 120×45 | `4k` | 20 | 56 │ 30 │ 34 |
-  | 240×40 (16:9 1440p) | `4k` | 20 | 117 │ 63 │ 60 |
-  | 400×100 (4K) | `4k` | 45 | 195 │ 105 │ 100 |
-  | 400×100 (4K) | `wide` | 35 | 177 │ 95 │ 128 |
-  | 500×40 (32:9) | `4k` | 20 | 247 │ 133 │ 120 |
-  | 500×40 (32:9) | `wide` | 14 | 221 │ 119 │ 160 |
+  | 120×45 | `4k` | 20 | 34 │ 56 │ 30 |
+  | 240×40 (16:9 1440p) | `4k` | 20 | 60 │ 117 │ 63 |
+  | 400×100 (4K) | `4k` | 45 | 100 │ 195 │ 105 |
+  | 400×100 (4K) | `wide` | 35 | 128 │ 177 │ 95 |
+  | 500×40 (32:9) | `4k` | 20 | 120 │ 247 │ 133 |
+  | 500×40 (32:9) | `wide` | 14 | 160 │ 221 │ 119 |
+
+  The table lists panel widths; `4k` renders thinking │ tools │ files, while
+  `wide` renders files │ thinking │ tools (the main files panel on the left,
+  the two live boxes on the right).
 
   Both curves derive from the same shape: the band takes the preset's share
   of the rows (45 % or 35 %, floors 20/14, ceiling 80) when no height is
@@ -173,7 +190,7 @@ root does not exist here, so:
 | Files right dock spanning the transcript | Files band column (omp composites overlays over the whole viewport, so a floating dock would cover the band and editor) |
 | Response-only built from pi's message components and a private ScrollView | omp's own hide-thinking / hide-tool-activity settings |
 | Thinking shown in both the panel and the transcript | A visible thinking panel hides transcript thinking (restored when the panel or band is gone) |
-| Mouse: drag band height, drag the tools split, drag the dock width, header `[↗]`/`[×]` buttons, wheel scrolling | Not wired — omp widgets receive no pointer events; use `/split-height`, `/split-tools-width`, `/files` |
+| Mouse: drag band height, drag the tools split, drag the dock width, header `[↗]`/`[×]` buttons, wheel scrolling | Not wired — omp widgets receive no pointer events; use `/split-height`, `/split-tools-width`, `/split-files` |
 | Answer divider between successive answers (`/split-divider`) | Not applicable — omp's transcript owns spacing |
 | Subagent tool calls shown in the tool panel | Not wired — omp exposes no subagent tool-call event bus channel |
 | Zoom a panel over the whole area above the editor | Not applicable — the band is editor chrome; `/split-height` grows it |
@@ -186,13 +203,24 @@ bun test          # helpers + component/integration + fast-check property tests
 bun run demo      # print real band frames (no TUI required)
 bun run typecheck # tsc --noEmit against @oh-my-pi/pi-tui / pi-coding-agent
 bun run check:package # verify the published tarball is self-contained
+omp --no-extensions -e ./split-view.ts --mode rpc < /dev/null  # must print no "Failed to load extension"
 ```
+
+The last line is the host-load check: `bun test` resolves `@oh-my-pi/*`
+imports the way Bun does, but omp's extension loader only answers those
+specifiers for the extension's own files. An import that reaches a host module
+which in turn imports a bare `@oh-my-pi/pi-*` from inside `node_modules` loads
+in tests and fails in omp (`Cannot find package '@oh-my-pi/pi-tui' imported
+from …/pi-coding-agent/src/…`), so run it after touching the import list. It
+needs a local `omp`; CI cannot run it.
 
 `bun run demo` (`scripts/demo.ts`) drives the extension with a fake host and
 prints the exact rows omp would receive from `render(width)`: the three-column
 layout with a live edit diff, a custom tool's diff reaching the files pane, a
 files-only layout on a too-narrow terminal, directory grouping/badges/
-truncation, and the retained-state bounds. The band is editor chrome inside
+truncation, both geometry presets rendered on the same pane, the auto preset
+the aspect ratio picks (band rows and panel order), and the retained-state
+bounds. The band is editor chrome inside
 omp's own frame, so there is no screenshot path; this is the reviewable
 equivalent.
 

@@ -270,7 +270,7 @@ exactly `bandHeight` rows, every row exactly `width` cells, hint plus
 
 - Where: `renderBand`, `split-view.ts:656-683` (`filesWidthCols` gate).
 - Problem: with only the files panel on, widths 80 and 89 render 0 rows and no
-  hint. `/files` warns on toggle, but a saved layout on a narrow terminal just
+  hint. `/split-files` warns on toggle, but a saved layout on a narrow terminal just
   shows nothing.
 - Change: when `filesOn` is the only enabled panel and `width < MIN_TERM_WIDTH`,
   render a framed panel with a hint row such as `Files panel needs ≥90 cols`
@@ -430,7 +430,7 @@ assertions use the harness `setTheme` hook. `test/setup.ts` redirects
   its usage message (geometry property), `/split-tools-width` empty and
   non-numeric rejections (the split must not move), its 20–60 clamp asserted
   through the composed columns (`[0,66,86]` at 20% and `[0,34,86]` at 60%),
-  `/split-height` rejecting a non-numeric argument, `/files` warning on a
+  `/split-height` rejecting a non-numeric argument, `/split-files` warning on a
   terminal too narrow to dock it, and both `/split-tools-view` states (the
   full-mode assertions in `complex renderers` and the saved-mode read-back).
 - [x] **T7 — Tool panel extras.** Done in the `complex renderers` suite: an
@@ -453,7 +453,7 @@ from `/tmp`), then delete the file — they are not part of the deliverable.
 Geometry sweep skeleton (`probe.tmp.ts`): import `splitView` from
 `./split-view.ts` and `visibleWidth` from `@oh-my-pi/pi-tui`; build the same
 fake `api`/`ctx`/`tui` as the test harness (flat theme must include `inverse`,
-`renderDiff` needs it); drive `session_start`, `/split`, `/files`, one
+`renderDiff` needs it); drive `session_start`, `/split`, `/split-files`, one
 `tool_call`, one `tool_result` diff, one thinking stream; then loop widths
 `40..300` (the tested range; the old probe started at 80) × heights `6..40`, calling
 `/split-height` and asserting `lines.length === height` and

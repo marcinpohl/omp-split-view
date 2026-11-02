@@ -5,13 +5,48 @@
  */
 
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui";
+import { truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui/utils";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
+import type { NativeChild, NativeNode } from "@oh-my-pi/pi-tui/native/node";
 
 /** A non-null object; host payloads arrive untyped and every reader narrows
  * before touching a field. */
 export function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
+}
+
+/** Native role omp gives the live hidden-thinking head. */
+export const LIVE_THINKING_ROLE = "omp.thinking.live";
+
+function isNativeNode(child: NativeChild): child is NativeNode {
+	return typeof child === "object" && child !== null && "k" in child;
+}
+
+function nativeRole(node: NativeNode): string | undefined {
+	const props = node.p;
+	if (!props || typeof props !== "object" || !("role" in props)) return undefined;
+	return typeof props.role === "string" ? props.role : undefined;
+}
+
+/** Remove the live hidden-thinking section from an assistant root node. It is
+ * a direct child of the root `col`; finished thinking is already skipped by
+ * the host. Returns the input node when nothing was removed, so the host's
+ * cached native tree stays reusable. */
+export function withoutLiveThinking(node: NativeNode): NativeNode {
+	const children = node.c;
+	if (!children?.length) return node;
+	let changed = false;
+	const kept: NativeChild[] = [];
+	for (const child of children) {
+		if (isNativeNode(child) && nativeRole(child) === LIVE_THINKING_ROLE) {
+			changed = true;
+			continue;
+		}
+		kept.push(child);
+	}
+	if (!changed) return node;
+	// The root union member is preserved; only `c` differs, which the spread copies.
+	return { ...node, c: kept };
 }
 
 /** True if c is a UTF-16 high (lead) surrogate. */

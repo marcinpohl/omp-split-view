@@ -4,10 +4,17 @@ import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "nod
 import { homedir } from "node:os";
 import { basename, dirname } from "node:path";
 import { visibleWidth } from "@oh-my-pi/pi-tui";
+import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
 import { Settings, settings, type ExtensionAPI, type ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import "@oh-my-pi/pi-coding-agent/session/settings";
 import "@oh-my-pi/pi-coding-agent/modes/settings";
 import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
+// Registers `advisor.enabled` in this process, so the panel's setting fallback
+// can be exercised. The extension itself reads the id through the registry and
+// must not import this module (see the note in split-view.ts).
+import "@oh-my-pi/pi-coding-agent/advisor/settings";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import splitView, {
 	panelRenderCounts,
 	retainedEditDiff,
@@ -68,8 +75,9 @@ interface Harness {
 	setBranch: (branch: unknown[]) => void;
 	/** The widget instance the host holds, for Component-contract calls. */
 	component: () => BandComponent | undefined;
-	/** Text of an extension status entry (`ctx.ui.setStatus`). */
-	status: (key: string) => string | undefined;
+	/** Session id the advisor probe matches against the live registry ref. */
+	getSessionId: () => string;
+	setSessionId: (id: string) => void;
 	notifications: { message: string; level: string }[];
 	widgets: Map<string, WidgetFactory | undefined>;
 	setSize: (columns: number, rows: number) => void;
@@ -92,8 +100,8 @@ function createHarness(columns = 120, rows = 45): Harness {
 	const components = new Map<string, BandComponent>();
 
 	const notifications: { message: string; level: string }[] = [];
-	const statuses = new Map<string, string>();
 	let branch: unknown[] = [];
+	let sessionId = "test-session";
 
 	const tui = {
 		terminal: { columns, rows },
@@ -106,17 +114,13 @@ function createHarness(columns = 120, rows = 45): Harness {
 		mode: "tui",
 		cwd: "/tmp",
 		agent: MAIN_AGENT,
-		sessionManager: { getBranch: () => branch },
+		sessionManager: { getBranch: () => branch, getSessionId: () => sessionId },
 		ui: {
 			get theme() {
 				return currentTheme;
 			},
 			notify: (message: string, level: string) => {
 				notifications.push({ message, level });
-			},
-			setStatus: (key: string, text: string | undefined) => {
-				if (text === undefined) statuses.delete(key);
-				else statuses.set(key, text);
 			},
 			setWidget: (key: string, content: WidgetFactory | undefined) => {
 				widgets.set(key, content);
@@ -172,7 +176,10 @@ function createHarness(columns = 120, rows = 45): Harness {
 			branch = next;
 		},
 		component: () => components.get("split-view"),
-		status: key => statuses.get(key),
+		getSessionId: () => sessionId,
+		setSessionId: id => {
+			sessionId = id;
+		},
 		notifications,
 		widgets,
 		setSize: (nextColumns, nextRows) => {
@@ -213,6 +220,40 @@ function effective(id: string): unknown {
 const tick = () => new Promise(resolve => setTimeout(resolve, 10));
 
 const h = createHarness();
+
+/**
+ * A live registry ref for the harness session: the extension reads advisor mode
+ * from `AgentRegistry.global()`, so a test only flips `enabled` to model
+ * `/advisor on|off` (which emits no extension event). `release` puts the empty
+ * registry the other suites expect back, so the 400 ms poll cannot leak the
+ * panel into them.
+ */
+function advisorRef(enabled = true): { setEnabled: (value: boolean) => void; release: () => void } {
+	let isEnabled = enabled;
+	AgentRegistry.resetGlobalForTests();
+	// The fake carries only what the probe reads: the ref's session id and the
+	// session-local advisor switch.
+	const fake = {
+		sessionId: h.getSessionId(),
+		isAdvisorEnabled: () => isEnabled,
+	} as unknown as AgentSession;
+	AgentRegistry.global().register({
+		id: MAIN_AGENT.id,
+		displayName: MAIN_AGENT.name,
+		kind: "main",
+		session: fake,
+		sessionFile: null,
+	});
+	return {
+		setEnabled: value => {
+			isEnabled = value;
+		},
+		release: () => {
+			isEnabled = false;
+			AgentRegistry.resetGlobalForTests();
+		},
+	};
+}
 
 const writeConfig = (cfg: unknown) => writeFileSync(CONFIG_FILE, JSON.stringify(cfg));
 /** Full layout used by the geometry suites; every panel on, diff on. */
@@ -319,7 +360,7 @@ describe("band widget", () => {
 
 describe("files panel", () => {
 	test("adds a files column beside thinking | tools", async () => {
-		await h.command("files");
+		await h.command("split-files");
 		const lines = h.widget()!.render(120);
 		assertExactWidth(lines, 120);
 		const joined = lines.join("\n");
@@ -399,7 +440,7 @@ describe("files panel", () => {
 		expect(joined).not.toContain("📂 Files");
 		assertExactWidth(h.widget()!.render(80), 80);
 		h.setSize(120, 45);
-		await h.command("files");
+		await h.command("split-files");
 	});
 });
 
@@ -409,7 +450,7 @@ describe("band properties", () => {
 		await h.command("split-height", "20");
 		await ensurePanel("Thinking", "split-thinking");
 		await ensurePanel("Tool Usage", "split-tools");
-		await ensurePanel("📂 Files", "files");
+		await ensurePanel("📂 Files", "split-files");
 		const joined = h.widget()!.render(120).join("\n");
 		expect(joined).toContain("Thinking");
 		expect(joined).toContain("Tool Usage");
@@ -591,7 +632,7 @@ describe("band properties", () => {
 			command: fc.constantFrom(
 				"split-thinking",
 				"split-tools",
-				"files",
+				"split-files",
 				"split-diff",
 				"split-tools-view",
 				"split-trim-response",
@@ -654,7 +695,7 @@ describe("band properties", () => {
 				}
 				await ensurePanel("Thinking", "split-thinking");
 				await ensurePanel("Tool Usage", "split-tools");
-				await ensurePanel("📂 Files", "files");
+				await ensurePanel("📂 Files", "split-files");
 				await h.command("split-height", "20");
 			}),
 			{ numRuns: 20, seed: 20261101 },
@@ -666,7 +707,7 @@ describe("band properties", () => {
 		await h.command("split-height", "20");
 		await ensurePanel("Thinking", "split-thinking");
 		await ensurePanel("Tool Usage", "split-tools");
-		await ensurePanel("📂 Files", "files");
+		await ensurePanel("📂 Files", "split-files");
 		expect(h.widget()).toBeDefined();
 	});
 });
@@ -691,7 +732,7 @@ describe("complex renderers", () => {
 		await h.command("split-height", "20");
 		await setToggle("split-thinking", /Thinking on/);
 		await setToggle("split-tools", /Tools on/);
-		await setToggle("files", /Files panel on/);
+		await setToggle("split-files", /Files panel on/);
 		await setDiff(true);
 		await setToolMode(false);
 		// The band must be mounted and complete before any test reads rows.
@@ -1494,7 +1535,7 @@ describe("large terminals (4K / ultrawide)", () => {
 		h.setSize(120, 45);
 		await h.emit("session_start"); // no config -> bare, 20-row default
 		await h.command("split");
-		await setToggle("files", /Files panel on/);
+		await setToggle("split-files", /Files panel on/);
 		await h.command("split-height", "20");
 	});
 
@@ -1619,12 +1660,12 @@ describe("geometry presets", () => {
 		h.setSize(500, 60); // 8.3 cols/row -> wide
 		await h.emit("session_start");
 		const wide = h.widget()!.render(500);
-		expect(500 - columnStarts(wide[0])[2]).toBe(160);
+		expect(columnStarts(wide[0])).toEqual([0, 160, 381]);
 		h.setSize(500, 90); // 5.6 cols/row -> 4k, same pinned height
 		await h.emit("session_start");
 		const fourK = h.widget()!.render(500);
 		expect(fourK.length).toBe(30); // the pinned height still wins
-		expect(500 - columnStarts(fourK[0])[2]).toBe(120);
+		expect(columnStarts(fourK[0])).toEqual([0, 247, 380]);
 	});
 
 	test("a remount after a resize drops the band memo of the old preset", async () => {
@@ -1634,13 +1675,46 @@ describe("geometry presets", () => {
 		h.setSize(500, 60); // 8.3 cols/row -> wide
 		await h.emit("session_start");
 		const wide = h.widget()!.render(500);
-		expect(500 - columnStarts(wide[0])[2]).toBe(160);
+		expect(columnStarts(wide[0])).toEqual([0, 160, 381]);
 		await h.command("split"); // all panels off: the widget unmounts
 		h.setSize(500, 90); // 5.6 cols/row -> 4k, same 30-row band
 		await h.command("split"); // back on: a fresh mount at the new shape
 		const fourK = h.widget()!.render(500);
 		expect(fourK.length).toBe(30);
-		expect(500 - columnStarts(fourK[0])[2]).toBe(120);
+		expect(columnStarts(fourK[0])).toEqual([0, 247, 380]);
+	});
+
+	test("wide renders files | thinking | tools and 4k keeps thinking | tools | files", async () => {
+		writeConfig(fullLayout);
+		h.setSize(500, 40); // auto -> wide
+		await h.emit("session_start");
+		const wide = h.widget()!.render(500);
+		expect(wide.length).toBe(14);
+		assertExactWidth(wide, 500);
+		expect(columnStarts(wide[0])).toEqual([0, 160, 381]);
+		// thinking/tools title their top border; the files panel titles its
+		// second row, so each title is located in the row it occupies.
+		const wideFilesAt = wide[1].indexOf("📂 Files");
+		expect(wideFilesAt).toBeGreaterThanOrEqual(0);
+		expect(wideFilesAt).toBeLessThan(160);
+		expect(wide[0].indexOf("Thinking")).toBeGreaterThanOrEqual(160);
+		expect(wide[0].indexOf("Thinking")).toBeLessThan(381);
+		expect(wide[0].indexOf("Tool Usage")).toBeGreaterThanOrEqual(381);
+
+		await h.command("split-thinking"); // off: files | tools
+		expect(columnStarts(h.widget()!.render(500)[0])).toEqual([0, 160]);
+		await h.command("split-thinking"); // on
+		await h.command("split-tools"); // off: files | thinking
+		expect(columnStarts(h.widget()!.render(500)[0])).toEqual([0, 160]);
+		await h.command("split-tools"); // on
+
+		await h.command("split-geometry", "4k");
+		const fourK = h.widget()!.render(500);
+		expect(columnStarts(fourK[0])).toEqual([0, 247, 380]);
+		expect(fourK[0].indexOf("Thinking")).toBeLessThan(247);
+		expect(fourK[0].indexOf("Tool Usage")).toBeGreaterThanOrEqual(247);
+		expect(fourK[0].indexOf("Tool Usage")).toBeLessThan(380);
+		expect(fourK[1].indexOf("📂 Files")).toBeGreaterThanOrEqual(380);
 	});
 });
 
@@ -1697,7 +1771,10 @@ describe("geometry preset properties", () => {
 					const dock = expectedDock(cols, profile);
 					const remaining = cols - dock;
 					const tools = bandToolsColsFor(remaining, 35);
-					expect(columnStarts(lines[0])).toEqual([0, remaining - tools, cols - dock]);
+					const starts = columnStarts(lines[0]);
+					expect(starts).toEqual(
+						preset === "wide" ? [0, dock, cols - tools] : [0, remaining - tools, cols - dock],
+					);
 				},
 			),
 			{ numRuns: 40, seed: 20261101 },
@@ -1726,7 +1803,8 @@ describe("geometry preset properties", () => {
 					if (!fits) return;
 					assertExactWidth(lines, 120);
 					const dock = Number(/dock (\d+) cols/.exec(message)?.[1]);
-					expect(dock).toBe(120 - columnStarts(lines[0])[2]);
+					const starts = columnStarts(lines[0]);
+					expect(dock).toBe(preset === "wide" ? starts[1] : 120 - starts[2]);
 				},
 			),
 			{ numRuns: 40, seed: 20261101 },
@@ -1750,9 +1828,10 @@ describe("geometry preset properties", () => {
 					const wide = h.widget()!.render(cols);
 					expect(fourK.length).toBe(MAX_BAND_HEIGHT);
 					expect(wide.length).toBe(MAX_BAND_HEIGHT);
-					// Both presets are at their dock ceilings here (120 vs 200).
+					// Both presets are at their dock ceilings here (120 vs 200);
+					// the same dock sits at opposite ends of the row.
 					expect(cols - columnStarts(fourK[0])[2]).toBe(120);
-					expect(cols - columnStarts(wide[0])[2]).toBe(200);
+					expect(columnStarts(wide[0])[1]).toBe(200);
 				},
 			),
 			{ numRuns: 20, seed: 20261101 },
@@ -1814,7 +1893,9 @@ describe("geometry preset properties", () => {
 					const lines = h.widget()!.render(cols);
 					const preset = setting === "auto" ? autoGeometryMode(cols, rows) : setting;
 					assertExactWidth(lines, cols);
-					expect(cols - columnStarts(lines[0])[2]).toBe(expectedDock(cols, GEOMETRY_PROFILES[preset]));
+					const starts = columnStarts(lines[0]);
+					const dock = expectedDock(cols, GEOMETRY_PROFILES[preset]);
+					expect(preset === "wide" ? starts[1] : cols - starts[2]).toBe(dock);
 				},
 			),
 			{ numRuns: 24, seed: 20261101 },
@@ -1835,7 +1916,7 @@ describe("command arguments and saved layout", () => {
 		await h.command("split-tools-width", "35");
 		await setToggle("split-thinking", /Thinking on/);
 		await setToggle("split-tools", /Tools on/);
-		await setToggle("files", /Files panel on/);
+		await setToggle("split-files", /Files panel on/);
 		await setToggle("split-tools-view", /compact/);
 		await setToggle("split-diff", /\bon$/);
 	};
@@ -1885,18 +1966,18 @@ describe("command arguments and saved layout", () => {
 		expect(h.widget()!.render(120).length).toBe(before);
 	});
 
-	test("/files warns when the panel cannot dock below 90 columns", async () => {
+	test("/split-files warns when the panel cannot dock below 90 columns", async () => {
 		h.setSize(80, 45);
 		h.notifications.length = 0;
-		await h.command("files"); // off
-		await h.command("files"); // on at 80 cols
+		await h.command("split-files"); // off
+		await h.command("split-files"); // on at 80 cols
 		expect(h.notifications.at(-1)).toMatchObject({
 			level: "warning",
 			message: expect.stringContaining("hidden below 90 cols"),
 		});
 		h.setSize(120, 45);
-		await h.command("files"); // leave it off for the reload test's expectations
-		await h.command("files");
+		await h.command("split-files"); // leave it off for the reload test's expectations
+		await h.command("split-files");
 	});
 
 	test("session_start applies the layout saved on disk", async () => {
@@ -2097,7 +2178,7 @@ describe("persistence and lifecycle", () => {
 		resetConfig();
 		await ensurePanel("Thinking", "split-thinking");
 		await ensurePanel("Tool Usage", "split-tools");
-		await ensurePanel("📂 Files", "files");
+		await ensurePanel("📂 Files", "split-files");
 		// Other suites leave diff/toolMode/trimResponse in either state; read the
 		// saved layout once, then normalize only those three toggles.
 		await h.command("split-save");
@@ -2204,7 +2285,7 @@ describe("persistence and lifecycle", () => {
 		await h.emit("session_start");
 		await ensurePanel("Thinking", "split-thinking");
 		await ensurePanel("Tool Usage", "split-tools");
-		await ensurePanel("📂 Files", "files");
+		await ensurePanel("📂 Files", "split-files");
 		for (const event of ["session_tree", "session_switch"]) {
 			await h.emit(event);
 			const joined = h.widget()!.render(120).join("\n");
@@ -2238,7 +2319,7 @@ describe("persistence and lifecycle", () => {
 			await h.emit("session_start");
 			await ensurePanel("Thinking", "split-thinking");
 			await ensurePanel("Tool Usage", "split-tools");
-			await ensurePanel("📂 Files", "files");
+			await ensurePanel("📂 Files", "split-files");
 			const text = () => h.widget()!.render(120).join("\n");
 			const first = text();
 			// Three real files were named only on bash lines; only the read counts.
@@ -2473,23 +2554,28 @@ describe("persistence and lifecycle", () => {
 });
 
 describe("advisor mode", () => {
-	const render = (): string => h.widget()?.render(120).join("\n") ?? "";
+	const render = (width = 120): string => h.widget()?.render(width).join("\n") ?? "";
+	/** `/advisor on` for the harness session; released so later suites stay off. */
+	let ref: { setEnabled: (value: boolean) => void; release: () => void };
 
 	beforeAll(async () => {
 		h.setSize(120, 45);
+		// The live ref is what `/advisor on|off` moves; the panel follows it.
+		ref = advisorRef();
 		// Reload so panels and the diff pane start from the branch (empty), not
 		// from whatever the preceding suites left behind.
 		h.setBranch([]);
 		await h.emit("session_start");
 		await h.command("split");
-		if (!render().includes("📂 Files (")) await h.command("files");
+		if (!render().includes("📂 Files (")) await h.command("split-files");
 		await h.command("split-height", "20");
 	});
 
 	afterAll(async () => {
+		ref.release();
 		h.setBranch([]);
 		await h.emit("session_tree");
-		if (render().includes("📂 Files (")) await h.command("files");
+		if (render().includes("📂 Files (")) await h.command("split-files");
 	});
 
 	test("main-agent activity still feeds the files and diff panes", async () => {
@@ -2507,7 +2593,7 @@ describe("advisor mode", () => {
 		expect(joined).not.toContain("advisor new");
 	});
 
-	test("hiding the band clears the tally and showing it restores it", async () => {
+	test("advisor notes stay across /split and clear on the next prompt", async () => {
 		await h.emit("message_end", {
 			message: {
 				role: "custom",
@@ -2516,13 +2602,16 @@ describe("advisor mode", () => {
 				details: { notes: [{ note: "slow path", severity: "concern" }] },
 			},
 		});
-		expect(h.status("split-view.advisor")).toBe("Advisor: 1 concern");
+		expect(render()).toContain("Advisor · 1 concern");
+		expect(render()).toContain("▲ concern: slow path");
+		// An advisor-only band is still a band: /split hides it, /split shows it.
 		await h.command("split");
 		expect(h.widget()).toBeUndefined();
-		expect(h.status("split-view.advisor")).toBeUndefined();
 		await h.command("split");
-		expect(h.status("split-view.advisor")).toBe("Advisor: 1 concern");
+		expect(render()).toContain("Advisor · 1 concern");
+		// A real prompt is the turn boundary the notes describe.
 		await h.emit("message_end", { message: { role: "user", content: "next question", timestamp: 5 } });
+		expect(render()).toContain("No advisor notes yet");
 	});
 
 	// ── properties ──
@@ -2534,7 +2623,7 @@ describe("advisor mode", () => {
 		h.setBranch([]);
 		await h.emit("session_tree");
 		if (!h.widget()) await h.command("split");
-		if (!render().includes("📂 Files")) await h.command("files");
+		if (!render().includes("📂 Files")) await h.command("split-files");
 	}
 
 	type AgentOp =
@@ -2586,7 +2675,8 @@ describe("advisor mode", () => {
 		return tally;
 	}
 
-	function formatTally(tally: Tally): string | undefined {
+	/** The panel's title row, framed exactly as the band draws it. */
+	function formatTitle(tally: Tally): string {
 		const parts: string[] = [];
 		const push = (count: number, one: string, many: string): void => {
 			if (count > 0) parts.push(`${count} ${count === 1 ? one : many}`);
@@ -2595,7 +2685,7 @@ describe("advisor mode", () => {
 		push(tally.concern, "concern", "concerns");
 		push(tally.nit, "nit", "nits");
 		push(tally.note, "note", "notes");
-		return parts.length > 0 ? `Advisor: ${parts.join(" · ")}` : undefined;
+		return parts.length > 0 ? `Advisor · ${parts.join(" · ")}` : "Advisor";
 	}
 
 	test("property: advisor tool activity cannot change the band", async () => {
@@ -2726,15 +2816,213 @@ describe("advisor mode", () => {
 					});
 					branch.push({ type: "custom_message", customType: "advisor", content: "", details });
 				}
-				const expected = formatTally(tallyOf(sequence));
-				expect(h.status("split-view.advisor")).toBe(expected);
+				// Wide enough that a long tally is never truncated in the title.
+				const panel = (): string => render(200);
+				const title = formatTitle(tallyOf(sequence));
+				expect(panel()).toContain(` ${title} `);
+				// A bare title must be exactly bare: no tally left behind it.
+				if (!title.includes(" · ")) expect(panel()).not.toContain("Advisor ·");
 				// Branch replay must reconstruct the same tally.
 				h.setBranch(branch);
 				await h.emit("session_tree");
-				expect(h.status("split-view.advisor")).toBe(expected);
+				expect(panel()).toContain(` ${title} `);
 			}),
 			{ numRuns: 30, seed: 20261101 },
 		);
+	});
+});
+
+/**
+ * Advisor mode is session-local (`/advisor on|off`) and announces itself to no
+ * extension event, so the band polls the live registry ref. These tests own
+ * that ref: it appears with the mode on, stacks above thinking, and disappears
+ * with the mode off or a `/split` off.
+ */
+describe("advisor panel", () => {
+	const render = (width = 120): readonly string[] => h.widget()?.render(width) ?? [];
+	const joined = (width = 120): string => render(width).join("\n");
+	let ref: { setEnabled: (value: boolean) => void; release: () => void };
+
+	/** The advisor card omp delivers live and records on the branch. */
+	const card = (notes: { note: string; severity?: string }[]) => ({
+		message: { role: "custom", customType: "advisor", content: "<advisory/>", details: { notes } },
+	});
+
+	/** Full layout, advisor mode on, a pinned 20-row band at 120 cols. */
+	async function startConfigured(): Promise<void> {
+		writeConfig(fullLayout);
+		ref.setEnabled(true);
+		h.setSize(120, 45);
+		await h.emit("session_start");
+		await h.command("split-height", "20");
+	}
+
+	beforeAll(async () => {
+		// Idempotent; the fallback test needs the settings singleton bound.
+		await Settings.init();
+		h.setSize(120, 45);
+		ref = advisorRef();
+	});
+
+	afterAll(async () => {
+		// Released first: the 400 ms poll must not carry the panel into the suites
+		// that follow, which assume advisor mode is off.
+		ref.release();
+		h.setBranch([]);
+		await h.emit("session_tree");
+		rmSync(CONFIG_FILE, { recursive: true, force: true });
+		h.setSize(120, 45);
+	});
+
+	test("appears with advisor mode and disappears when it is turned off", async () => {
+		writeConfig({ split: false, thinking: false, tools: false, files: false });
+		ref.setEnabled(true);
+		await h.emit("session_start");
+		expect(h.widget()).toBeDefined();
+		expect(joined()).toContain("Advisor");
+		expect(joined()).toContain("No advisor notes yet");
+		// `/advisor off` emits no event: the next sync sees it and unmounts.
+		ref.setEnabled(false);
+		await h.emit("message_end", { message: { role: "user", content: "done", timestamp: 9 } });
+		expect(h.widget()).toBeUndefined();
+	});
+
+	test("a ref for another session is not this session's advisor mode", async () => {
+		writeConfig({ split: false, thinking: false, tools: false, files: false });
+		ref.setEnabled(true);
+		// A subagent's (or a previous session's) ref must not switch the band on.
+		h.setSessionId("another-session");
+		await h.emit("session_start");
+		expect(h.widget()).toBeUndefined();
+		h.setSessionId("test-session");
+	});
+
+	test("stacks above the thinking column, and strips when thinking is off", async () => {
+		await startConfigured();
+		const stacked = render();
+		expect(stacked.length).toBe(20);
+		assertExactWidth(stacked, 120);
+		expect(stacked[0]).toContain("Advisor");
+		// One frame per column: the advisor block sits inside the thinking column.
+		expect(columnStarts(stacked[0]).length).toBe(3);
+		const thinkingRow = stacked.findIndex(line => line.startsWith("╭") && line.includes("Thinking"));
+		expect(thinkingRow).toBeGreaterThan(0);
+
+		await h.command("split-thinking");
+		const stripped = render();
+		expect(stripped.length).toBe(20);
+		assertExactWidth(stripped, 120);
+		// The strip is the whole band width, and the columns start below it.
+		expect(columnStarts(stripped[0])).toEqual([0]);
+		const toolsRow = stripped.findIndex(line => line.startsWith("╭") && line.includes("Tool Usage"));
+		expect(toolsRow).toBeGreaterThan(0);
+		expect(stripped.slice(0, toolsRow).join("\n")).toContain("Advisor");
+
+		await h.command("split-thinking");
+		expect(columnStarts(render()[0]).length).toBe(3);
+	});
+
+	test("shows the newest notes with the running tally in the title", async () => {
+		await startConfigured();
+		// Render the empty panel first: the card must rebuild it, not leave a
+		// memoised frame with the "no notes" state behind.
+		expect(joined()).toContain("No advisor notes yet");
+		await h.emit(
+			"message_end",
+			card([
+				{ note: "ship it", severity: "blocker" },
+				{ note: "check edge", severity: "concern" },
+			]),
+		);
+		const text = joined();
+		expect(text).toContain("Advisor · 1 blocker · 1 concern");
+		expect(text).toContain("■ blocker: ship it");
+		expect(text).toContain("▲ concern: check edge");
+		assertExactWidth(render(), 120);
+	});
+
+	test("the strip keeps the band height when the files column comes first", async () => {
+		// `wide` renders files | thinking | tools, so a files column that ignored
+		// the strip above it would set the composed row count, not follow it.
+		writeConfig({ ...fullLayout, geometry: "wide" });
+		ref.setEnabled(true);
+		h.setSize(256, 45);
+		await h.emit("session_start");
+		await h.command("split-height", "20");
+		await h.command("split-thinking");
+		const stripped = render(256);
+		expect(stripped.length).toBe(20);
+		assertExactWidth(stripped, 256);
+		expect(columnStarts(stripped[0])).toEqual([0]);
+		// Files is the first column of the `wide` order; its title row follows
+		// the frame row that starts the columns.
+		expect(columnStarts(stripped[5]).length).toBe(2);
+		expect(stripped[6]).toContain("📂 Files");
+		// The strip memoises on its own key: a card must rebuild its rows.
+		await h.emit("message_end", card([{ note: "strip note", severity: "nit" }]));
+		const after = render(256).join("\n");
+		expect(after).toContain("Advisor · 1 nit");
+		expect(after).toContain("· nit: strip note");
+	});
+
+	test("a real prompt is the turn boundary for notes and tally", async () => {
+		await startConfigured();
+		await h.emit("message_end", card([{ note: "ship it", severity: "blocker" }]));
+		expect(joined()).toContain("■ blocker: ship it");
+		await h.emit("message_end", { message: { role: "user", content: "next", timestamp: 7 } });
+		const text = joined();
+		expect(text).toContain(" Advisor ");
+		expect(text).not.toContain("Advisor ·");
+		expect(text).toContain("No advisor notes yet");
+	});
+
+	test("branch replay rebuilds the notes and the tally", async () => {
+		await startConfigured();
+		h.setBranch([
+			{ type: "message", message: { role: "user", content: "hello", timestamp: 1, attribution: "user" } },
+			{
+				type: "custom_message",
+				customType: "advisor",
+				content: "",
+				details: { notes: [{ note: "replayed", severity: "nit" }] },
+			},
+		]);
+		await h.emit("session_tree");
+		const text = joined();
+		expect(text).toContain("Advisor · 1 nit");
+		expect(text).toContain("· nit: replayed");
+	});
+
+	test("/split hides and restores a band whose only panel is the advisor", async () => {
+		writeConfig({ split: false, thinking: false, tools: false, files: false });
+		ref.setEnabled(true);
+		await h.emit("session_start");
+		expect(h.widget()).toBeDefined();
+		await h.command("split");
+		expect(h.widget()).toBeUndefined();
+		await h.command("split");
+		expect(h.widget()).toBeDefined();
+		expect(joined()).toContain("Advisor");
+	});
+
+	test("the advisor.enabled setting answers when no live ref matches", async () => {
+		// The last test in the suite: it drops the ref, so nothing after it may
+		// expect one.
+		const handle = lookup("advisor.enabled");
+		expect(handle).toBeDefined();
+		writeConfig({ split: false, thinking: false, tools: false, files: false });
+		AgentRegistry.resetGlobalForTests();
+		try {
+			handle!.override(settings, true);
+			await h.emit("session_start");
+			expect(h.widget()).toBeDefined();
+			expect(joined()).toContain("Advisor");
+		} finally {
+			handle!.clearOverride(settings);
+		}
+		// The setting is off again: the next sync unmounts the bare band.
+		await h.emit("message_end", { message: { role: "user", content: "off", timestamp: 11 } });
+		expect(h.widget()).toBeUndefined();
 	});
 });
 
@@ -2754,7 +3042,7 @@ describe("band memo properties", () => {
 		await h.emit("session_start");
 		await setToggle("split-thinking", /Thinking on/);
 		await setToggle("split-tools", /Tools on/);
-		await setToggle("files", /Files panel on/);
+		await setToggle("split-files", /Files panel on/);
 		await setToggle("split-tools-view", /compact/);
 		await setToggle("split-diff", /\bon$/);
 		await h.command("split-height", "40");
@@ -2879,6 +3167,8 @@ describe("band memo properties", () => {
 						thinking: before.thinking + Number(panel === "thinking"),
 						tools: before.tools + Number(panel === "tools"),
 						files: before.files + Number(panel === "files"),
+						// Advisor mode is off in this suite: its panel builds nothing.
+						advisor: before.advisor,
 					});
 				},
 			),
@@ -2978,5 +3268,53 @@ describe("band memo properties", () => {
 			}),
 			{ numRuns: 15, seed: 20261101 },
 		);
+	});
+});
+
+/**
+ * omp's native transcript draws a live `omp.thinking.live` head even with
+ * `hideThinkingBlock`; while the thinking panel owns reasoning the extension
+ * must suppress that head, and give it back when the panel is off.
+ */
+describe("thinking head", () => {
+	/** A live assistant message with hideThinkingBlock on; its native tree
+	 * carries the live head the host would draw in the transcript. */
+	const liveNode = () => {
+		const component = new AssistantMessageComponent(undefined, true);
+		component.updateContent(
+			{
+				role: "assistant",
+				content: [{ type: "thinking", thinking: "hidden reasoning" }],
+				usage: { reasoningTokens: 5, output: 5 },
+				stopReason: undefined,
+			} as never,
+			{ transient: true },
+		);
+		return component.describe({
+			cols: 80,
+			reduceMotion: false,
+			dark: true,
+			supports: () => false,
+			feature: () => false,
+		});
+	};
+
+	test("the live head is suppressed while the panel owns thinking and returns when it does not", async () => {
+		writeConfig({ split: true, thinking: true, tools: false, files: false, diff: true });
+		h.setSize(120, 45);
+		await h.emit("session_start");
+		// The panel is visible, so the host's live head must not reach the tree.
+		expect(JSON.stringify(liveNode())).not.toContain("omp.thinking.live");
+
+		await h.command("split"); // off: the transcript owns thinking again
+		expect(JSON.stringify(liveNode())).toContain("omp.thinking.live");
+	});
+
+	afterAll(async () => {
+		rmSync(CONFIG_FILE, { recursive: true, force: true });
+		h.setSize(120, 45);
+		await h.emit("session_start");
+		await h.command("split");
+		await h.command("split-height", "20");
 	});
 });

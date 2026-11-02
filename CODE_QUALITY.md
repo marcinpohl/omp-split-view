@@ -4,8 +4,9 @@ Snapshot: 2026-11-02, after the Q1–Q7 structural batch, B7 CI, the split-view
 improvement pass, the geometry preset switch (G1), advisor compatibility
 (A1), test-suite simplification (T1), code simplification (C1), W6 bash
 replay, the R1 review pass, R2 mount-once/auto-height fixes, the R3
-tool-preview window, the R4 render-budget/saved-layout batch and the H1 band
-hot-path batch (all landed).
+tool-preview window, the R4 render-budget/saved-layout batch, the H1 band
+hot-path batch, the wide files-first / live-thinking-head batch and the
+advisor panel (all landed).
 This file is the dispatcher: metrics live here, the ordered queue below is
 what to work on next, and every landed item updates the snapshot and ticks
 its row.
@@ -14,11 +15,12 @@ its row.
 
 | Command | Measures | Gate |
 | --- | --- | --- |
-| `bun test` | behaviour + property tests | 155 tests, 0 failures |
+| `bun test` | behaviour + property tests | 168 tests, 0 failures |
 | `bun run test:coverage` | line/function coverage from Bun's lcov | lines ≥ 99%, functions ≥ 90% (`scripts/check-coverage.ts`) |
 | `bun run lint` | ESLint 10 + typescript-eslint + sonarjs; also the cyclomatic/cognitive/size metrics | 0 errors, 0 warnings |
 | `bun run typecheck` | `tsc --noEmit`, strict | clean |
 | `bun run check:package` | the shipped tarball: `files` coverage and declared deps via the `omp.extensions` import graph (`scripts/check-package.ts`) | `ok` — 3 shipped modules |
+| `omp --no-extensions -e ./split-view.ts --mode rpc < /dev/null` | the real host loader, which resolves `@oh-my-pi/*` differently from Bun (see the advisor-panel row on host-load) | no `Failed to load extension` line; needs a local `omp`, so CI cannot run it |
 | geometry properties (`band properties`, `geometry preset properties`) | 40–300 cols × 6–40 rows with a pinned height, plus 90–420 cols × 24–140 rows for both presets: exact rows/cells, dock offset, no control chars | 0 failures |
 | geometry properties (`geometry profiles`) | both curves at 0–2000 rows/cols against literal shares, aspect threshold at every row count | 0 failures |
 
@@ -32,25 +34,25 @@ targets control characters.
 
 | File | Lines | Funcs | Test file | Tests |
 | --- | --- | --- | --- | --- |
-| `split-view.ts` | 99.91% | 98.54% | `test/split-view.test.ts` | 95 |
-| `helpers.ts` | 100.00% | 96.00% | `test/helpers.test.ts` | 25 |
+| `split-view.ts` | 99.92% | 98.73% | `test/split-view.test.ts` | 106 |
+| `helpers.ts` | 100.00% | 96.43% | `test/helpers.test.ts` | 27 |
 | `ui-panels-config.ts` | 100.00% | 88.89% | `test/properties.test.ts` | 35 |
-| **overall** | **99.93%** | **97.66%** | | **155** |
+| **overall** | **99.94%** | **97.95%** | | **168** |
 
-59,014 assertions, ~3.8 s wall time. Uncovered:
+59,179 assertions, ~3.9 s wall time. Uncovered:
 
-- `split-view.ts:137` — `themeGetter` default that throws if something renders
+- `split-view.ts:138` — `themeGetter` default that throws if something renders
   before `session_start` binds a theme. Deliberate, unreachable.
-- Functions: 168/172 counted (`FNF`/`FNH` in `coverage/lcov.info`, `test/**`
+- Functions: 192/196 counted (`FNF`/`FNH` in `coverage/lcov.info`, `test/**`
   excluded as the gate does). The four misses are the throwing `themeGetter`
   default, `BandHub.dispose` (no-op host hook), and the two no-op default
   exports that exist so omp's extension auto-discovery does not report a load
-  error (`helpers.ts:409`, `ui-panels-config.ts:174`). Bun 1.4's lcov omits the
+  error (`helpers.ts:444`, `ui-panels-config.ts:174`). Bun 1.4's lcov omits the
   per-function `FN`/`FNDA` records, so those identities come from reading the
   four sites; only the totals come from the report. Every helper extracted by
   Q1–Q7 plus the split-view batches (`capDiffText`, `imageLabel`,
-  `retainedEditDiff`, `framedRow`, `resultTextTail`) is reached by the existing
-  suite.
+  `retainedEditDiff`, `framedRow`, `resultTextTail`) and the advisor panel's
+  probe/store/render helpers is reached by the existing suite.
 
 Property coverage is behavioural, not line-based: helpers (truncation, caps,
 config normalization, visibility), band geometry for arbitrary terminal sizes,
@@ -128,7 +130,11 @@ introduced none: two helpers needed one extra split each while landing
 (`fileRows` → `fileEntryRow` + `fileRunRows`, `renderBand` → `panelLayout` +
 `narrowFilesNotice`, then `splitView` → `registerEvents` + `registerCommands`
 → `registerPanelToggles`/`registerGeometryCommand`/`registerBandSettings`),
-which is why the extraction count is higher than the Q rows name.
+which is why the extraction count is higher than the Q rows name. The
+advisor-panel pass hit the same two limits again and split both sites a second
+time (`renderBand` → `bandFrames` + `composeBand` + `sameParts`, and the
+`session_start` handler → `adoptSession`), which is how it lands back at
+0 warnings.
 
 Band/dock geometry now scales and switches: `GEOMETRY_PROFILES` +
 `autoGeometryMode` in `helpers.ts` pick the `4k` curve (45%-height band,
@@ -141,10 +147,10 @@ caller that does not pass one gets the pre-switch behavior.
 `notice?` and passes the padded content width to the helpers instead of a
 closure, so no fifth parameter (and no options object) was needed.
 
-File sizes: `split-view.ts` 1853 L, `helpers.ts` 411 L,
+File sizes: `split-view.ts` 2138 L, `helpers.ts` 446 L,
 `ui-panels-config.ts` 176 L, `scripts/check-coverage.ts` 90 L,
-`scripts/check-package.ts` 169 L, tests 3989 L (`split-view` 2982,
-`properties` 699, `helpers` 301, `setup` 7).
+`scripts/check-package.ts` 169 L, tests 4348 L (`split-view` 3320,
+`properties` 699, `helpers` 323, `setup` 7).
 
 CI: `.github/workflows/ci.yml` runs the five gates plus `bun install
 --frozen-lockfile` on Bun 1.4.3 for every push and pull request;
@@ -168,8 +174,44 @@ when its acceptance metric is met and the snapshot above is updated.
 | ID | Evidence | Work | Acceptance |
 | --- | --- | --- | --- |
 | Q8 | ~~`syncTranscriptVisibility` cc 15, `normalizeConfig` cc 16~~ — **done (C1)** | Extracted `pendingVisibilityPolicy` and the config field readers. | 0 warnings |
+| W10 | Live `tool_result` applies any `details.diff` with a resolvable path (`split-view.ts:1641`); replay applies it only when `msg.toolName === "edit"` (`split-view.ts:1442`). Probe: the same branch entry renders the diff live and `No edit yet` after `session_start`, so README's custom-tool claim holds for live turns only. | Make replay apply the same payload-keyed rule as the live handler (or narrow the README claim to live turns). | A custom tool's `details.diff` is visible after branch replay; live and replay share one diff rule; README matches both paths. |
+| W11 | `auto` geometry and auto height resolve only at mount and session start. Probe: mounted at 120×45 (20 band rows), a resize to 300×35 renders 0 rows — the 4k height no longer fits — while `autoGeometryMode(300,35)` is `wide` (14 rows, fits). | Re-resolve `auto` on a terminal-size change, or on render when the shape changes, without overriding a pinned height. | Resize probe: after shrinking to 300×35 the band renders the `wide` curve at 14 rows; a pinned `/split-height` is unchanged; gates green. |
 
-Nothing else is queued: W6 landed with policy (a) and the queue is empty.
+W10 and W11 are open; W6 landed with policy (a) and Q8 closed with C1.
+
+### Landed — wide files-first order, live thinking head
+
+Delta: 155 → 159 tests (97 in `split-view.test.ts`, 27 in
+`helpers.test.ts`, 35 in `properties.test.ts`: +2 thinking-head tests, +2
+`withoutLiveThinking` examples), assertions 59,014 → 59,047, coverage 99.93%
+lines / 97.73% functions (FNF 172 → 176, FNH 168 → 172: the same four
+deliberate misses), lint 0/0, typecheck clean, package gate ok (3 modules).
+`split-view.ts` 1853 → 1898 L, `helpers.ts` 411 → 446 L,
+`test/split-view.test.ts` 2982 → 3071 L, `test/helpers.test.ts` 301 → 323 L.
+
+- **`wide` puts the files panel first.** `panelLayout` orders
+  files | thinking | tools when the preset is `wide` and the dock is wide
+  enough; widths stay keyed by panel, so `allocateWidths` is unchanged. The
+  README table and `demo` label columns in that order.
+- **The live thinking head is suppressed with the panel.** `hideThinkingBlock`
+  leaves the `omp.thinking.live` section visible; `installThinkingHeadGate`
+  wraps `AssistantMessageComponent.prototype.describe` and
+  `withoutLiveThinking` drops that direct child while the extension owns
+  thinking. The gate lives on `globalThis` (`Symbol.for`) so a `/reload`
+  generation cannot stack wrappers, and `session_shutdown` clears it.
+- **The files toggle is `/split-files`.** Renamed from `/files` so all eleven
+  commands carry the prefix; README, PLAN, demo and tests updated. No saved
+  config key changes.
+- **Imports use the host's subpath modules** (`pi-tui/utils`,
+  `/terminal-capabilities`, `/chrome`, `/chat/assistant-message`,
+  `/native/node`); the installed 18.14.2 package exports `./*`, and
+  `check-package` still passes (it requires declared package names, not
+  subpaths).
+- Acceptance: the thinking-head suite covers gate filtering, node-cache reuse
+  and shutdown reset; `helpers.test.ts` covers the node filter; the full gate
+  set above is green on this tree. It landed in the same commit as the advisor
+  panel below, because the two batches share `split-view.ts`, `README.md` and
+  this file; the snapshot measures the combined tree.
 
 ### Landed — band hot path: bounded streaming, per-panel memo, ingest precompute (H1)
 
@@ -510,7 +552,9 @@ or column.
   (replay reads only the primary branch). `isMainAgent` now gates
   `tool_call`, `tool_result` and the three `tool_execution_*` hooks; a missing
   identity (older host) still counts as main.
-- **A1 → advisor tally status line.** Advisor cards arrive as `custom`
+- **A1 → advisor tally status line.** (Superseded by the advisor panel pass
+  below: the status entry duplicated the panel title and only existed because
+  there was no panel.) Advisor cards arrive as `custom`
   messages (`customType: "advisor"`, `details.notes`) on both delivery paths —
   turn-less recording emits `message_start`/`message_end` directly, and a
   steered batch passes through the same pair when the loop injects it. The
@@ -704,10 +748,102 @@ subsumed them.
   column offsets; forcing the resolver to `4k` fails the preset-facing tests;
   reverting the session-load resolution fails the session-switch test.
 
+### Landed — advisor panel (auto with advisor mode)
+
+Delta: 159 → 168 tests, overall lines 99.93% → 99.94%, functions 97.73% →
+97.95% (FNF 176 → 196, twenty new function records, all reached; the four
+misses are unchanged), lint unchanged at 0 warnings / 0 errors, `split-view.ts`
+1898 → 2138 L. The status entry and its seam are gone (`ADVISOR_STATUS_KEY`,
+`advisorStatusText`, `syncAdvisorStatus`, and the harness `status` accessor).
+Committed together with the wide-order / live-head batch above, which shares
+`split-view.ts`, `README.md` and this file; its message covers both.
+
+- **Mode comes from the live session.** `/advisor on|off` is session-local —
+  no extension event, no setting write — so `readAdvisorMode` reads
+  `AgentSession.isAdvisorEnabled()` off the `AgentRegistry.global()` ref whose
+  `sessionId` matches `ctx.sessionManager.getSessionId()`, and a 400 ms
+  `unref`'d poll catches the switch while the band is unmounted. Enabled
+  without a resolved model counts as on. No matching ref (older or detached
+  host) falls back to the `advisor.enabled` setting, and either path failing
+  means "off": the panel is decorative, so it must not break a render or an
+  event handler. Subagent `session_start`s re-adopt the config but not the
+  advisor flags, which belong to the top-level session that owns the band.
+- **Host-load constraint: no host domain modules.** The first version imported
+  `cfgAdvisorEnabled` from `@oh-my-pi/pi-coding-agent/advisor/settings`, which
+  loads under `bun test` but makes the extension fail to load in the real
+  host: `omp -e ./split-view.ts` reports
+  `Cannot find package '@oh-my-pi/pi-tui' imported from
+  …/node_modules/@oh-my-pi/pi-coding-agent/src/advisor/settings.ts`. The
+  importer is OURS, but the failing resolution is a *bare* `@oh-my-pi/pi-tui`
+  import from a file inside `node_modules` (the host's loader answers that
+  specifier for extension files only; a minimal `node_modules` probe package
+  that exports from `@oh-my-pi/pi-tui` reproduces it exactly). Any host module
+  whose on-disk graph reaches such an edge breaks the load — `advisor/settings`
+  reaches 1789 files including `config/model-resolver.ts`. The fallback now
+  reads the setting by id through the already-imported registry
+  (`lookup("advisor.enabled")`), so the extension's graph is the pre-change one
+  plus `registry/agent-registry` (verified loadable). Root and `node_modules`
+  graphs were also probed in the real host: the extension sees the live `Main`
+  ref with a matching `sessionId`, and `setAdvisorEnabled(true)` — what
+  `/advisor on` calls — flips the same getter the poll reads.
+- **Notes are a window on this turn.** `addAdvisorNotes` keeps the severity
+  counts it always had, and now also stores one bounded, single-line row per
+  note (newest 100, ≤2000 chars each) with its optional advisor tag.
+  `resetAdvisorTally` is still the single turn-boundary reset, so notes and
+  tally live and die together — live, across `reconstruct`, and on shutdown.
+- **Rendering is a normal band panel.** `advisor` joined `PanelId`, the panel
+  memo (`a|width|rows|advisorVersion`), the composed cache (an `advisor` array
+  compared by identity) and `panelRenderCounts`. Its title is the tally
+  (`Advisor · 1 blocker · 2 concerns`), its rows are pre-coloured
+  severity-tagged lines, so no new theme colour exists and
+  `themeFingerprint` already samples all four tones.
+- **Layout: stack, strip, or the whole band.** With thinking on, the advisor
+  stacks above the thinking panel *inside that column* (its own memoised
+  composite, so the column join still caches on identity); the block is
+  `advisorBodyRows()` = clamp(⌊bandHeight/6⌋, 1, 4) rows plus its frame, and
+  thinking takes the rest of the same `bandHeight`. Without thinking it is a
+  full-width strip over the remaining columns; with no other panel it takes
+  the whole band. Totals stay exact in every case: `strip + columns` and
+  `advisor + thinking` both equal `bandHeight`.
+- **`/split` is the master off.** `splitOff` is now explicit state instead of
+  being inferred from the panel flags, which could not express an
+  advisor-only band; `--no-split` still starts bare, the individual toggles
+  clear it when they turn a panel on, and a new advisor activation clears it
+  so the panel can appear on its own.
+- **Fixed while landing it.** The first frame dump (120 cols, 3 columns, strip
+  path) was 25 rows, not 20: the files column rendered `bandHeight` regardless
+  of the strip above it. `panelLines` now sizes the files panel from the body
+  rows it is given (`bodyRows + 2`), which is identical when no strip exists.
+  The plan's stacked-composite step passed the band width rather than the
+  thinking column's width; that overran the row join and was corrected to the
+  column width before the first run.
+- Tests: a new `advisor panel` suite owns a registered fake ref (released in
+  `afterAll`, so the poll cannot leak the panel into later suites): auto
+  on/off with no other panels, the stack (3 columns at row 0) becoming a
+  full-width strip (`columnStarts(row0) === [0]`) when thinking is hidden and
+  back, notes and tally live, the user-prompt boundary, branch replay, a ref
+  for another session id not counting, `/split` off/on around an advisor-only
+  band, and the `advisor.enabled` setting as the no-ref fallback (that test
+  imports the host's advisor settings module only to register the id). The
+  tally property now reads the panel title live and replayed; the per-panel
+  rebuild property expects `advisor` unchanged.
+  Mutations checked (each reverted after the run): matching any ref regardless
+  of session id fails the other-session test; letting the files column keep
+  `bandHeight` under a strip fails the `wide` files-first test (20 rows → 24);
+  dropping `advisorVersion` from the strip's panel key fails its card-rebuild
+  assertion, and dropping it from the stacked composite key fails the notes
+  test; keeping `splitOff` out of the `/split` guard fails the advisor-only
+  hide test; a misspelled fallback setting id fails the fallback test; removing
+  the `message_end` sync fails all nine.
+
 ## Next up
 
-1. Nothing is queued: W6 (bash replay) landed; Q8 closed with C1.
-2. Keep all five gates green and update this snapshot in the same commit as
+1. W10 — make replay apply the same payload-keyed diff rule as the live
+   handler, or narrow the README claim to live turns.
+2. W11 — establish whether the host exposes a resize hook before promising
+   live `auto` re-resolution; the fallback is to re-resolve at render time
+   when the aspect ratio or fit changes.
+3. Keep all five gates green and update this snapshot in the same commit as
    any future change.
 
 ## Keeping this file honest
@@ -716,5 +852,6 @@ subsumed them.
   coverage gate itself is validated by forcing a failure (`COVERAGE_LINES=1`).
 - Update the snapshot and tick/rewrite the affected rows in the same commit as
   the change; delete rows instead of leaving stale metrics.
-- Cross-references: `PLAN.md` holds the full backlog text for the behaviour
-  items (W1–W9, T1–T7); this file holds the ranking and the metric targets.
+- Cross-references: `PLAN.md` holds the full backlog text for the landed
+  behaviour items (W1–W9, T1–T7); this file holds the ranking, the open rows
+  (W10, W11) and the metric targets.

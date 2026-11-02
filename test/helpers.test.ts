@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { visibleWidth } from "@oh-my-pi/pi-tui";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
+import type { NativeNode } from "@oh-my-pi/pi-tui/native/node";
 import {
 	MAX_BAND_HEIGHT,
 	MAX_DIFF_CHARS,
@@ -21,6 +22,7 @@ import {
 	resultTextTail,
 	sanitizeText,
 	truncateInline,
+	withoutLiveThinking,
 } from "../helpers.ts";
 import { normalizeConfig } from "../ui-panels-config.ts";
 
@@ -297,5 +299,25 @@ describe("lastImageBlock", () => {
 		expect(lastImageBlock("plain text")).toBeUndefined();
 		expect(lastImageBlock(undefined)).toBeUndefined();
 		expect(lastImageBlock({})).toBeUndefined();
+	});
+});
+
+describe("withoutLiveThinking", () => {
+	test("drops only the live thinking section from the root's children", () => {
+		const text = { k: "md", p: { text: "answer" }, key: "t0" } as unknown as NativeNode;
+		const head = { k: "section", p: { role: "omp.thinking.live" }, key: "k0" } as unknown as NativeNode;
+		const root = { k: "col", p: { role: "omp.assistant" }, c: [text, head] } as unknown as NativeNode;
+		const filtered = withoutLiveThinking(root);
+		expect(filtered).not.toBe(root);
+		expect(filtered.c).toEqual([text]);
+	});
+
+	test("returns the same node when nothing matches", () => {
+		const root = {
+			k: "col",
+			p: { role: "omp.assistant" },
+			c: [{ k: "md", p: { text: "answer" } }],
+		} as unknown as NativeNode;
+		expect(withoutLiveThinking(root)).toBe(root);
 	});
 });

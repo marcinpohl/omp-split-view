@@ -103,7 +103,7 @@ const frame = (width: number) => {
 
 await emit("session_start");
 await command("split"); // thinking + tools
-await command("files");
+await command("split-files");
 await command("split-height", "20");
 tui.terminal.columns = 120;
 
@@ -167,7 +167,7 @@ const measure = async (width: number, rows: number) => {
 	tui.terminal.rows = rows;
 	await emit("session_start");
 	await command("split"); // thinking + tools on, which mounts the band
-	await command("files");
+	await command("split-files");
 	const lines = render(width);
 	const starts: number[] = [];
 	let cell = 0;
@@ -180,7 +180,7 @@ const measure = async (width: number, rows: number) => {
 	return { rows: lines.length, starts };
 };
 
-console.log("  terminal    preset   band  thinking | tools | files (cols)");
+console.log("  terminal    preset   band  files | thinking | tools (cols)");
 for (const [width, rows] of [
 	[120, 45], // classic
 	[200, 60], // 1440p, larger font
@@ -188,19 +188,100 @@ for (const [width, rows] of [
 	[500, 60], // ultrawide
 ] as const) {
 	const { rows: band, starts } = await measure(width, rows);
-	const thinking = (starts[1] ?? width) - (starts[0] ?? 0);
-	const tools = (starts[2] ?? width) - (starts[1] ?? width);
-	const files = width - (starts[2] ?? width);
-	const size = `${width}x${rows}`;
 	const preset = autoGeometryMode(width, rows);
-	const columns = `${String(thinking).padStart(8)} | ${String(tools).padStart(5)} | ${String(files).padStart(5)}`;
+	// wide renders the files panel first; 4k keeps it last, so each panel's
+	// width comes from the column boundaries in that preset's order.
+	const files =
+		preset === "wide" ? (starts[1] ?? width) - (starts[0] ?? 0) : width - (starts[2] ?? width);
+	const thinking =
+		preset === "wide" ? (starts[2] ?? width) - (starts[1] ?? width) : (starts[1] ?? width) - (starts[0] ?? 0);
+	const tools =
+		preset === "wide" ? width - (starts[2] ?? width) : (starts[2] ?? width) - (starts[1] ?? width);
+	const size = `${width}x${rows}`;
+	const columns = `${String(files).padStart(5)} | ${String(thinking).padStart(8)} | ${String(tools).padStart(5)}`;
 	console.log(`  ${size.padEnd(11)} ${preset.padEnd(6)} ${String(band).padStart(4)}  ${columns}`);
 }
+console.log("  wide renders files | thinking | tools; 4k renders thinking | tools | files.");
 console.log("  preset = auto: wide (≥8 cols/row) takes 35% of the rows and 32% of the cols,");
 console.log("  4k takes 45% and 25% (20-row floor, 80-row ceiling; 34/120-col dock bounds).");
 console.log("  /split-geometry pins 4k or wide; /split-height keeps 18 rows for the transcript.");
 
-heading("6. State bounds — seams the suite asserts on");
+heading("6. Geometry presets — the same 160x50 pane, both curves");
+/** A seeded scene, so both presets render identical content. */
+const seedScene = async () => {
+	await resetBuffers();
+	await emit("message_update", { assistantMessageEvent: { type: "thinking_start" } });
+	await emit("message_update", {
+		assistantMessageEvent: { type: "thinking_delta", delta: "Comparing the two geometry curves on one terminal." },
+	});
+	await emit("message_update", {
+		assistantMessageEvent: { type: "thinking_end", content: "Comparing the two geometry curves on one terminal." },
+	});
+	await emit("tool_execution_start", { toolCallId: "g1", toolName: "bash", args: { command: "bun test" } });
+	await emit("tool_execution_end", {
+		toolCallId: "g1",
+		result: { content: "159 pass\n0 fail" },
+		isError: false,
+	});
+	await emit("tool_call", { toolName: "edit", input: { path: "/home/marcin/project/src/band.ts" } });
+	await emit("tool_result", {
+		toolName: "edit",
+		input: { path: "/home/marcin/project/src/band.ts" },
+		details: { diff: "@@ -12,2 +12,2 @@\n-const rows = compose(a);\n+const rows = compose(a, filesWidth);\n" },
+	});
+};
+/** Bare session at a size with all three panels on, then pin `preset`. */
+const pinGeometry = async (preset: "4k" | "wide", width: number, rows: number) => {
+	tui.terminal.columns = width;
+	tui.terminal.rows = rows;
+	await emit("session_start");
+	await command("split");
+	await command("split-files");
+	await command("split-geometry", preset);
+	return notifications.at(-1)?.message ?? "";
+};
+for (const preset of ["4k", "wide"] as const) {
+	const report = await pinGeometry(preset, 160, 50);
+	await seedScene();
+	console.log(`\n  /split-geometry ${preset} — ${report}`);
+	frame(160);
+}
+
+heading("7. Auto preset — the terminal shape picks the curve");
+console.log("  terminal    cols/row  preset  band  widths in render order");
+for (const [width, rows] of [
+	[120, 45], // 2.7
+	[200, 60], // 3.3
+	[256, 32], // 8.0 — exactly the cutoff
+	[320, 40], // 8.0
+	[400, 100], // 4.0 — a 4K cell grid reads as tall, not wide
+	[500, 40], // 12.5
+] as const) {
+	tui.terminal.columns = width;
+	tui.terminal.rows = rows;
+	await emit("session_start");
+	await command("split");
+	await command("split-files");
+	await command("split-geometry", "auto");
+	const lines = render(width);
+	const starts: number[] = [];
+	let cell = 0;
+	for (const ch of lines[0] ?? "") {
+		if (ch === "╭") starts.push(cell);
+		cell += visibleWidth(ch);
+	}
+	const preset = autoGeometryMode(width, rows);
+	const order = preset === "wide" ? ["files", "thinking", "tools"] : ["thinking", "tools", "files"];
+	const bounds = [...starts, width];
+	const widths = order.map((id, i) => `${id} ${bounds[i + 1]! - bounds[i]!}`);
+	const size = `${width}x${rows}`;
+	console.log(
+		`  ${size.padEnd(11)} ${(width / rows).toFixed(1).padStart(8)}  ${preset.padEnd(6)} ${String(lines.length).padStart(4)}  ${widths.join(" | ")}`,
+	);
+}
+console.log("  auto switches at 8 cols per row; the 256x32 pane is the exact cutoff and gets `wide`.");
+
+heading("8. State bounds — seams the suite asserts on");
 await resetBuffers();
 const blocksBefore = retainedThinkingBlocks();
 for (let i = 0; i < 500; i++) {

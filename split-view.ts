@@ -10,6 +10,10 @@
  *                    reasoning is never shown twice
  *   tool usage panel every tool call, status, duration, output preview
  *   files panel      touched files + edit diff, alongside the other panels
+ *   advisor panel    the newest advisor notes and the running tally, shown
+ *                    automatically while advisor mode is on (stacked above
+ *                    thinking, a strip when thinking is off); it owns no
+ *                    setting and follows the session-local `/advisor` switch
  *   response-only    hides thinking blocks and tool activity through omp's
  *                    own display settings (see /split-trim-response)
  *
@@ -18,7 +22,8 @@
  *   ctx.ui.setWidget(key, factory, { placement: "aboveEditor" })
  *
  * The composer renders it full-width just above the editor. The component
- * composes the enabled columns side by side — thinking | tools | files —
+ * composes the enabled columns side by side — thinking | tools | files in
+ * `4k`, files | thinking | tools in `wide` —
  * by direct row composition (omp has no fullscreen layout root to wrap, and
  * its Stack/Row components are not needed for a fixed-height band). It is
  * the same region omp's own HUD widgets use, so it never overlaps the
@@ -43,7 +48,7 @@
  *                               ON = the layout saved by /split-save
  *   /split-thinking             toggle the thinking panel within the band
  *   /split-tools                toggle the tools panel within the band
- *   /files                      toggle the files panel within the band
+ *   /split-files                toggle the files panel within the band
  *   /split-tools-view           compact <-> full tool detail
  *   /split-tools-width <pct>    tools share of the band width (20-60)
  *   /split-height <n>           band height in rows (6-80, clamped to fit)
@@ -53,17 +58,15 @@
  */
 
 import type { Component, TUI } from "@oh-my-pi/pi-tui";
-import {
-	getImageDimensions,
-	imageFallback,
-	truncateToWidth,
-	visibleWidth,
-	wrapTextWithAnsi,
-} from "@oh-my-pi/pi-tui";
-import { renderDiff } from "@oh-my-pi/pi-tui/chrome/diff";
+import { getImageDimensions, imageFallback } from "@oh-my-pi/pi-tui/terminal-capabilities";
+import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@oh-my-pi/pi-tui/utils";
+import { renderDiff } from "@oh-my-pi/pi-tui/chrome";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
+import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
+import type { DescribeContext, NativeNode } from "@oh-my-pi/pi-tui/native/node";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { SessionMessageEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import {
 	GEOMETRY_PROFILES,
@@ -91,6 +94,7 @@ import {
 	sanitizeText,
 	transcriptVisibility,
 	truncateInline,
+	withoutLiveThinking,
 	type GeometryMode,
 	type ImageBlock,
 	type TranscriptVisibility,
@@ -125,7 +129,7 @@ const MAX_LINE_CHARS = MAX_TAIL_CHARS;
 const THINK_RAF_MS = 50;
 const TOOLS_FLUSH_MS = 100;
 
-type PanelId = "thinking" | "tools" | "files";
+type PanelId = "thinking" | "tools" | "files" | "advisor";
 
 const EMPTY: readonly string[] = [];
 const LEGEND = "r read · w write · s seen(bash)";
@@ -159,13 +163,29 @@ let geometrySetting: GeometrySetting = "auto";
 /** Preset in force for this session (resolved from `geometrySetting`). */
 let geometryMode: GeometryMode = "4k";
 
-// ─── advisor status line ─────────────────────────────────────────────────────
+// ─── advisor panel ───────────────────────────────────────────────────────────
 
 // Advisor mode delivers batched notes as `custom` messages (customType
 // "advisor") that omp already renders as a full-width transcript card. The
-// card is the content; this one-line status only keeps the tally visible once
-// the card scrolls away, so it costs no band column and repeats no prose.
-const ADVISOR_STATUS_KEY = "split-view.advisor";
+// card is the transcript record; the panel keeps the newest notes and the
+// running tally on screen while advisor mode is on, and disappears with it.
+const ADVISOR_POLL_MS = 400;
+/** Fallback mode source when no live registry ref matches (see readAdvisorMode).
+ * Read through the setting registry, not the advisor domain module: importing
+ * that module drags the on-disk host graph into the extension, and omp's loader
+ * cannot resolve a bare `@oh-my-pi/pi-*` import from inside `node_modules`. */
+const ADVISOR_ENABLED_ID = "advisor.enabled";
+const MAX_ADVISOR_NOTES = 100;
+const MAX_ADVISOR_NOTE_CHARS = 2000;
+const ADVISOR_MAX_BODY_ROWS = 4;
+
+type AdvisorSeverityLabel = "blocker" | "concern" | "nit" | "note";
+
+interface AdvisorNoteEntry {
+	severity: AdvisorSeverityLabel;
+	text: string;
+	advisor?: string;
+}
 
 interface AdvisorTally {
 	blocker: number;
@@ -175,12 +195,51 @@ interface AdvisorTally {
 }
 
 const advisorTally: AdvisorTally = { blocker: 0, concern: 0, nit: 0, note: 0 };
+/** Notes of the current turn, oldest first; every change bumps the version. */
+const advisorNotes: AdvisorNoteEntry[] = [];
+let advisorVersion = 0;
 
+/** Advisor mode is session-local (`/advisor on|off`): no extension event and
+ * no setting change announces it, so a poll of the live session reads it. */
+let advisorOn = false;
+/** Explicit master off for the whole band (`/split` off); a new advisor
+ * activation clears it. */
+let splitOff = false;
+let advisorPoll: NodeJS.Timeout | null = null;
+/** The context the poll reads, refreshed on every session start: the host hands
+ * each session its own, and a stale one would report the previous session's
+ * mode after a switch. */
+let advisorPollCtx: ExtensionContext | null = null;
+
+/** The single turn-boundary reset: counts and notes describe the turn in
+ * progress, so a real user prompt, a branch rebuild and shutdown all land
+ * here. The version bump is what repaints the panel. */
 function resetAdvisorTally(): void {
 	advisorTally.blocker = 0;
 	advisorTally.concern = 0;
 	advisorTally.nit = 0;
 	advisorTally.note = 0;
+	advisorNotes.length = 0;
+	advisorVersion++;
+}
+
+/** Severities the advisor protocol defines; anything else counts as a note. */
+function advisorSeverity(value: unknown): AdvisorSeverityLabel {
+	if (value === "blocker" || value === "concern" || value === "nit") return value;
+	return "note";
+}
+
+/** One retained note row: single-line text, bounded heap, advisor tag. */
+function advisorNoteEntry(note: Record<string, unknown>, severity: AdvisorSeverityLabel): AdvisorNoteEntry | undefined {
+	if (typeof note.note !== "string") return undefined;
+	const text = sanitizeText(note.note).replace(/\s+/g, " ").trim().slice(0, MAX_ADVISOR_NOTE_CHARS);
+	if (!text) return undefined;
+	const entry: AdvisorNoteEntry = { severity, text };
+	if (typeof note.advisor === "string" && note.advisor) {
+		const advisor = sanitizeText(note.advisor);
+		if (advisor) entry.advisor = advisor;
+	}
+	return entry;
 }
 
 /** The advisor card carries its notes in `details.notes`; severity is optional. */
@@ -188,13 +247,18 @@ function addAdvisorNotes(details: unknown): void {
 	if (!isRecord(details) || !Array.isArray(details.notes)) return;
 	for (const note of details.notes) {
 		if (!isRecord(note)) continue;
-		const severity = note.severity;
-		if (severity === "blocker" || severity === "concern" || severity === "nit") advisorTally[severity]++;
-		else advisorTally.note++;
+		const severity = advisorSeverity(note.severity);
+		advisorTally[severity]++;
+		const entry = advisorNoteEntry(note, severity);
+		if (entry) advisorNotes.push(entry);
 	}
+	if (advisorNotes.length > MAX_ADVISOR_NOTES) advisorNotes.splice(0, advisorNotes.length - MAX_ADVISOR_NOTES);
+	// One bump per card: the panel title changes even when only the tally did.
+	advisorVersion++;
 }
 
-function advisorStatusText(): string | undefined {
+/** Running counts as one title fragment, or undefined when nothing arrived. */
+function advisorTallyText(): string | undefined {
 	const parts: string[] = [];
 	const push = (count: number, one: string, many: string): void => {
 		if (count > 0) parts.push(`${count} ${count === 1 ? one : many}`);
@@ -203,7 +267,88 @@ function advisorStatusText(): string | undefined {
 	push(advisorTally.concern, "concern", "concerns");
 	push(advisorTally.nit, "nit", "nits");
 	push(advisorTally.note, "note", "notes");
-	return parts.length > 0 ? `Advisor: ${parts.join(" · ")}` : undefined;
+	return parts.length > 0 ? parts.join(" · ") : undefined;
+}
+
+/** Glyph and theme tone per severity; the panel carries every colour it uses
+ * through `theme.fg`, so a theme switch reaches them. */
+const ADVISOR_SEVERITY_STYLE: Record<
+	AdvisorSeverityLabel,
+	{ glyph: string; color: "error" | "warning" | "muted" | "dim" }
+> = {
+	blocker: { glyph: "■", color: "error" },
+	concern: { glyph: "▲", color: "warning" },
+	nit: { glyph: "·", color: "muted" },
+	note: { glyph: "•", color: "dim" },
+};
+
+/** Every retained note as one pre-coloured row, oldest first (`newestRows`
+ * keeps the newest rows of the body). */
+function advisorNoteLines(theme: Theme): string[] {
+	return advisorNotes.map(note => {
+		const { glyph, color } = ADVISOR_SEVERITY_STYLE[note.severity];
+		const advisor = note.advisor ? ` (${note.advisor})` : "";
+		return theme.fg(color, `${glyph} ${note.severity}${advisor}: ${note.text}`);
+	});
+}
+
+/**
+ * Advisor mode on the top-level session, read from the live registry ref for
+ * `ctx`'s session id: `/advisor on|off` only ever moves that session-local
+ * state. The `advisor.enabled` setting answers only when no live ref matches
+ * (older and detached hosts), and a failure on either path means "off" — the
+ * panel is decorative, so it must never break a render or an event handler.
+ */
+function readAdvisorMode(ctx: ExtensionContext): boolean {
+	try {
+		const sessionId = ctx.sessionManager.getSessionId();
+		for (const ref of AgentRegistry.global().list()) {
+			if (ref.kind !== "main" || !ref.session || ref.session.sessionId !== sessionId) continue;
+			// Enabled, not "active": advisor mode with no model still counts as on.
+			return ref.session.isAdvisorEnabled();
+		}
+	} catch {
+		/* no live registry ref: fall through to the setting */
+	}
+	try {
+		// Undefined when the host does not register the setting at all (older
+		// build): then there is no advisor mode to mirror.
+		const scope = api?.pi.settings;
+		return scope !== undefined && lookup(ADVISOR_ENABLED_ID)?.get(scope) === true;
+	} catch {
+		return false;
+	}
+}
+
+/** Adopt the session's current advisor mode, reconciling only on a change. */
+function syncAdvisorMode(ctx: ExtensionContext): void {
+	if (ctx.mode !== "tui" || !isMainAgent(ctx)) return;
+	const next = readAdvisorMode(ctx);
+	if (next === advisorOn) return;
+	advisorOn = next;
+	// An explicit new activation re-opens a band the user closed with /split.
+	if (next) splitOff = false;
+	reconcile(ctx);
+}
+
+/** Poll the live session for advisor mode: one boolean per tick, and nothing
+ * happens while the value is unchanged. Called on every main-session start so
+ * the interval always reads the newest context. */
+function startAdvisorPoll(ctx: ExtensionContext): void {
+	if (ctx.mode !== "tui" || !isMainAgent(ctx)) return;
+	advisorPollCtx = ctx;
+	if (advisorPoll) return;
+	advisorPoll = setInterval(() => {
+		if (advisorPollCtx) syncAdvisorMode(advisorPollCtx);
+	}, ADVISOR_POLL_MS);
+	advisorPoll.unref?.();
+}
+
+function stopAdvisorPoll(): void {
+	if (!advisorPoll) return;
+	clearInterval(advisorPoll);
+	advisorPoll = null;
+	advisorPollCtx = null;
 }
 
 /** Details of a delivered advisor card, or undefined for any other message. */
@@ -217,18 +362,6 @@ function advisorNoteDetails(message: unknown): { details: unknown } | undefined 
 function isUserPrompt(message: unknown): boolean {
 	if (!isRecord(message) || message.role !== "user") return false;
 	return message.synthetic !== true && message.attribution !== "agent";
-}
-
-function syncAdvisorStatus(ctx: ExtensionContext): void {
-	if (ctx.mode !== "tui") return;
-	// The tally belongs to the band: with every panel off the extension is
-	// hidden, so leaving its status line up would be stale chrome.
-	const visible = thinkingOn || toolsOn || filesOn;
-	try {
-		ctx.ui.setStatus(ADVISOR_STATUS_KEY, visible ? advisorStatusText() : undefined);
-	} catch {
-		/* the status line is decorative: never break an event handler */
-	}
 }
 
 /** Advisor tool calls reach extension `tool_call`/`tool_result` hooks with a
@@ -796,7 +929,7 @@ interface BandDef {
 	empty: string;
 }
 
-function bandDef(theme: Theme, id: "thinking" | "tools"): BandDef {
+function bandDef(theme: Theme, id: Exclude<PanelId, "files">): BandDef {
 	if (id === "thinking")
 		return {
 			title: "Thinking",
@@ -806,6 +939,19 @@ function bandDef(theme: Theme, id: "thinking" | "tools"): BandDef {
 			lines: () => thinkingLines(),
 			empty: "Thinking idle",
 		};
+	if (id === "advisor") {
+		// The title is the running tally: the card is the transcript record,
+		// the panel only has to keep the notes and their counts in view.
+		const tally = advisorTallyText();
+		return {
+			title: tally ? `Advisor · ${tally}` : "Advisor",
+			color: "muted",
+			streaming: () => false,
+			style: line => line,
+			lines: () => advisorNoteLines(theme),
+			empty: "No advisor notes yet",
+		};
+	}
 	return {
 		title: "Tool Usage",
 		color: "muted",
@@ -897,11 +1043,21 @@ let bandFingerprint = "";
 /** Rendered panel lines, keyed on that panel's own inputs only. */
 const panelMemos = new Map<PanelId, { key: string; lines: readonly string[] }>();
 /** Composed band, reused while every panel returns the same arrays. */
-let composedCache: { width: number; parts: readonly (readonly string[])[]; lines: string[] } | null = null;
-const panelBuilds: Record<PanelId, number> = { thinking: 0, tools: 0, files: 0 };
+let composedCache: {
+	width: number;
+	advisor: readonly string[];
+	parts: readonly (readonly string[])[];
+	lines: readonly string[];
+} | null = null;
+const panelBuilds: Record<PanelId, number> = { thinking: 0, tools: 0, files: 0, advisor: 0 };
 
 /** Test seam: panel bodies built since process start. */
-export function panelRenderCounts(): Readonly<{ thinking: number; tools: number; files: number }> {
+export function panelRenderCounts(): Readonly<{
+	thinking: number;
+	tools: number;
+	files: number;
+	advisor: number;
+}> {
 	return { ...panelBuilds };
 }
 
@@ -933,8 +1089,9 @@ function themeFingerprint(theme: Theme): string {
 	].join("|");
 }
 
-/** Panel widths: files keeps its dock, then thinking | tools split the
- * remainder right-to-left; a lone panel takes the whole width. */
+/** Panel widths: files keeps its computed width, then thinking | tools split
+ * the remainder right-to-left; a lone panel takes the whole width. `panelLayout`
+ * owns the render order, so these widths are keyed by panel, not position. */
 function allocateWidths(width: number, ids: PanelId[], filesCols: number): Map<PanelId, number> {
 	const widths = new Map<PanelId, number>();
 	if (ids.length === 1) {
@@ -959,13 +1116,19 @@ function allocateWidths(width: number, ids: PanelId[], filesCols: number): Map<P
 
 /** One panel's rows, reused while that panel's own inputs are unchanged. */
 function panelLines(theme: Theme, id: PanelId, width: number, bodyRows: number): readonly string[] {
-	// The files column sizes off the whole band (it owns the diff subpanel), so
-	// its key carries `bandHeight` rather than the body row count.
-	if (id === "files")
+	// The files column owns the diff subpanel, so it sizes off its whole panel
+	// height (its body rows plus its own frame) rather than the body count.
+	if (id === "files") {
+		const height = Math.max(2, bodyRows + 2);
 		return memoPanel(
 			id,
-			`f|${width}|${bandHeight}|${showDiff ? 1 : 0}|${filesVersion}|${editDiff.version}`,
-			() => filesPanelLines(theme, width, bandHeight),
+			`f|${width}|${height}|${showDiff ? 1 : 0}|${filesVersion}|${editDiff.version}`,
+			() => filesPanelLines(theme, width, height),
+		);
+	}
+	if (id === "advisor")
+		return memoPanel(id, `a|${width}|${bodyRows}|${advisorVersion}`, () =>
+			renderPanel({ theme, def: bandDef(theme, id), width, bodyRows, memo: wrapMemo }),
 		);
 	const key =
 		id === "thinking"
@@ -974,6 +1137,27 @@ function panelLines(theme: Theme, id: PanelId, width: number, bodyRows: number):
 	return memoPanel(id, key, () =>
 		renderPanel({ theme, def: bandDef(theme, id), width, bodyRows, memo: wrapMemo }),
 	);
+}
+
+/** The thinking column with the advisor panel stacked on top of it: one
+ * composite array, so the column join still caches on panel identity and a
+ * change to either panel rebuilds only this column. */
+function thinkingColumnLines(
+	theme: Theme,
+	width: number,
+	advisorBody: number,
+	thinkingBody: number,
+): readonly string[] {
+	const key = `ts|${width}|${advisorBody}|${thinkingBody}|${advisorVersion}|${thinking.version}`;
+	const hit = panelMemos.get("thinking");
+	if (hit && hit.key === key) return hit.lines;
+	const build = (id: "advisor" | "thinking", bodyRows: number): readonly string[] =>
+		renderPanel({ theme, def: bandDef(theme, id), width, bodyRows, memo: wrapMemo });
+	const lines = [...build("advisor", advisorBody), ...build("thinking", thinkingBody)];
+	panelMemos.set("thinking", { key, lines });
+	panelBuilds.thinking++;
+	panelBuilds.advisor++;
+	return lines;
 }
 
 /** Join the enabled panels row by row into one band. */
@@ -996,50 +1180,97 @@ function clearRenderCaches(): void {
 	composedCache = null;
 }
 
-/** Enabled panel ids for this width, plus the files dock width (0 = no dock). */
+/** Enabled panel ids in render order for this width, plus the files column
+ * width (0 = no files column). `wide` renders the files panel first so the
+ * thinking and tool boxes sit on the right; `4k` keeps thinking | tools |
+ * files. */
 function panelLayout(width: number): { ids: PanelId[]; filesWidthCols: number } {
-	const ids: PanelId[] = [];
-	if (thinkingOn) ids.push("thinking");
-	if (toolsOn) ids.push("tools");
 	// A files column needs room for its frame plus something beside it.
 	const filesWidthCols = filesOn && width >= MIN_TERM_WIDTH ? clampedDockCols(width) : 0;
-	if (filesWidthCols > 0) ids.push("files");
+	const filesFirst = geometryMode === "wide" && filesWidthCols > 0;
+	const ids: PanelId[] = [];
+	if (filesFirst) ids.push("files");
+	if (thinkingOn) ids.push("thinking");
+	if (toolsOn) ids.push("tools");
+	if (!filesFirst && filesWidthCols > 0) ids.push("files");
 	return { ids, filesWidthCols };
 }
 
 /** Files-only on a narrow terminal: keep the frame and say why. Not memoised —
  * it depends on the panel flags, which the panel keys do not carry. */
-function narrowFilesNotice(theme: Theme, width: number): string[] {
+function narrowFilesNotice(theme: Theme, width: number, height: number): string[] {
 	if (filesOn && !thinkingOn && !toolsOn)
-		return filesPanelLines(theme, width, bandHeight, `Files panel needs ≥${MIN_TERM_WIDTH} cols`);
+		return filesPanelLines(theme, width, height, `Files panel needs ≥${MIN_TERM_WIDTH} cols`);
 	return [];
+}
+
+/** Advisor body rows: a fraction of the band, so a short band still leaves the
+ * panels below it usable (3 at the 20-row default, 2 at the wide preset's 14). */
+function advisorBodyRows(): number {
+	return Math.max(1, Math.min(ADVISOR_MAX_BODY_ROWS, Math.floor(bandHeight / 6)));
+}
+
+/** The advisor block above the columns (or stacked into the thinking column)
+ * and the body rows every column has left. */
+interface BandFrames {
+	stacked: boolean;
+	advisorBody: number;
+	stripLines: readonly string[];
+	columnBody: number;
+}
+
+/** How this frame divides `bandHeight`: the advisor stacked into the thinking
+ * column, or a strip above the columns, plus the body rows the columns get. */
+function bandFrames(theme: Theme, width: number, ids: readonly PanelId[]): BandFrames {
+	const columnBody = Math.max(0, bandHeight - 2);
+	if (!advisorOn) return { stacked: false, advisorBody: 0, stripLines: EMPTY, columnBody };
+	const advisorBody = advisorBodyRows();
+	if (thinkingOn) return { stacked: true, advisorBody, stripLines: EMPTY, columnBody };
+	// A band with nothing else in it gives the advisor the whole height; the
+	// files-only notice still needs its own rows, so the strip stays short there.
+	const body = ids.length === 0 && !filesOn ? columnBody : advisorBody;
+	const stripLines = panelLines(theme, "advisor", width, body);
+	return { stacked: false, advisorBody, stripLines, columnBody: Math.max(0, columnBody - stripLines.length) };
+}
+
+/** The advisor block followed by the column rows (strip first, columns below). */
+function composeBand(strip: readonly string[], columns: readonly string[]): readonly string[] {
+	if (strip.length === 0) return columns;
+	return columns.length > 0 ? [...strip, ...columns] : strip;
+}
+
+/** Same panel arrays in the same order: the composed band can be reused. */
+function sameParts(left: readonly (readonly string[])[], right: readonly (readonly string[])[]): boolean {
+	return left.length === right.length && left.every((part, index) => part === right[index]);
 }
 
 /** The band's rows for one frame: each panel from its own memo, the column join
  * from the composed cache, nothing rebuilt unless its own inputs moved. */
-function renderBand(theme: Theme, width: number, bodyRows: number, rows: number): readonly string[] {
+function renderBand(theme: Theme, width: number, rows: number): readonly string[] {
 	// Short terminals hide the band instead of squeezing the transcript.
-	if (rows - bandHeight < MIN_ROWS_BELOW_BAND) return [];
+	if (rows - bandHeight < MIN_ROWS_BELOW_BAND) return EMPTY;
 	const fingerprint = themeFingerprint(theme);
 	if (fingerprint !== bandFingerprint) {
 		clearRenderCaches();
 		bandFingerprint = fingerprint;
 	}
 	const { ids, filesWidthCols } = panelLayout(width);
-	if (ids.length === 0) return narrowFilesNotice(theme, width);
+	const { stacked, advisorBody, stripLines, columnBody } = bandFrames(theme, width, ids);
+	if (ids.length === 0) return composeBand(stripLines, narrowFilesNotice(theme, width, Math.max(4, columnBody + 2)));
 
 	const widths = allocateWidths(width, ids, filesWidthCols);
-	const parts = ids.map(id => panelLines(theme, id, widths.get(id) ?? 0, bodyRows));
+	const parts = ids.map(id => {
+		const columnWidth = widths.get(id) ?? 0;
+		// Stacked, the advisor block and the thinking panel share one column, so
+		// both must keep that column's width or the row join would overrun.
+		if (id === "thinking" && stacked)
+			return thinkingColumnLines(theme, columnWidth, advisorBody, Math.max(0, columnBody - (advisorBody + 2)));
+		return panelLines(theme, id, columnWidth, columnBody);
+	});
 	const cached = composedCache;
-	if (
-		cached &&
-		cached.width === width &&
-		cached.parts.length === parts.length &&
-		parts.every((part, i) => part === cached.parts[i])
-	)
-		return cached.lines;
-	const lines = [...composeColumns(parts)];
-	composedCache = { width, parts, lines };
+	if (cached && cached.width === width && cached.advisor === stripLines && sameParts(cached.parts, parts)) return cached.lines;
+	const lines = composeBand(stripLines, composeColumns(parts));
+	composedCache = { width, advisor: stripLines, parts, lines };
 	return lines;
 }
 
@@ -1047,11 +1278,11 @@ class BandHub implements Component {
 	constructor(private readonly tui: TUI) {}
 
 	render(width: number): readonly string[] {
-		if (!thinkingOn && !toolsOn && !filesOn) return EMPTY;
+		if (splitOff || (!thinkingOn && !toolsOn && !filesOn && !advisorOn)) return EMPTY;
 		scheduleVisibilitySync();
 		// eslint-disable-next-line sonarjs/no-use-of-empty-return-value -- the default getter throws
 		const theme = themeGetter();
-		return renderBand(theme, width, Math.max(0, bandHeight - 2), this.tui.terminal.rows);
+		return renderBand(theme, width, this.tui.terminal.rows);
 	}
 
 	invalidate(): void {
@@ -1238,9 +1469,10 @@ function unmountWidget(ctx: ExtensionContext): void {
 }
 
 function reconcile(ctx: ExtensionContext): void {
-	if (thinkingOn || toolsOn || filesOn) mountWidget(ctx);
+	// `splitOff` is the explicit master hide: advisor mode turning on clears it,
+	// but nothing else overrides a user's `/split` off.
+	if (!splitOff && (thinkingOn || toolsOn || filesOn || advisorOn)) mountWidget(ctx);
 	else unmountWidget(ctx);
-	syncAdvisorStatus(ctx);
 	requestRender();
 }
 
@@ -1302,6 +1534,43 @@ const visibilityRegistry: { applied: TranscriptVisibility | null } = (
 let visibilityUnsupported = false;
 let visibilitySyncPending = false;
 
+/** Shared across /reload generations: an earlier generation's wrapper must
+ * see the current gate and must not be stacked. */
+interface ThinkingHeadGate {
+	suppress: boolean;
+	installed: boolean;
+}
+const THINKING_HEAD_KEY = Symbol.for("omp.split-view.thinking-head");
+const thinkingHeadGate: ThinkingHeadGate = (
+	globalThis as Record<symbol, ThinkingHeadGate | undefined>
+)[THINKING_HEAD_KEY] ?? { suppress: false, installed: false };
+(globalThis as Record<symbol, ThinkingHeadGate>)[THINKING_HEAD_KEY] = thinkingHeadGate;
+
+/** Filtered result per native tree: the host reuses its cached tree across
+ * frames, so the filtered tree is reused too. */
+const filteredThinkingHeads = new WeakMap<NativeNode, NativeNode>();
+
+/** omp's native renderer emits a live `omp.thinking.live` section even with
+ * `hideThinkingBlock`; no setting or extension renderer removes it. Wrap the
+ * one public node producer and drop that direct child while the extension owns
+ * thinking. Idempotent across /reload; a no-op if the host stops using the
+ * role. */
+function installThinkingHeadGate(): void {
+	if (thinkingHeadGate.installed) return;
+	thinkingHeadGate.installed = true;
+	const proto = AssistantMessageComponent.prototype;
+	const describe = proto.describe;
+	proto.describe = function (this: AssistantMessageComponent, context?: DescribeContext): NativeNode {
+		const node = describe.call(this, context);
+		if (!thinkingHeadGate.suppress) return node;
+		const cached = filteredThinkingHeads.get(node);
+		if (cached) return cached;
+		const filtered = withoutLiveThinking(node);
+		filteredThinkingHeads.set(node, filtered);
+		return filtered;
+	};
+}
+
 function sameVisibility(left: TranscriptVisibility, right: TranscriptVisibility): boolean {
 	return left.hideThinking === right.hideThinking && left.hideTools === right.hideTools;
 }
@@ -1327,6 +1596,7 @@ function pendingVisibilityPolicy(force: boolean): TranscriptVisibility | null {
  * user's own configured value applies again.
  */
 function syncTranscriptVisibility(force = false): void {
+	thinkingHeadGate.suppress = desiredVisibility().hideThinking;
 	const policy = pendingVisibilityPolicy(force);
 	if (!policy || !api) return;
 
@@ -1446,6 +1716,7 @@ function reconstruct(ctx: ExtensionContext): void {
 export default function splitView(pi: ExtensionAPI): void {
 	api = pi;
 	pi.setLabel("Split View");
+	installThinkingHeadGate();
 
 	pi.registerFlag("no-split", {
 		description: "Start bare: skip the split-view panels (thinking/tools/files)",
@@ -1466,6 +1737,29 @@ function requireTui(ctx: ExtensionContext): boolean {
 	return true;
 }
 
+/** Adopt one session's layout: panel flags and metrics from its config, plus
+ * the advisor mode and the starting master on/off state. Module state is
+ * process-global and the extension factory is rebound to subagent sessions, so
+ * only the top-level session may own the flags a subagent start would clobber. */
+function adoptSession(
+	ctx: ExtensionContext,
+	raw: UiPanelsConfig,
+	cfg: NormalizedUiPanelsConfig,
+	noSplit: boolean,
+): void {
+	thinkingOn = cfg.thinking;
+	toolsOn = cfg.tools;
+	applySavedMetrics(raw, cfg);
+	filesOn = cfg.files;
+	showDiff = cfg.diff;
+	trimResponse = cfg.trimResponse;
+	if (!isMainAgent(ctx)) return;
+	advisorOn = readAdvisorMode(ctx);
+	// `--no-split` starts bare even with advisor mode on; a later activation
+	// clears it.
+	splitOff = noSplit || !(thinkingOn || toolsOn || filesOn || trimResponse || advisorOn);
+}
+
 /** Wire the omp lifecycle: session load/resume, live thinking and tool deltas. */
 function registerEvents(pi: ExtensionAPI): void {
 	pi.on("session_start", (_event, ctx) => {
@@ -1476,36 +1770,32 @@ function registerEvents(pi: ExtensionAPI): void {
 		visibilityUnsupported = false;
 
 		const raw = loadUiPanelsConfig();
+		const noSplit = pi.getFlag("no-split") === true;
 		let cfg = normalizeConfig(raw);
-		if (pi.getFlag("no-split")) {
-			cfg = { ...cfg, split: false, thinking: false, tools: false, files: false, trimResponse: false };
-		}
-		thinkingOn = cfg.thinking;
-		toolsOn = cfg.tools;
-		applySavedMetrics(raw, cfg);
-		filesOn = cfg.files;
-		showDiff = cfg.diff;
-		trimResponse = cfg.trimResponse;
+		if (noSplit) cfg = { ...cfg, split: false, thinking: false, tools: false, files: false, trimResponse: false };
+		adoptSession(ctx, raw, cfg, noSplit);
 
 		reconstruct(ctx);
 		if (ctx.mode === "tui") {
-			if (thinkingOn || toolsOn || filesOn) mountWidget(ctx);
+			if (!splitOff && (thinkingOn || toolsOn || filesOn || advisorOn)) mountWidget(ctx);
 			// Forced: a fresh session must not trust a previous generation's
 			// recorded override state.
 			syncTranscriptVisibility(true);
-			syncAdvisorStatus(ctx);
 			requestRender();
 		}
+		// `/advisor on|off` emits no extension event, so a poll is the only way
+		// to notice it while the band is unmounted.
+		startAdvisorPoll(ctx);
 	});
 
 	pi.on("session_tree", (_event, ctx) => {
 		reconstruct(ctx);
-		syncAdvisorStatus(ctx);
+		syncAdvisorMode(ctx);
 		requestRender();
 	});
 	pi.on("session_switch", (_event, ctx) => {
 		reconstruct(ctx);
-		syncAdvisorStatus(ctx);
+		syncAdvisorMode(ctx);
 		requestRender();
 	});
 
@@ -1526,21 +1816,19 @@ function registerEvents(pi: ExtensionAPI): void {
 	// the tally describes the turn in progress.
 	pi.on("message_end", (event, ctx) => {
 		const advisor = advisorNoteDetails(event.message);
-		if (advisor) {
-			addAdvisorNotes(advisor.details);
-			syncAdvisorStatus(ctx);
-			return;
-		}
-		if (isUserPrompt(event.message)) {
-			resetAdvisorTally();
-			syncAdvisorStatus(ctx);
-		}
+		if (advisor) addAdvisorNotes(advisor.details);
+		else if (isUserPrompt(event.message)) resetAdvisorTally();
+		// The panel title carries the tally, so a card or a turn boundary has to
+		// repaint even when the mode itself did not change.
+		syncAdvisorMode(ctx);
+		if (advisorOn) requestRender();
 	});
 
 	registerToolEvents(pi);
 
 	pi.on("session_shutdown", (_event, ctx) => {
 		stopToolTicker();
+		stopAdvisorPoll();
 		if (thinkFlushTimer) {
 			clearTimeout(thinkFlushTimer);
 			thinkFlushTimer = null;
@@ -1549,13 +1837,10 @@ function registerEvents(pi: ExtensionAPI): void {
 			clearTimeout(toolsFlushTimer);
 			toolsFlushTimer = null;
 		}
-		try {
-			if (ctx.mode === "tui") ctx.ui.setStatus(ADVISOR_STATUS_KEY, undefined);
-		} catch {
-			/* status is decorative */
-		}
 		resetAdvisorTally();
+		advisorOn = false;
 		unmountWidget(ctx);
+		thinkingHeadGate.suppress = false;
 		notifyFn = null;
 	});
 }
@@ -1627,7 +1912,10 @@ function registerPanelToggles(pi: ExtensionAPI): void {
 		description: "Toggle all panels: off = bare layout, on = saved startup defaults",
 		handler: async (_args, ctx) => {
 			if (!requireTui(ctx)) return;
-			if (thinkingOn || toolsOn || filesOn || trimResponse) {
+			// An advisor-only band is still a band: hiding it is a `/split` off,
+			// which the panel flags alone cannot express.
+			if (!splitOff && (thinkingOn || toolsOn || filesOn || trimResponse || advisorOn)) {
+				splitOff = true;
 				thinkingOn = false;
 				toolsOn = false;
 				filesOn = false;
@@ -1639,6 +1927,7 @@ function registerPanelToggles(pi: ExtensionAPI): void {
 			}
 			const raw = loadUiPanelsConfig();
 			const cfg = normalizeConfig(raw);
+			splitOff = false;
 			if (!cfg.thinking && !cfg.tools && !cfg.files && !cfg.trimResponse) {
 				thinkingOn = true;
 				toolsOn = true;
@@ -1661,6 +1950,8 @@ function registerPanelToggles(pi: ExtensionAPI): void {
 		handler: async (_args, ctx) => {
 			if (!requireTui(ctx)) return;
 			thinkingOn = !thinkingOn;
+			// Turning a panel on from the bare layout opens the band again.
+			if (thinkingOn) splitOff = false;
 			applyLayout(ctx);
 			const thinkingState = thinkingOn ? "on (transcript hidden)" : "off (transcript shown)";
 			notify(thinkingOn || toolsOn ? `Thinking ${thinkingState}` : "Band off (no panels)");
@@ -1672,16 +1963,18 @@ function registerPanelToggles(pi: ExtensionAPI): void {
 		handler: async (_args, ctx) => {
 			if (!requireTui(ctx)) return;
 			toolsOn = !toolsOn;
+			if (toolsOn) splitOff = false;
 			reconcile(ctx);
 			notify(`Tools ${toolsOn ? "on" : "off"}`);
 		},
 	});
 
-	pi.registerCommand("files", {
+	pi.registerCommand("split-files", {
 		description: "Toggle the files panel within the band",
 		handler: async (_args, ctx) => {
 			if (!requireTui(ctx)) return;
 			filesOn = !filesOn;
+			if (filesOn) splitOff = false;
 			reconcile(ctx);
 			if (!filesOn) {
 				notify("Files panel off");
