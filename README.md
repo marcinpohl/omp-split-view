@@ -247,7 +247,10 @@ Release prerequisites, in order: add the remote, push `main`, add the
 the initial publish and the npm install line in [Install](#install) only starts
 working once that tag's workflow has completed.
 
-The packed file set is installable as published — verified for this tree:
+The packed file set is installable as published — verified for this tree. The
+tarball is not tracked: pack from a clean tree after the last commit, or the
+artifact ships a README/manifest that no longer matches HEAD (copying the
+extracted files back over the tree is what catches it):
 
 ```sh
 bun pm pack                              # runs check:package (scripts.prepack),
