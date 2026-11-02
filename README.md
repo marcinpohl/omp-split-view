@@ -289,6 +289,17 @@ omp plugin install /tmp/omp-pkg/package  # a .tgz path is read as a directory (E
 omp plugin list && omp plugin doctor     # lists @marcinpohl/omp-split-view, v0.1.0, status ok
 ```
 
+On a development tree the plugin is usually installed as a symlink to the repo
+(`~/.omp/plugins/node_modules/@marcinpohl/omp-split-view -> ~/omp-split-view`),
+which already tracks live edits; `omp plugin install` would replace that link
+with a copy and decouple the two. Skip the install step there and verify the
+artifact by loading the extracted entry instead — it has no `node_modules`,
+so any host import the package graph cannot resolve shows up immediately:
+
+```sh
+omp --no-extensions -e /tmp/omp-pkg/package/split-view.ts --mode rpc < /dev/null
+```
+
 The packed entry itself was loaded against the host API surface as well: importing
 `./split-view.ts` from the extracted package registers 11 event handlers and 11
 slash commands and re-exports the four state seams. `check-package` (and therefore
